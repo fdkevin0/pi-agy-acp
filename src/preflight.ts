@@ -16,6 +16,9 @@ import {
   writeFileSync,
   readFileSync,
   statSync,
+  lstatSync,
+  readdirSync,
+  rmSync,
 } from 'node:fs'
 import { homedir } from 'node:os'
 import { delimiter, isAbsolute, join } from 'node:path'
@@ -208,6 +211,46 @@ export function syncOAuthToken(
   }
 }
 
+/** Remove only one closed ACP session's files; session ids come from the agent. */
+export function removeSessionArtifacts(home: string, sessionId: string): void {
+  if (
+    typeof sessionId !== 'string' ||
+    sessionId.length === 0 ||
+    /[^A-Za-z0-9._-]/.test(sessionId) ||
+    sessionId === '.' ||
+    sessionId.includes('..')
+  )
+    return
+  const appData = join(home, 'agy')
+  if (!isRealDirectory(appData)) return
+  removeArtifacts(join(appData, 'conversations'), [
+    `${sessionId}.db`,
+    `${sessionId}.db-wal`,
+    `${sessionId}.db-shm`,
+  ])
+  removeArtifacts(join(appData, 'brain'), [sessionId])
+}
+
+function isRealDirectory(path: string): boolean {
+  try {
+    return lstatSync(path).isDirectory()
+  } catch {
+    return false
+  }
+}
+
+function removeArtifacts(directory: string, names: readonly string[]): void {
+  // Never follow a replaced parent directory into data outside the isolated home.
+  if (!isRealDirectory(directory)) return
+  for (const name of names) {
+    try {
+      rmSync(join(directory, name), { recursive: true, force: true })
+    } catch {
+      // Locked or unreadable leftovers can be retried on the next startup.
+    }
+  }
+}
+
 /**
  * Write the isolated Antigravity home: bridge agent and ACP settings.
  * @param home - absolute home directory used as `--gemini-dir`.
@@ -240,6 +283,24 @@ export function prepareHome(
   )
   const appData = join(home, 'agy')
   mkdirSync(appData, { recursive: true })
+  // Pi owns conversation history; no ACP session is restored across processes.
+  // shortcut: cleanup requires an exclusive home; add locking before supporting shared homes.
+  removeArtifacts(appData, [
+    'conversations',
+    'brain',
+    'conversation_summaries.db',
+    'conversation_summaries.db-wal',
+    'conversation_summaries.db-shm',
+    'jetbox_summaries_proto.pb',
+  ])
+  try {
+    removeArtifacts(
+      home,
+      readdirSync(home).filter((name) => /^acp\.log\.\d+$/.test(name)),
+    )
+  } catch {
+    // Log cleanup is best-effort when the home cannot be listed.
+  }
   syncOAuthToken(home, userHome)
   const settingsPath = join(appData, 'settings.json')
   const settings = readJson(settingsPath)

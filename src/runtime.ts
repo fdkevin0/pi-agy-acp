@@ -67,6 +67,7 @@ import {
   GPT_OSS_CONTEXT_WINDOW,
   DEFAULT_CONTEXT_WINDOW,
   prepareHome,
+  removeSessionArtifacts,
   readVersion,
   resolveAgyBinary,
   syncOAuthToken,
@@ -184,6 +185,7 @@ export class AntigravityRuntime {
   private state: RuntimeStatus['state'] = 'idle'
   private lastError: string | undefined
   private tierDiscovery: Promise<void> | undefined
+  private warmupPromise: Promise<void> | undefined
   private readonly conversations = new Map<string, Conversation>()
   private readonly tenants = new Map<string, Conversation>()
   private readonly mutex = new KeyedMutex()
@@ -344,24 +346,39 @@ export class AntigravityRuntime {
    * @returns resolves when discovery finished.
    */
   async warmup(): Promise<void> {
-    const proc = await this.ensureReady()
-    const result = await proc.newSession(
-      {
-        cwd: this.preflight?.workspace ?? this.home,
-        mcpServers: [],
-      },
-      { onUpdate: () => undefined },
-      120_000,
-    )
-    if (
-      this.catalog.observe(
-        result.configOptions,
-        result.models?.availableModels,
-        result._meta?.antigravity?.tier,
+    if (this.warmupPromise !== undefined) return this.warmupPromise
+    if (this.catalog.observed) return
+    this.warmupPromise = (async () => {
+      const proc = await this.ensureReady()
+      if (this.catalog.observed) return
+      const result = await proc.newSession(
+        {
+          cwd: this.preflight?.workspace ?? this.home,
+          mcpServers: [],
+        },
+        { onUpdate: () => undefined },
+        120_000,
       )
-    )
-      this.host.onModelsChanged()
-    await proc.closeSession(result.sessionId)
+      try {
+        if (
+          this.catalog.observe(
+            result.configOptions,
+            result.models?.availableModels,
+            result._meta?.antigravity?.tier,
+          )
+        )
+          this.host.onModelsChanged()
+      } finally {
+        try {
+          await proc.closeSession(result.sessionId)
+        } finally {
+          removeSessionArtifacts(this.home, result.sessionId)
+        }
+      }
+    })().finally(() => {
+      this.warmupPromise = undefined
+    })
+    return this.warmupPromise
   }
 
   /** Stop every session, the process, and the bridge. */
@@ -593,7 +610,10 @@ export class AntigravityRuntime {
   }
 
   private runPreflight(): Promise<PreflightResult> {
-    if (this.preflight !== undefined) return Promise.resolve(this.preflight)
+    if (this.preflight !== undefined) {
+      prepareHome(this.home)
+      return Promise.resolve(this.preflight)
+    }
     this.preflightPromise ??= (async () => {
       const config = this.host.config
       const binary = resolveAgyBinary(config.command)
@@ -966,7 +986,10 @@ export class AntigravityRuntime {
 
   private async resetSession(conv: Conversation): Promise<void> {
     if (conv.sessionId !== undefined && conv.process !== undefined) {
-      void conv.process.closeSession(conv.sessionId)
+      const sessionId = conv.sessionId
+      void conv.process
+        .closeSession(sessionId)
+        .finally(() => removeSessionArtifacts(this.home, sessionId))
     }
     this.releaseTenant(conv)
     conv.sessionId = undefined

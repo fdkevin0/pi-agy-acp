@@ -98,6 +98,14 @@ PI_AGY_COMMAND=/absolute/path/to/agy pi -e ./index.ts
 The dedicated directory isolates the bridge agent from your normal agy tools and
 plugins. It contains agy-managed session data, logs, and the extension's model cache.
 
+Closed temporary ACP sessions have their database files and brain directories
+removed automatically. Before starting ACP, the extension also removes leftover
+session files, summary indexes, and numeric `acp.log.<pid>` backups. It retains
+the current `acp.log`, model cache, and authentication files; Pi owns the history
+used to rebuild sessions. Cleanup is best-effort if files are locked. Use a
+different `PI_AGY_HOME` for each concurrently running Pi instance, since startup
+cleanup assumes exclusive use of the directory.
+
 With file-backed authentication, the extension copies the existing OAuth token
 from your normal agy directory and sets its permissions to `0600`. Do not commit
 or share this directory. Authentication and token refresh remain agy's responsibility.
@@ -106,7 +114,9 @@ or share this directory. Authentication and token refresh remain agy's responsib
 
 Loading the extension reads the cached model catalog, or falls back to five model
 families, without starting agy. Pi's model refresh queries ACP for the account's
-catalog. The first request also discovers models and validates the selection.
+catalog once per runtime. Concurrent refreshes share one discovery session;
+after a refresh or normal session observes the live catalog, later refreshes
+reuse it. The first request also discovers models and validates the selection.
 Cache-only refreshes and refreshes already cancelled before startup do not launch
 ACP. Server-advertised models are not hidden, and live catalog changes update
 Pi's model selector. The selector exposes only the ACP reasoning levels offered

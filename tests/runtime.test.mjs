@@ -127,9 +127,44 @@ after(async () => {
   for (const r of runtimes) await r.dispose()
 })
 
-test('ACP tier metadata reaches the catalog through discovery and normal sessions', async () => {
+test('warmup coalesces discovery, cleans its files, and skips a live catalog from either session path', async (t) => {
   const discovery = makeRuntime()
+  const proc = await discovery.runtime.ensureReady()
+  const closeSession = proc.closeSession.bind(proc)
+  const closed = []
+  t.mock.method(proc, 'closeSession', async (sessionId) => {
+    assert.equal(
+      existsSync(
+        join(discovery.home, 'agy', 'conversations', `${sessionId}.db`),
+      ),
+      true,
+    )
+    assert.equal(
+      existsSync(join(discovery.home, 'agy', 'brain', sessionId)),
+      true,
+    )
+    await closeSession(sessionId)
+    closed.push(sessionId)
+  })
+  await Promise.all([
+    discovery.runtime.warmup(),
+    discovery.runtime.warmup(),
+    discovery.runtime.warmup(),
+  ])
   await discovery.runtime.warmup()
+  assert.equal(discovery.mcps().length, 1)
+  assert.equal(closed.length, 1)
+  for (const suffix of ['.db', '.db-wal', '.db-shm'])
+    assert.equal(
+      existsSync(
+        join(discovery.home, 'agy', 'conversations', `${closed[0]}${suffix}`),
+      ),
+      false,
+    )
+  assert.equal(
+    existsSync(join(discovery.home, 'agy', 'brain', closed[0])),
+    false,
+  )
   assert.deepEqual(discovery.runtime.catalog.tier(), {
     id: 'test-ultra',
     name: 'Google AI Ultra',
@@ -149,6 +184,88 @@ test('ACP tier metadata reaches the catalog through discovery and normal session
     discovery.runtime.catalog.tier(),
   )
   assert.equal(normal.runtime.status().account.plan, 'Google AI Ultra')
+  await normal.runtime.warmup()
+  assert.equal(normal.mcps().length, 1)
+})
+
+test('warmup retries failed discovery and cleans artifacts even if session close fails', async (t) => {
+  const { runtime, home } = makeRuntime()
+  const proc = await runtime.ensureReady()
+  const newSession = proc.newSession.bind(proc)
+  const opening = t.mock.method(proc, 'newSession', async () => {
+    throw new Error('Discovery failed')
+  })
+  const results = await Promise.allSettled([runtime.warmup(), runtime.warmup()])
+  assert.equal(opening.mock.callCount(), 1)
+  assert.ok(results.every((result) => result.status === 'rejected'))
+  assert.equal(runtime.catalog.observed, false)
+  opening.mock.restore()
+  let id
+  t.mock.method(proc, 'newSession', async (...args) => {
+    const result = await newSession(...args)
+    id = result.sessionId
+    return result
+  })
+  t.mock.method(proc, 'closeSession', async () => {
+    throw new Error('Close failed')
+  })
+  await assert.rejects(runtime.warmup(), /Close failed/)
+  assert.equal(
+    existsSync(join(home, 'agy', 'conversations', `${id}.db`)),
+    false,
+  )
+  assert.equal(existsSync(join(home, 'agy', 'brain', id)), false)
+})
+
+test('resetSession removes closed session files after acknowledgement and preserves other sessions', async (t) => {
+  const { runtime, home } = makeRuntime()
+  for (const sessionId of ['RESET-FILES', 'KEEP-FILES'])
+    await collect(
+      runtime.stream({
+        model: 'gemini-4-argon',
+        sessionId,
+        messages: [sys, user(sessionId, 'hello')],
+      }),
+    )
+  const conv = runtime.conversations.get('RESET-FILES')
+  const keep = runtime.conversations.get('KEEP-FILES').sessionId
+  const id = conv.sessionId
+  const proc = conv.process
+  const closing = Promise.withResolvers()
+  const closeSession = proc.closeSession.bind(proc)
+  let closed
+  t.mock.method(proc, 'closeSession', (sessionId) => {
+    closed = closing.promise.then(() => closeSession(sessionId))
+    return closed
+  })
+  await runtime.resetSession(conv)
+  assert.equal(conv.sessionId, undefined)
+  assert.equal(existsSync(join(home, 'agy', 'conversations', `${id}.db`)), true)
+  closing.resolve()
+  await closed
+  for (const suffix of ['.db', '.db-wal', '.db-shm']) {
+    assert.equal(
+      existsSync(join(home, 'agy', 'conversations', `${id}${suffix}`)),
+      false,
+    )
+    assert.equal(
+      existsSync(join(home, 'agy', 'conversations', `${keep}${suffix}`)),
+      true,
+    )
+  }
+  assert.equal(existsSync(join(home, 'agy', 'brain', id)), false)
+  assert.equal(existsSync(join(home, 'agy', 'brain', keep)), true)
+})
+
+test('a process restart cleans leftovers even when preflight metadata is cached', async () => {
+  const { runtime, home } = makeRuntime()
+  const proc = await runtime.ensureReady()
+  const leftover = join(home, 'agy', 'conversations', 'stale.db')
+  mkdirSync(join(leftover, '..'), { recursive: true })
+  writeFileSync(leftover, 'stale session')
+  proc.stop()
+  await runtime.ensureReady()
+  assert.equal(existsSync(leftover), false)
 })
 
 const sys = {

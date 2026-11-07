@@ -6,12 +6,16 @@ import {
   writeFileSync,
   readFileSync,
   rmSync,
+  existsSync,
+  symlinkSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, delimiter } from 'node:path'
 import {
   resolveAgyBinary,
   assertSupportedAgyVersion,
+  prepareHome,
+  removeSessionArtifacts,
 } from '../src/preflight.ts'
 import { defaults } from '../src/config.ts'
 import { AntigravityRuntime } from '../src/runtime.ts'
@@ -31,6 +35,90 @@ function isolateHome(t) {
   })
   return root
 }
+
+test('startup removes stale ACP data and numeric log backups while preserving persistent files', (t) => {
+  const home = isolateHome(t)
+  const stale = [
+    'agy/conversations/session.db',
+    'agy/conversations/session.db-wal',
+    'agy/conversations/session.db-shm',
+    'agy/brain/session/note.md',
+    'agy/conversation_summaries.db',
+    'agy/conversation_summaries.db-wal',
+    'agy/conversation_summaries.db-shm',
+    'agy/jetbox_summaries_proto.pb',
+    'acp.log.123',
+    'acp.log.456',
+  ]
+  const retained = [
+    'acp.log',
+    'catalog.json',
+    'agy/antigravity-oauth-token',
+    'agy/other-data',
+    'acp.log.backup',
+    'acp.log.123.old',
+  ]
+  for (const name of [...stale, ...retained]) {
+    const path = join(home, name)
+    mkdirSync(join(path, '..'), { recursive: true })
+    writeFileSync(path, name)
+  }
+  const workspace = prepareHome(home, join(home, 'no-user-auth'))
+  assert.equal(existsSync(workspace), true)
+  for (const name of stale)
+    assert.equal(existsSync(join(home, name)), false, name)
+  for (const name of retained)
+    assert.equal(readFileSync(join(home, name), 'utf8'), name)
+  assert.doesNotThrow(() => prepareHome(home, join(home, 'no-user-auth')))
+})
+
+test('session cleanup is scoped, idempotent, and refuses path traversal or linked parents', (t) => {
+  const home = isolateHome(t)
+  const target = 'session-1_abc.2'
+  const paths = (id) => [
+    `agy/conversations/${id}.db`,
+    `agy/conversations/${id}.db-wal`,
+    `agy/conversations/${id}.db-shm`,
+    `agy/brain/${id}/note.md`,
+  ]
+  for (const name of [...paths(target), ...paths('other')]) {
+    const path = join(home, name)
+    mkdirSync(join(path, '..'), { recursive: true })
+    writeFileSync(path, 'keep until closed')
+  }
+  for (const invalid of [
+    '',
+    '.',
+    '..',
+    '../other',
+    'a..b',
+    '/other',
+    'a/b',
+    'a\\b',
+    's\n',
+    null,
+  ]) {
+    assert.doesNotThrow(() => removeSessionArtifacts(home, invalid))
+    for (const name of [...paths(target), ...paths('other')])
+      assert.equal(existsSync(join(home, name)), true)
+  }
+  removeSessionArtifacts(home, target)
+  for (const name of paths(target))
+    assert.equal(existsSync(join(home, name)), false)
+  for (const name of paths('other'))
+    assert.equal(existsSync(join(home, name)), true)
+  assert.doesNotThrow(() => removeSessionArtifacts(home, target))
+
+  const outside = join(home, 'outside')
+  mkdirSync(outside)
+  writeFileSync(join(outside, 'linked.db'), 'untouched')
+  rmSync(join(home, 'agy', 'conversations'), { recursive: true })
+  symlinkSync(outside, join(home, 'agy', 'conversations'), 'junction')
+  removeSessionArtifacts(home, 'linked')
+  assert.equal(readFileSync(join(outside, 'linked.db'), 'utf8'), 'untouched')
+  prepareHome(home, join(home, 'no-user-auth'))
+  assert.equal(readFileSync(join(outside, 'linked.db'), 'utf8'), 'untouched')
+})
 
 test('tier-only metadata is validated and persisted without model changes', (t) => {
   const root = isolateHome(t)

@@ -19,12 +19,15 @@
 //   CALL_ALWAYSONLY <tool> <json>  reported call whose options only offer allow_always
 // Setting FAKE_AGY_NO_HANDSHAKE skips the MCP initialize handshake at session/new.
 // Every received prompt is appended to $FAKE_AGY_LOG as one JSON line.
-import { appendFileSync } from 'node:fs'
+import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { createInterface } from 'node:readline'
 
 const log = process.env.FAKE_AGY_LOG
 const initLog = process.env.FAKE_AGY_INIT
 const mcpLog = process.env.FAKE_AGY_MCP
+const homeIndex = process.argv.indexOf('--gemini-dir')
+const home = homeIndex >= 0 ? process.argv[homeIndex + 1] : undefined
 const sessions = new Map()
 let nextSession = 1
 const rl = createInterface({ input: process.stdin })
@@ -470,6 +473,15 @@ rl.on('line', async (line) => {
         tools: [],
       }
       sessions.set(s.id, s)
+      if (home) {
+        const conversations = join(home, 'agy', 'conversations')
+        const brain = join(home, 'agy', 'brain', s.id)
+        mkdirSync(conversations, { recursive: true })
+        mkdirSync(brain, { recursive: true })
+        for (const suffix of ['.db', '.db-wal', '.db-shm'])
+          writeFileSync(join(conversations, `${s.id}${suffix}`), 'fake session')
+        writeFileSync(join(brain, 'note.md'), 'fake session')
+      }
       if (s.mcp && !process.env.FAKE_AGY_NO_HANDSHAKE) {
         await mcp(s.mcp, {
           jsonrpc: '2.0',
