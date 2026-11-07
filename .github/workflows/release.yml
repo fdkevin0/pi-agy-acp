@@ -24,11 +24,11 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 24
 
@@ -70,21 +70,23 @@ jobs:
         if: steps.meta.outputs.published == 'false'
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          PACKAGE_NAME: ${{ steps.meta.outputs.name }}
         run: |
-          if [ -z "${NPM_TOKEN}" ] && [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL}" ]; then
-            echo "::error::Neither NPM_TOKEN secret nor GitHub OIDC token is available."
-            exit 1
-          fi
           npm install -g npm@^11.5.1
           NPMRC="$(mktemp)"
-          trap 'rm -f "$NPMRC"' EXIT
+          LOG="$(mktemp)"
+          trap 'rm -f "$NPMRC" "$LOG"' EXIT
           if [ -n "${NPM_TOKEN}" ]; then
             printf '//registry.npmjs.org/:_authToken=%s\n' "${NPM_TOKEN}" > "$NPMRC"
           fi
-          NPM_CONFIG_USERCONFIG="$NPMRC" npm publish --access public --provenance
+          if ! NPM_CONFIG_USERCONFIG="$NPMRC" npm publish --access public --provenance 2>&1 | tee "$LOG"; then
+            if grep -qE "ENEEDAUTH|EOTP|OIDC|404" "$LOG"; then
+              echo "::error::npm publish requires Trusted Publishing (OIDC) or an automation NPM_TOKEN. Configure GitHub Actions Trusted Publisher (owner: fdkevin0, repo: pi-agy-acp, workflow: release.yml) at https://www.npmjs.com/package/${PACKAGE_NAME}/access"
+            fi
+            exit 1
+          fi
 
-      - name: Create GitHub Release
-        if: steps.meta.outputs.published == 'false'
+      - name: Ensure GitHub Release exists
         env:
           TAG: ${{ steps.meta.outputs.tag }}
         run: |
