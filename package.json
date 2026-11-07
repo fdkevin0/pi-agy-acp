@@ -1,0 +1,50 @@
+{
+  "name": "pi-agy-acp",
+  "version": "0.1.0",
+  "type": "module",
+  "license": "MIT",
+  "description": "Google Antigravity ACP provider extension for Pi Coding Agent",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fdkevin0/pi-agy-acp.git"
+  },
+  "homepage": "https://github.com/fdkevin0/pi-agy-acp#readme",
+  "bugs": {
+    "url": "https://github.com/fdkevin0/pi-agy-acp/issues"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "files": [
+    "index.ts",
+    "src",
+    "README.md",
+    "docs",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.0",
+    "@types/node": "^22.0.0"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-coding-agent",
+    "antigravity",
+    "agy",
+    "acp"
+  ]
+}

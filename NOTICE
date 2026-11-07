@@ -1,0 +1,10 @@
+This project adapts dsh-llm-antigravity-acp from:
+https://github.com/lili-luo/dsh-plugin-bundle
+Upstream snapshot: f0499138aa4f39531f258bcbdcebfeecbf17fbbc
+Copyright (c) 2026 lili-luo. MIT license, reproduced in LICENSE.
+
+The ACP runtime, JSON-RPC transport, MCP bridge, history projection, model
+catalog, preflight, quota reader, and runtime test fixtures derive
+from that project. Pi entry point, host process integration, local protocol
+contracts and Pi stream translation are adaptations in this repository.
+Internal bridge identifiers are renamed to pi; upstream licensing and attribution are retained.
