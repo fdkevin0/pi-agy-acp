@@ -70,6 +70,30 @@ To inspect the package contents without publishing:
 npm pack --dry-run
 ```
 
+## CI and releases
+
+`ci.yml` checks pull requests and pushes to `main`. `release.yml` runs only for
+version-tag pushes or manual runs on an existing tag, so ordinary commits do not
+run a second test suite or trigger publication. Both use Node.js 24. There is no
+committed lockfile, so dependency installation uses `npm install`.
+
+To release, bump `package.json`, commit the change, and push its matching
+`vX.Y.Z` tag. The workflow accepts stable versions only; publish one version at
+a time and never move a published tag. It validates the tag and version, then
+checks, tests, and packs before publishing. Only a registry 404 means the version
+is absent; network, authentication, and server errors stop the job.
+
+Configure npm [Trusted Publishing](https://docs.npmjs.com/trusted-publishers/)
+for owner `fdkevin0`, repository `pi-agy-acp`, and workflow filename `release.yml`.
+The workflow grants OIDC permission to the publish job and uses npm >= 11.5.1.
+An optional `NPM_TOKEN` repository secret supports token authentication through
+`NODE_AUTH_TOKEN`; use a granular write token with the required 2FA bypass.
+
+If npm publication succeeds but GitHub Release creation fails, rerun that tagged
+workflow, or use `gh workflow run release.yml --ref vX.Y.Z`. Branch-based manual
+runs are rejected. Existing npm versions are not republished, and GitHub Releases
+are created only for existing tags with `gh release create --verify-tag`.
+
 ## Documentation conventions
 
 Keep all project documentation in English. Use progressive disclosure:
