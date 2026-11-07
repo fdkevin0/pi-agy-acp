@@ -1,0 +1,98 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish to npm and GitHub Releases
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Read package metadata and check npm registry
+        id: meta
+        run: |
+          NAME=$(node -p "require('./package.json').name")
+          VERSION=$(node -p "require('./package.json').version")
+          TAG="v${VERSION}"
+          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "${GITHUB_REF_NAME}" != "${TAG}" ]; then
+            echo "::error::Git tag ${GITHUB_REF_NAME} does not match package.json version ${TAG}"
+            exit 1
+          fi
+
+          PUBLISHED=$(npm view "${NAME}@${VERSION}" version 2>/dev/null || true)
+          if [ "${PUBLISHED}" = "${VERSION}" ]; then
+            echo "${NAME}@${VERSION} is already published on npm; skipping publish."
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "${NAME}@${VERSION} is not yet published on npm."
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install dependencies
+        if: steps.meta.outputs.published == 'false'
+        run: npm install
+
+      - name: Typecheck and test
+        if: steps.meta.outputs.published == 'false'
+        run: |
+          npm run check
+          npm test
+
+      - name: Publish to npm
+        if: steps.meta.outputs.published == 'false'
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "${NPM_TOKEN}" ] && [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL}" ]; then
+            echo "::error::Neither NPM_TOKEN secret nor GitHub OIDC token is available."
+            exit 1
+          fi
+          npm install -g npm@^11.5.1
+          NPMRC="$(mktemp)"
+          trap 'rm -f "$NPMRC"' EXIT
+          if [ -n "${NPM_TOKEN}" ]; then
+            printf '//registry.npmjs.org/:_authToken=%s\n' "${NPM_TOKEN}" > "$NPMRC"
+          fi
+          NPM_CONFIG_USERCONFIG="$NPMRC" npm publish --access public --provenance
+
+      - name: Create GitHub Release
+        if: steps.meta.outputs.published == 'false'
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "GitHub Release ${TAG} already exists."
+            exit 0
+          fi
+          gh release create "${TAG}" \
+            --target "${GITHUB_SHA}" \
+            --title "${TAG}" \
+            --generate-notes
