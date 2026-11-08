@@ -123,6 +123,18 @@ export class QuotaReader {
     this.ttlMs = ttlMs
   }
 
+  /** Fresh successful data only; never starts a command. */
+  peek(): QuotaSnapshot | undefined {
+    return this.cached?.status === 'ok' &&
+      Date.now() - this.cachedAt < this.ttlMs
+      ? this.cached
+      : undefined
+  }
+
+  get pending(): boolean {
+    return this.inflight !== undefined
+  }
+
   /**
    * Read the quota snapshot.
    * @param force - bypass the cache.
@@ -167,6 +179,9 @@ export class QuotaReader {
         groups: this.cached?.groups ?? [],
         error: error instanceof Error ? error.message : String(error),
       }
+      // Apply the same TTL to failures so settled events cannot hammer an unavailable CLI.
+      this.cached = snapshot
+      this.cachedAt = Date.now()
       return snapshot
     }
   }

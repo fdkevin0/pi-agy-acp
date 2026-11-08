@@ -17,6 +17,10 @@ import {
   type ServerResponse,
 } from 'node:http'
 import type { AddressInfo } from 'node:net'
+import type { ToolSchema } from './protocol.ts'
+import { AGENT_TOOL_PREFIX, CALL_TOOL_NAME } from './history.ts'
+import { digest } from './util.ts'
+import { VERSION } from './version.ts'
 
 /** One tool schema advertised over MCP. */
 export interface BridgeTool {
@@ -104,11 +108,6 @@ export class McpBridge {
   constructor(router: BridgeRouter, options: McpBridgeOptions) {
     this.router = router
     this.options = options
-  }
-
-  /** Whether the HTTP listener is bound. */
-  get listening(): boolean {
-    return this.server !== undefined
   }
 
   /**
@@ -254,7 +253,7 @@ export class McpBridge {
         return reply({
           protocolVersion: version,
           capabilities: { tools: { listChanged: false } },
-          serverInfo: { name: 'pi', version: '0.1.0' },
+          serverInfo: { name: 'pi', version: VERSION },
           instructions:
             'Tools of the Pi session. Every call is executed by the harness under its own permission policy.',
         })
@@ -402,4 +401,123 @@ function writeJson(res: ServerResponse, status: number, value: unknown): void {
 
 function writeEvent(res: ServerResponse, value: unknown): void {
   res.write(`event: message\ndata: ${JSON.stringify(value)}\n\n`)
+}
+
+/**
+ * Diff active tools against the session's known tool set and render a compact
+ * `<harness_tool_update>` block for newly added, modified, restored, or disabled tools.
+ * @param conv - conversation tool state (`advertisedToolNames` and `knownTools`).
+ * @param tools - active tools for the current step.
+ * @returns `<harness_tool_update>` text block, or `''` when unchanged.
+ */
+export function consumeToolDelta(
+  conv: {
+    readonly advertisedToolNames: ReadonlySet<string>
+    readonly knownTools: Map<string, string>
+  },
+  tools: readonly BridgeTool[],
+): string {
+  const lines: string[] = []
+  const active = new Set<string>()
+  for (const tool of tools) {
+    active.add(tool.name)
+    const hash = digest(tool)
+    if (conv.knownTools.get(tool.name) === hash) continue
+    conv.knownTools.set(tool.name, hash)
+    if (conv.advertisedToolNames.has(tool.name)) {
+      lines.push(`[tool restored: ${AGENT_TOOL_PREFIX}${tool.name}]`)
+    } else {
+      lines.push(
+        `[tool available via ${AGENT_TOOL_PREFIX}${CALL_TOOL_NAME} with {"name":"${tool.name}","arguments":{...}}]: ${JSON.stringify({ name: tool.name, description: tool.description, parameters: tool.inputSchema })}`,
+      )
+    }
+  }
+  for (const name of [...conv.knownTools.keys()]) {
+    if (!active.has(name)) {
+      conv.knownTools.delete(name)
+      lines.push(`[tool disabled: ${name}]`)
+    }
+  }
+  return lines.length > 0
+    ? `<harness_tool_update>\n${lines.join('\n')}\n</harness_tool_update>`
+    : ''
+}
+
+/** Byte ceiling keeping advertised MCP tool schemas below agy's ~1,500B lazy cutoff. */
+export const MAX_EAGER_BRIDGE_TOOL_BYTES = 1_350
+
+function shortenText(text: string, maxChars: number): string {
+  const clean = text.replace(/\s+/gu, ' ').trim()
+  if (clean.length <= maxChars) return clean
+  const sentenceEnd = clean.indexOf('. ')
+  if (sentenceEnd >= 32 && sentenceEnd + 1 <= maxChars)
+    return clean.slice(0, sentenceEnd + 1)
+  return `${clean.slice(0, Math.max(1, maxChars - 1)).trimEnd()}…`
+}
+
+function compactSchemaNode(value: unknown, maxDescChars: number): unknown {
+  if (Array.isArray(value))
+    return value.map((item) => compactSchemaNode(item, maxDescChars))
+  if (value === null || typeof value !== 'object') return value
+  const record = value as Record<string, unknown>
+  const out: Record<string, unknown> = {}
+  for (const [key, entry] of Object.entries(record)) {
+    if (key === 'description' && typeof entry === 'string') {
+      if (maxDescChars > 0) out[key] = shortenText(entry, maxDescChars)
+      continue
+    }
+    out[key] = compactSchemaNode(entry, maxDescChars)
+  }
+  return out
+}
+
+/**
+ * Keep each MCP-advertised tool schema under `agy`'s eager size threshold while
+ * preserving every parameter name, type, required list, and enum constraint.
+ * Full prose instructions remain in Pi's system prompt.
+ * @param tool - raw bridge tool descriptor.
+ * @returns compacted descriptor when oversized, otherwise the original descriptor.
+ */
+export function compactBridgeTool(tool: BridgeTool): BridgeTool {
+  if (
+    Buffer.byteLength(JSON.stringify(tool), 'utf8') <=
+    MAX_EAGER_BRIDGE_TOOL_BYTES
+  )
+    return tool
+  const pass1: BridgeTool = {
+    name: tool.name,
+    description: shortenText(tool.description, 220),
+    inputSchema: compactSchemaNode(tool.inputSchema, 90) as Record<
+      string,
+      unknown
+    >,
+  }
+  if (
+    Buffer.byteLength(JSON.stringify(pass1), 'utf8') <=
+    MAX_EAGER_BRIDGE_TOOL_BYTES
+  )
+    return pass1
+  return {
+    name: tool.name,
+    description: shortenText(tool.description, 140),
+    inputSchema: compactSchemaNode(tool.inputSchema, 0) as Record<
+      string,
+      unknown
+    >,
+  }
+}
+
+export function toBridgeTools(
+  tools: readonly ToolSchema[] | undefined,
+): BridgeTool[] {
+  return (tools ?? []).map((t) =>
+    compactBridgeTool({
+      name: t.name,
+      description: t.description,
+      inputSchema:
+        t.parameters.type === undefined
+          ? { type: 'object', ...t.parameters }
+          : t.parameters,
+    }),
+  )
 }

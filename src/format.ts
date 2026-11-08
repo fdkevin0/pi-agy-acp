@@ -1,9 +1,59 @@
-import type { QuotaSnapshot } from './quota.ts'
+import type {
+  AccountInfo,
+  QuotaSnapshot,
+  QuotaGroup,
+  QuotaBucket,
+} from './quota.ts'
 import type { RuntimeStatus } from './runtime.ts'
 
 export interface FormattedNotice {
   text: string
   level: 'info' | 'warning' | 'error'
+}
+
+function clampFraction(value: number | undefined): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value)
+    ? Math.max(0, Math.min(1, value))
+    : undefined
+}
+
+function formatAccount(account?: AccountInfo): string {
+  return [account?.email, account?.plan].filter(Boolean).join(' · ')
+}
+
+/** Lowest known window for the model family; unknown groups fall back conservatively. */
+export function quotaForModel(
+  snapshot: QuotaSnapshot,
+  model?: string,
+): { group: QuotaGroup; bucket: QuotaBucket; fraction: number } | undefined {
+  if (snapshot.status !== 'ok') return undefined
+  const family = /^(gemini|claude|gpt)(?:-|$)/i.exec(model ?? '')?.[1]
+  const matched = family
+    ? snapshot.groups.filter((group) =>
+        new RegExp(`\\b${family}\\b`, 'i').test(
+          `${group.name} ${group.description}`,
+        ),
+      )
+    : []
+  const groups = matched.length > 0 ? matched : snapshot.groups
+  let lowest: ReturnType<typeof quotaForModel>
+  for (const group of groups) {
+    for (const bucket of group.buckets) {
+      const fraction = clampFraction(bucket.remainingFraction)
+      if (fraction === undefined) continue
+      if (!lowest || fraction < lowest.fraction)
+        lowest = { group, bucket, fraction }
+    }
+  }
+  return lowest
+}
+
+export function formatQuotaStatus(
+  snapshot: QuotaSnapshot,
+  model?: string,
+): string | undefined {
+  const quota = quotaForModel(snapshot, model)
+  return quota ? `AGY ${Math.round(quota.fraction * 100)}%` : undefined
 }
 
 function resetCountdown(resetTime: string, now: number): string {
@@ -24,9 +74,7 @@ export function formatQuota(
 ): FormattedNotice {
   const stale = snapshot.status === 'error' && snapshot.groups.length > 0
   const lines = [`Antigravity Quota${stale ? ' (stale)' : ''}`]
-  const account = [snapshot.account?.email, snapshot.account?.plan]
-    .filter(Boolean)
-    .join(' · ')
+  const account = formatAccount(snapshot.account)
   if (account) lines.push(`  Account:  ${account}`)
   let level: FormattedNotice['level'] =
     snapshot.status === 'error' ? 'error' : 'info'
@@ -45,11 +93,7 @@ export function formatQuota(
     if (group.buckets.length === 0)
       lines.push('    No quota windows available.')
     for (const bucket of group.buckets) {
-      const fraction =
-        typeof bucket.remainingFraction === 'number' &&
-        Number.isFinite(bucket.remainingFraction)
-          ? Math.max(0, Math.min(1, bucket.remainingFraction))
-          : undefined
+      const fraction = clampFraction(bucket.remainingFraction)
       const filled = fraction === undefined ? 0 : Math.round(fraction * 12)
       const bar = '█'.repeat(filled) + '░'.repeat(12 - filled)
       const percent =
@@ -83,9 +127,7 @@ export function formatStatus(status: RuntimeStatus): FormattedNotice {
   const binary = status.binary
     ? `${status.version || 'unknown version'} (${status.binary})`
     : 'not probed yet (lazy init on first turn)'
-  const account = [status.account?.email, status.account?.plan]
-    .filter(Boolean)
-    .join(' · ')
+  const account = formatAccount(status.account)
   const lines = [
     `Antigravity ACP · ${badges[status.state]}`,
     `  Binary:   ${binary}`,

@@ -4,7 +4,13 @@ import { mkdtempSync, rmSync, chmodSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { streamPi, requestMessages } from '../src/pi-stream.ts'
-import { AntigravityRuntime } from '../src/runtime.ts'
+import { AntigravityRuntime, mapError } from '../src/runtime.ts'
+import { LlmError } from '../src/protocol.ts'
+import { splitSystem, renderTranscript } from '../src/history.ts'
+import {
+  isContextOverflow,
+  isRetryableAssistantError,
+} from '@earendil-works/pi-ai'
 import { defaults } from '../src/config.ts'
 import { spawnAcp } from '../src/host.ts'
 const model = {
@@ -244,4 +250,118 @@ test('setup failure does not report a successful response', async () => {
   )
   assert.equal(r.message.stopReason, 'error')
   assert.equal(responses, 0)
+})
+
+test('leading system sections stay in the prompt and empty tool updates disappear', () => {
+  const converted = requestMessages([
+    system,
+    { role: 'system', content: 'Second', sections: { rules: 'Keep it brief' } },
+    user('hello'),
+    { role: 'system', content: '  ', toolsRemoved: ['bash'] },
+    { role: 'system', content: '', sections: { rules: 'Be precise' } },
+  ])
+  assert.equal(converted.length, 4)
+  const split = splitSystem({ messages: converted })
+  assert.match(split.system, /Second\n\nKeep it brief/)
+  assert.doesNotMatch(split.system, /Updated system prompt section/)
+  const transcript = renderTranscript(split.messages)
+  assert.match(transcript, /Updated system prompt section "rules"/)
+  assert.doesNotMatch(transcript, /<system_update>\s*<\/system_update>/)
+})
+
+test('timeout and cancellation cannot masquerade as overflow; quota and overflow reach Pi classifiers', async () => {
+  assert.equal(mapError(new Error('context deadline exceeded')).code, 'TIMEOUT')
+  assert.equal(mapError(new Error('context canceled')).code, 'TRANSPORT')
+  assert.equal(
+    mapError(new Error('context window limit exceeded')).code,
+    'CONTEXT_WINDOW_EXCEEDED',
+  )
+  for (const [code, text, prefix] of [
+    [
+      'CONTEXT_WINDOW_EXCEEDED',
+      'Input is too large',
+      'context_length_exceeded: ',
+    ],
+    ['QUOTA', 'ResourceExhausted: weekly allowance', 'quota exceeded: '],
+    ['CONTEXT_WINDOW_EXCEEDED', 'context_length_exceeded: original', ''],
+    ['QUOTA', 'insufficient_quota: original', ''],
+  ]) {
+    for (const terminal of ['throw', 'finish']) {
+      const r = await result(
+        {
+          async *stream() {
+            if (terminal === 'throw') throw new LlmError(text, code)
+            yield {
+              type: 'finish',
+              reason: { kind: 'error', failure: { message: text, code } },
+            }
+          },
+        },
+        context(user('hi')),
+      )
+      assert.equal(r.message.errorMessage, prefix + text)
+      if (code === 'CONTEXT_WINDOW_EXCEEDED')
+        assert.equal(isContextOverflow(r.message), true)
+      else assert.equal(isRetryableAssistantError(r.message), false)
+    }
+  }
+})
+
+test('an initial aborted finish does not report a synthetic successful response', async () => {
+  let responses = 0
+  const r = await result(
+    {
+      async *stream() {
+        yield { type: 'finish', reason: { kind: 'aborted' } }
+      },
+    },
+    context(user('hi')),
+    {
+      signal: AbortSignal.abort(),
+      onResponse() {
+        responses++
+      },
+    },
+  )
+  assert.equal(r.message.stopReason, 'aborted')
+  assert.equal(responses, 0)
+})
+
+test('fragmented tool JSON emits one start and reports malformed final arguments safely', async () => {
+  for (const text of ['{"command":"pwd"}', '{"command":']) {
+    const r = await result(
+      {
+        async *stream() {
+          yield { type: 'block-start', index: 0, blockType: 'tool-call' }
+          for (const piece of [text.slice(0, 5), text.slice(5)])
+            yield {
+              type: 'tool-call-delta',
+              index: 0,
+              id: 'call-1',
+              name: 'bash',
+              argumentsDelta: piece,
+            }
+          yield {
+            type: 'block-end',
+            index: 0,
+            block: {
+              type: 'tool-call',
+              id: 'call-1',
+              name: 'bash',
+              arguments: text,
+            },
+          }
+          yield { type: 'finish', reason: { kind: 'tool-calls' } }
+        },
+      },
+      context(user('hi')),
+    )
+    assert.equal(r.message.stopReason, 'toolUse')
+    assert.equal(r.events.filter((e) => e.type === 'toolcall_start').length, 1)
+    assert.equal(r.events.filter((e) => e.type === 'toolcall_delta').length, 2)
+    assert.equal(r.events.filter((e) => e.type === 'toolcall_end').length, 1)
+    if (text.endsWith('}'))
+      assert.deepEqual(r.message.content[0].arguments, { command: 'pwd' })
+    else assert.ok(r.message.content[0].argumentsError)
+  }
 })

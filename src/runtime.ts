@@ -8,7 +8,6 @@
  */
 
 import { randomBytes, timingSafeEqual } from 'node:crypto'
-import { existsSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { LlmError } from './protocol.ts'
@@ -17,7 +16,6 @@ import type {
   GenerateOptions,
   RequestMessage,
   StreamChunk,
-  ToolSchema,
 } from './protocol.ts'
 import {
   AcpProcess,
@@ -25,9 +23,7 @@ import {
   type AcpPermissionOutcome,
   type AcpPermissionRequest,
   type AcpPromptResult,
-  type AcpSessionUpdate,
   type AcpSpawner,
-  type AcpToolCallMeta,
 } from './acp-process.ts'
 import { ModelCatalog, nearestEffort } from './catalog.ts'
 import { asEffort, type Config, type Effort } from './config.ts'
@@ -36,16 +32,19 @@ import {
   AWAIT_TOOL,
   AWAIT_TOOL_NAME,
   CALL_TOOL,
-  CALL_TOOL_NAME,
   pumpStep,
   relayNotice,
   type ParkedCall,
+  type ReportedToolCall,
+  structuredToolMeta,
+  recordReportedToolCall,
+  isEmptyInput,
 } from './conversation.ts'
 import {
   AGENT_TOOL_PREFIX,
+  CALL_TOOL_NAME,
   bridgeSystemPrompt,
   inputPrompt,
-  REPLAY_BUDGET_BYTES,
   MCP_SERVER_NAME,
   renderTranscript,
   replayPrompt,
@@ -55,6 +54,8 @@ import {
 import { JsonRpcClosedError, JsonRpcRemoteError } from './jsonrpc.ts'
 import {
   McpBridge,
+  consumeToolDelta,
+  toBridgeTools,
   type BridgeCallRequest,
   type BridgeContent,
   type BridgeTool,
@@ -80,7 +81,8 @@ import {
   type AccountInfo,
   type QuotaSnapshot,
 } from './quota.ts'
-import { delay, digest, KeyedMutex } from './util.ts'
+import { delay, digest, KeyedMutex, abortable } from './util.ts'
+import { VERSION } from './version.ts'
 
 /** Parked calls answer with a still-running notice before Gemini cache TTL expiry and agy's 180-second MCP deadline. */
 export const DEFAULT_RELAY_AFTER_MS = 85_000
@@ -109,7 +111,6 @@ export interface RuntimeStatus {
   account?: AccountInfo
   contextWindow: number
   defaultEffort: Effort
-  longDecodeContinuations: number
   models: {
     id: string
     name: string
@@ -129,15 +130,6 @@ export interface RuntimeStatus {
     usage?: AcpPromptResult['usage']
     at: string
   }
-}
-
-/** Structured MCP metadata the agent reported for one tool call. */
-interface ReportedToolCall {
-  kind?: string
-  serverName?: string
-  toolName?: string
-  /** Set when later updates contradicted an already established field. */
-  conflict?: boolean
 }
 
 interface Conversation {
@@ -239,16 +231,6 @@ export class AntigravityRuntime {
     return this.catalog.fixedEffort(model) ?? requested
   }
 
-  /** Default effort. */
-  defaultEffort(): Effort {
-    return this.host.config.defaultEffort
-  }
-
-  /** Maximum automatic long-decode continuations. */
-  longDecodeContinuations(): number {
-    return this.host.config.longDecodeContinuations
-  }
-
   /**
    * Current status for diagnostics surfaces.
    * @returns the status snapshot.
@@ -266,8 +248,7 @@ export class AntigravityRuntime {
       home: this.home,
       account: this.accountInfo(),
       contextWindow: DEFAULT_CONTEXT_WINDOW,
-      defaultEffort: this.defaultEffort(),
-      longDecodeContinuations: this.longDecodeContinuations(),
+      defaultEffort: this.host.config.defaultEffort,
       models: this.catalog.list().map((m) => ({
         ...m,
         efforts: this.catalog.effortsFor(m.id),
@@ -345,12 +326,15 @@ export class AntigravityRuntime {
    * Warm the process and refresh the catalog through a tool-less discovery session.
    * @returns resolves when discovery finished.
    */
-  async warmup(): Promise<void> {
-    if (this.warmupPromise !== undefined) return this.warmupPromise
-    if (this.catalog.observed) return
+  async warmup(
+    options: { force?: boolean; signal?: AbortSignal } = {},
+  ): Promise<void> {
+    options.signal?.throwIfAborted()
+    if (this.warmupPromise !== undefined)
+      return abortable(this.warmupPromise, options.signal)
+    if (!options.force && this.catalog.observed) return
     this.warmupPromise = (async () => {
       const proc = await this.ensureReady()
-      if (this.catalog.observed) return
       const result = await proc.newSession(
         {
           cwd: this.preflight?.workspace ?? this.home,
@@ -378,7 +362,26 @@ export class AntigravityRuntime {
     })().finally(() => {
       this.warmupPromise = undefined
     })
-    return this.warmupPromise
+    return abortable(this.warmupPromise, options.signal)
+  }
+
+  /** Close conversation sessions while retaining the process and discovery/quota caches. */
+  async resetConversations(): Promise<void> {
+    const conversations = [...this.conversations.values()]
+    for (const conv of conversations)
+      this.dropTurn(conv, 'The Pi session changed.')
+    await Promise.all(
+      conversations.map(async (conv) => {
+        const release = await this.mutex.acquire(conv.key)
+        try {
+          if (this.conversations.get(conv.key) !== conv) return
+          await this.resetSession(conv)
+          this.conversations.delete(conv.key)
+        } finally {
+          release()
+        }
+      }),
+    )
   }
 
   /** Stop every session, the process, and the bridge. */
@@ -423,7 +426,7 @@ export class AntigravityRuntime {
       conv.toolNames = new Set(tools.map((t) => t.name))
       const effort = this.effectiveEffort(
         options.model,
-        asEffort(options.reasoningEffort) ?? this.defaultEffort(),
+        asEffort(options.reasoningEffort) ?? this.host.config.defaultEffort,
       )
 
       if (conv.turn !== undefined && conv.turn.pendingCalls.size > 0) {
@@ -588,7 +591,7 @@ export class AntigravityRuntime {
         cwd: preflight.workspace,
         spawn: this.host.spawnAcp,
         clientName: 'pi-agy-acp',
-        clientVersion: '0.1.0',
+        clientVersion: VERSION,
         log: (message) => this.host.log.warn(message),
       })
       const started = proc
@@ -628,7 +631,6 @@ export class AntigravityRuntime {
         logFile: join(this.home, 'acp.log'),
       }
       this.preflight = result
-      this.host.onModelsChanged()
       return result
     })().finally(() => {
       this.preflightPromise = undefined
@@ -652,16 +654,7 @@ export class AntigravityRuntime {
           'TRANSPORT',
         ),
       })
-      this.releaseTenant(conv)
-      conv.sessionId = undefined
-      conv.process = undefined
-      conv.tenantKey = undefined
-      conv.tenantSecret = undefined
-      conv.advertisedTools = []
-      conv.advertisedToolNames.clear()
-      conv.knownTools.clear()
-      conv.reportedToolCalls.clear()
-
+      this.clearSession(conv)
       conv.dirty = true
     }
   }
@@ -739,12 +732,7 @@ export class AntigravityRuntime {
       )
         this.host.onModelsChanged()
     } catch (error) {
-      this.releaseTenant(conv)
-      conv.tenantKey = undefined
-      conv.tenantSecret = undefined
-      conv.advertisedTools = []
-      conv.advertisedToolNames.clear()
-      conv.knownTools.clear()
+      this.clearSession(conv)
       throw mapError(error)
     }
   }
@@ -985,12 +973,20 @@ export class AntigravityRuntime {
   }
 
   private async resetSession(conv: Conversation): Promise<void> {
+    let closing: Promise<void> | undefined
     if (conv.sessionId !== undefined && conv.process !== undefined) {
       const sessionId = conv.sessionId
-      void conv.process
+      closing = conv.process
         .closeSession(sessionId)
         .finally(() => removeSessionArtifacts(this.home, sessionId))
     }
+    this.clearSession(conv)
+    conv.knownIds = undefined
+    conv.dirty = false
+    await closing
+  }
+
+  private clearSession(conv: Conversation): void {
     this.releaseTenant(conv)
     conv.sessionId = undefined
     conv.tenantKey = undefined
@@ -1000,9 +996,6 @@ export class AntigravityRuntime {
     conv.advertisedToolNames.clear()
     conv.knownTools.clear()
     conv.reportedToolCalls.clear()
-
-    conv.knownIds = undefined
-    conv.dirty = false
   }
 
   private startPrompt(
@@ -1011,7 +1004,7 @@ export class AntigravityRuntime {
     blocks: AcpPromptBlock[],
   ): void {
     const turn = conv.turn as AcpTurn
-    proc.prompt(conv.sessionId as string, blocks).then(
+    turn.promptSettled = proc.prompt(conv.sessionId as string, blocks).then(
       (result) => turn.events.push({ kind: 'done', result }),
       (error: unknown) =>
         turn.events.push({ kind: 'error', error: mapError(error) }),
@@ -1027,7 +1020,6 @@ export class AntigravityRuntime {
     const turn = conv.turn as AcpTurn
     const sessionId = conv.sessionId as string
     let finishKind: string | undefined
-    let usage: AcpPromptResult['usage']
     const recordTurn = (
       outcome: NonNullable<RuntimeStatus['lastTurn']>['outcome'],
     ) => {
@@ -1035,7 +1027,7 @@ export class AntigravityRuntime {
         model: options.model,
         effort,
         steps: turn.toolSteps + turn.continuations + 1,
-        usage,
+        usage: turn.usage,
         outcome,
         durationMs: Math.max(0, performance.now() - turn.startedAt),
         retryNotices: turn.retryNotices,
@@ -1047,13 +1039,10 @@ export class AntigravityRuntime {
         turn,
         {
           parkSettleMs: this.host.config.parkSettleMs,
-          maxContinuations: this.longDecodeContinuations(),
+          maxContinuations: this.host.config.longDecodeContinuations,
           continuePrompt: () =>
             proc.prompt(sessionId, [{ type: 'text', text: CONTINUE_PROMPT }]),
           cancel: () => proc.cancel(sessionId),
-          recordUsage: (sample) => {
-            usage = sample
-          },
         },
         options.signal,
       )) {
@@ -1079,7 +1068,7 @@ export class AntigravityRuntime {
     )
     if (finishKind === 'aborted') {
       // A cancelled turn leaves partial agent-side history; rebuild from Pi history next time.
-      await Promise.race([turnSettled(turn), delay(5_000)])
+      await Promise.race([turn.promptSettled, delay(5_000)])
       conv.dirty = true
     }
     // The turn is over: clear the identities it established with it.
@@ -1225,39 +1214,17 @@ export class AntigravityRuntime {
       request.tenantKey !== undefined
         ? this.tenants.get(request.tenantKey)
         : undefined
-    if (conv === undefined) {
-      return {
-        content: [
-          {
-            type: 'text',
-            text: 'No harness turn is waiting for this tool call.',
-          },
-        ],
-        isError: true,
-      }
-    }
+    if (conv === undefined)
+      return toolError('No harness turn is waiting for this tool call.')
     if (
       request.conversationId !== undefined &&
       (conv.sessionId === undefined ||
         request.conversationId !== conv.sessionId)
-    ) {
-      return {
-        content: [{ type: 'text', text: 'Tenant session mismatch.' }],
-        isError: true,
-      }
-    }
+    )
+      return toolError('Tenant session mismatch.')
     const turn = conv.turn
-    if (turn === undefined || turn.finished) {
-      return {
-        content: [
-          {
-            type: 'text',
-            text: 'No harness turn is waiting for this tool call.',
-          },
-        ],
-        isError: true,
-      }
-    }
+    if (turn === undefined || turn.finished)
+      return toolError('No harness turn is waiting for this tool call.')
     if (request.name === AWAIT_TOOL_NAME) {
       const callId =
         typeof request.arguments.call_id === 'string'
@@ -1265,57 +1232,31 @@ export class AntigravityRuntime {
           : ''
       const call = turn.calls.get(callId)
       if (call === undefined)
-        return {
-          content: [
-            { type: 'text', text: `Unknown harness call id ${callId}.` },
-          ],
-          isError: true,
-        }
+        return toolError(`Unknown harness call id ${callId}.`)
       turn.relaying = false
       return this.awaitCall(turn, call, request.signal)
     }
-    if (request.name === CALL_TOOL_NAME) {
+    let name = request.name
+    let args = request.arguments
+    if (name === CALL_TOOL_NAME) {
       const rawTarget =
         typeof request.arguments.name === 'string'
           ? request.arguments.name.trim()
           : ''
-      const targetName = rawTarget.startsWith(AGENT_TOOL_PREFIX)
+      name = rawTarget.startsWith(AGENT_TOOL_PREFIX)
         ? rawTarget.slice(AGENT_TOOL_PREFIX.length)
         : rawTarget
       const rawArgs = request.arguments.arguments
-      const targetArgs =
+      args =
         rawArgs !== null &&
         typeof rawArgs === 'object' &&
         !Array.isArray(rawArgs)
           ? (rawArgs as Record<string, unknown>)
           : {}
-      if (!conv.toolNames.has(targetName)) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `The harness has no tool named ${targetName}.`,
-            },
-          ],
-          isError: true,
-        }
-      }
-      const call = turn.park(targetName, targetArgs)
-      return this.awaitCall(turn, call, request.signal)
     }
-    if (!conv.toolNames.has(request.name)) {
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `The harness has no tool named ${request.name}.`,
-          },
-        ],
-        isError: true,
-      }
-    }
-    const call = turn.park(request.name, request.arguments)
-    return this.awaitCall(turn, call, request.signal)
+    if (!conv.toolNames.has(name))
+      return toolError(`The harness has no tool named ${name}.`)
+    return this.awaitCall(turn, turn.park(name, args), request.signal)
   }
 
   private async awaitCall(
@@ -1345,10 +1286,7 @@ export class AntigravityRuntime {
         return relayNotice(call)
       }
       if (outcome === 'aborted')
-        return {
-          content: [{ type: 'text', text: 'The tool call was cancelled.' }],
-          isError: true,
-        }
+        return toolError('The tool call was cancelled.')
       return outcome
     } finally {
       if (timer !== undefined) clearTimeout(timer)
@@ -1371,241 +1309,8 @@ function messageIds(messages: readonly RequestMessage[]): string[] {
   return messages.map((m) => m.id ?? '')
 }
 
-/** Read a non-empty string field. */
-function nonEmpty(value: unknown): string | undefined {
-  return typeof value === 'string' && value.length > 0 ? value : undefined
-}
-
-/**
- * Extract the structured `(serverName, toolName)` an agent claimed in one
- * permission request: top-level `mcpServerName`/`mcpToolName` or `_meta`.
- * `title` and `rawInput` are deliberately not consulted.
- */
-function structuredToolMeta(toolCall: AcpPermissionRequest['toolCall']): {
-  serverName?: string
-  toolName?: string
-} {
-  const meta: AcpToolCallMeta | undefined = toolCall?._meta
-  const serverName =
-    nonEmpty(toolCall?.mcpServerName) ??
-    nonEmpty(meta?.mcpServerName) ??
-    nonEmpty(meta?.serverName) ??
-    nonEmpty(meta?.server)
-  const toolName =
-    nonEmpty(toolCall?.mcpToolName) ??
-    nonEmpty(meta?.mcpToolName) ??
-    nonEmpty(meta?.toolName) ??
-    nonEmpty(meta?.tool)
-  return {
-    ...(serverName !== undefined ? { serverName } : {}),
-    ...(toolName !== undefined ? { toolName } : {}),
-  }
-}
-
-/**
- * Record the structured metadata of one agent-reported tool-call update.
- * The first report establishes the identity; later updates merge only the
- * fields actually present, so a status-only `tool_call_update` never wipes an
- * established `server`/`tool`/`kind`. A later field that contradicts the
- * established identity keeps the original value and marks the record
- * anomalous — the permission gate refuses every further request for that call.
- * @returns 'created' | 'merged' | 'conflict', or undefined for ignored updates.
- */
-function recordReportedToolCall(
-  conv: Conversation,
-  update: AcpSessionUpdate,
-): 'created' | 'merged' | 'conflict' | undefined {
-  if (
-    update.sessionUpdate !== 'tool_call' &&
-    update.sessionUpdate !== 'tool_call_update'
-  )
-    return
-  if (typeof update.toolCallId !== 'string' || update.toolCallId.length === 0)
-    return
-  const meta: AcpToolCallMeta | undefined = update._meta
-  const serverName =
-    nonEmpty(update.mcpServerName) ??
-    nonEmpty(meta?.mcpServerName) ??
-    nonEmpty(meta?.serverName) ??
-    nonEmpty(meta?.server)
-  const toolName =
-    nonEmpty(update.mcpToolName) ??
-    nonEmpty(meta?.mcpToolName) ??
-    nonEmpty(meta?.toolName) ??
-    nonEmpty(meta?.tool)
-  const kind = typeof update.kind === 'string' ? update.kind : undefined
-  const existing = conv.reportedToolCalls.get(update.toolCallId)
-  const merged: ReportedToolCall = existing === undefined ? {} : { ...existing }
-  let conflict = false
-  if (kind !== undefined) {
-    if (merged.kind !== undefined && merged.kind !== kind) conflict = true
-    else merged.kind = kind
-  }
-  if (serverName !== undefined) {
-    if (merged.serverName !== undefined && merged.serverName !== serverName)
-      conflict = true
-    else merged.serverName = serverName
-  }
-  if (toolName !== undefined) {
-    if (merged.toolName !== undefined && merged.toolName !== toolName)
-      conflict = true
-    else merged.toolName = toolName
-  }
-  if (conflict) merged.conflict = true
-  conv.reportedToolCalls.set(update.toolCallId, merged)
-  if (conflict) return 'conflict'
-  return existing === undefined ? 'created' : 'merged'
-}
-
-/** Whether `rawInput` carries no arguments at all (MCP server loading probes). */
-function isEmptyInput(rawInput: unknown): boolean {
-  if (rawInput === undefined || rawInput === null) return true
-  if (typeof rawInput === 'string') return rawInput.trim().length === 0
-  if (Array.isArray(rawInput)) return rawInput.length === 0
-  if (typeof rawInput === 'object') return Object.keys(rawInput).length === 0
-  return false
-}
-
-/**
- * Diff active tools against the session's known tool set and render a compact
- * `<harness_tool_update>` block for newly added, modified, restored, or disabled tools.
- * @param conv - conversation tool state (`advertisedToolNames` and `knownTools`).
- * @param tools - active tools for the current step.
- * @returns `<harness_tool_update>` text block, or `''` when unchanged.
- */
-export function consumeToolDelta(
-  conv: {
-    readonly advertisedToolNames: ReadonlySet<string>
-    readonly knownTools: Map<string, string>
-  },
-  tools: readonly BridgeTool[],
-): string {
-  const lines: string[] = []
-  const active = new Set<string>()
-  for (const tool of tools) {
-    active.add(tool.name)
-    const hash = digest(tool)
-    if (conv.knownTools.get(tool.name) === hash) continue
-    conv.knownTools.set(tool.name, hash)
-    if (conv.advertisedToolNames.has(tool.name)) {
-      lines.push(`[tool restored: ${AGENT_TOOL_PREFIX}${tool.name}]`)
-    } else {
-      lines.push(
-        `[tool available via ${AGENT_TOOL_PREFIX}${CALL_TOOL_NAME} with {"name":"${tool.name}","arguments":{...}}]: ${JSON.stringify({ name: tool.name, description: tool.description, parameters: tool.inputSchema })}`,
-      )
-    }
-  }
-  for (const name of [...conv.knownTools.keys()]) {
-    if (!active.has(name)) {
-      conv.knownTools.delete(name)
-      lines.push(`[tool disabled: ${name}]`)
-    }
-  }
-  return lines.length > 0
-    ? `<harness_tool_update>\n${lines.join('\n')}\n</harness_tool_update>`
-    : ''
-}
-
-/** Byte ceiling keeping advertised MCP tool schemas below agy's ~1,500B lazy cutoff. */
-export const MAX_EAGER_BRIDGE_TOOL_BYTES = 1_350
-
-function shortenText(text: string, maxChars: number): string {
-  const clean = text.replace(/\s+/gu, ' ').trim()
-  if (clean.length <= maxChars) return clean
-  const sentenceEnd = clean.indexOf('. ')
-  if (sentenceEnd >= 32 && sentenceEnd + 1 <= maxChars)
-    return clean.slice(0, sentenceEnd + 1)
-  return `${clean.slice(0, Math.max(1, maxChars - 1)).trimEnd()}…`
-}
-
-function compactSchemaNode(value: unknown, maxDescChars: number): unknown {
-  if (Array.isArray(value))
-    return value.map((item) => compactSchemaNode(item, maxDescChars))
-  if (value === null || typeof value !== 'object') return value
-  const record = value as Record<string, unknown>
-  const out: Record<string, unknown> = {}
-  for (const [key, entry] of Object.entries(record)) {
-    if (key === 'description' && typeof entry === 'string') {
-      if (maxDescChars > 0) out[key] = shortenText(entry, maxDescChars)
-      continue
-    }
-    if (
-      key === 'properties' &&
-      entry !== null &&
-      typeof entry === 'object' &&
-      !Array.isArray(entry)
-    ) {
-      const props: Record<string, unknown> = {}
-      for (const [propKey, propVal] of Object.entries(
-        entry as Record<string, unknown>,
-      )) {
-        props[propKey] = compactSchemaNode(propVal, maxDescChars)
-      }
-      out[key] = props
-      continue
-    }
-    out[key] = compactSchemaNode(entry, maxDescChars)
-  }
-  return out
-}
-
-/**
- * Keep each MCP-advertised tool schema under `agy`'s eager size threshold while
- * preserving every parameter name, type, required list, and enum constraint.
- * Full prose instructions remain in Pi's system prompt.
- * @param tool - raw bridge tool descriptor.
- * @returns compacted descriptor when oversized, otherwise the original descriptor.
- */
-export function compactBridgeTool(tool: BridgeTool): BridgeTool {
-  if (
-    Buffer.byteLength(JSON.stringify(tool), 'utf8') <=
-    MAX_EAGER_BRIDGE_TOOL_BYTES
-  )
-    return tool
-  const pass1: BridgeTool = {
-    name: tool.name,
-    description: shortenText(tool.description, 220),
-    inputSchema: compactSchemaNode(tool.inputSchema, 90) as Record<
-      string,
-      unknown
-    >,
-  }
-  if (
-    Buffer.byteLength(JSON.stringify(pass1), 'utf8') <=
-    MAX_EAGER_BRIDGE_TOOL_BYTES
-  )
-    return pass1
-  return {
-    name: tool.name,
-    description: shortenText(tool.description, 140),
-    inputSchema: compactSchemaNode(tool.inputSchema, 0) as Record<
-      string,
-      unknown
-    >,
-  }
-}
-
-function toBridgeTools(tools: readonly ToolSchema[] | undefined): BridgeTool[] {
-  return (tools ?? []).map((t) =>
-    compactBridgeTool({
-      name: t.name,
-      description: t.description,
-      inputSchema:
-        t.parameters.type === undefined
-          ? { type: 'object', ...t.parameters }
-          : t.parameters,
-    }),
-  )
-}
-
-function turnSettled(turn: AcpTurn): Promise<void> {
-  return (async () => {
-    while (turn.events.size > 0 || !turn.finished) {
-      const head = turn.events.peek()
-      if (head?.kind === 'done' || head?.kind === 'error') return
-      await delay(100)
-    }
-  })()
+function toolError(text: string): BridgeToolResult {
+  return { content: [{ type: 'text', text }], isError: true }
 }
 
 /**
@@ -1637,10 +1342,14 @@ export function mapError(error: unknown): Error {
     return new LlmError(message, 'QUOTA', { cause: error })
   if (/rate.?limit|429|too many requests|overloaded|capacity/i.test(message))
     return new LlmError(message, 'RATE_LIMIT', { cause: error })
-  if (/context|too long|token limit|maximum.*tokens/i.test(message))
-    return new LlmError(message, 'CONTEXT_WINDOW_EXCEEDED', { cause: error })
   if (/timeout|timed out|deadline/i.test(message))
     return new LlmError(message, 'TIMEOUT', { cause: error })
+  if (
+    /context.*(length|window|limit|overflow|exceeded)|too long|token limit|maximum.*tokens/i.test(
+      message,
+    )
+  )
+    return new LlmError(message, 'CONTEXT_WINDOW_EXCEEDED', { cause: error })
   if (error instanceof JsonRpcRemoteError)
     return new LlmError(`Antigravity: ${message}`, 'SERVER', { cause: error })
   return new LlmError(message, 'TRANSPORT', { cause: error })

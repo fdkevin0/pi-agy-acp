@@ -136,8 +136,6 @@ export class AcpProcess {
   private child: AcpChild | undefined
   private peer: JsonRpcPeer | undefined
   private exitError: Error | undefined
-  /** Agent `initialize` result. */
-  initializeResult: Record<string, unknown> | undefined
   private readonly exitListeners = new Set<(error: Error) => void>()
   private readonly options: AcpProcessOptions
 
@@ -188,7 +186,7 @@ export class AcpProcess {
       peer.close(error)
       this.fail(error)
     })
-    this.initializeResult = await peer.request<Record<string, unknown>>(
+    await peer.request(
       'initialize',
       {
         protocolVersion: 1,

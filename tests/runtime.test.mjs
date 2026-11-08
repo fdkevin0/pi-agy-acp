@@ -14,15 +14,15 @@ import {
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { AntigravityRuntime, DEFAULT_RELAY_AFTER_MS } from '../src/runtime.ts'
 import {
-  AntigravityRuntime,
   compactBridgeTool,
-  DEFAULT_RELAY_AFTER_MS,
   MAX_EAGER_BRIDGE_TOOL_BYTES,
-} from '../src/runtime.ts'
+} from '../src/mcp-bridge.ts'
 import { defaults } from '../src/config.ts'
-const Config = (values) => ({ ...defaults, ...values })
-import { toTokenUsage } from '../src/conversation.ts'
+import { VERSION } from '../src/version.ts'
+import { AcpTurn, toTokenUsage } from '../src/conversation.ts'
+import { deferred } from '../src/util.ts'
 import {
   EMPTY_INPUT_CONTINUATION,
   REPLAY_BUDGET_BYTES,
@@ -34,10 +34,21 @@ import {
   syncOAuthToken,
 } from '../src/preflight.ts'
 
+const Config = (values) => ({ ...defaults, ...values })
 const here = dirname(fileURLToPath(import.meta.url))
 const fake = join(here, 'fake-agy.mjs')
 chmodSync(fake, 0o755)
 const runtimes = []
+
+function readJsonl(path) {
+  return existsSync(path)
+    ? readFileSync(path, 'utf8')
+        .trim()
+        .split('\n')
+        .filter(Boolean)
+        .map((line) => JSON.parse(line))
+    : []
+}
 
 function makeRuntime(extra = {}) {
   const home = mkdtempSync(join(tmpdir(), 'agy-acp-test-'))
@@ -96,30 +107,9 @@ function makeRuntime(extra = {}) {
     ...extra.host,
   })
   runtimes.push(runtime)
-  const prompts = () =>
-    existsSync(log)
-      ? readFileSync(log, 'utf8')
-          .trim()
-          .split('\n')
-          .filter(Boolean)
-          .map((l) => JSON.parse(l))
-      : []
-  const inits = () =>
-    existsSync(initLog)
-      ? readFileSync(initLog, 'utf8')
-          .trim()
-          .split('\n')
-          .filter(Boolean)
-          .map((l) => JSON.parse(l))
-      : []
-  const mcps = () =>
-    existsSync(mcpLog)
-      ? readFileSync(mcpLog, 'utf8')
-          .trim()
-          .split('\n')
-          .filter(Boolean)
-          .map((l) => JSON.parse(l))
-      : []
+  const prompts = () => readJsonl(log)
+  const inits = () => readJsonl(initLog)
+  const mcps = () => readJsonl(mcpLog)
   return { home, runtime, prompts, inits, mcps, adapter: runtime }
 }
 
@@ -238,11 +228,12 @@ test('resetSession removes closed session files after acknowledgement and preser
     closed = closing.promise.then(() => closeSession(sessionId))
     return closed
   })
-  await runtime.resetSession(conv)
+  const resetting = runtime.resetSession(conv)
   assert.equal(conv.sessionId, undefined)
   assert.equal(existsSync(join(home, 'agy', 'conversations', `${id}.db`)), true)
   closing.resolve()
   await closed
+  await resetting
   for (const suffix of ['.db', '.db-wal', '.db-shm']) {
     assert.equal(
       existsSync(join(home, 'agy', 'conversations', `${id}${suffix}`)),
@@ -266,6 +257,77 @@ test('a process restart cleans leftovers even when preflight metadata is cached'
   proc.stop()
   await runtime.ensureReady()
   assert.equal(existsSync(leftover), false)
+})
+
+test('forced warmup refreshes an observed catalog and aborting one waiter keeps shared discovery alive', async (t) => {
+  const { runtime, mcps, home } = makeRuntime()
+  const changed = t.mock.method(runtime.host, 'onModelsChanged')
+  const proc = await runtime.ensureReady()
+  assert.equal(changed.mock.callCount(), 0, 'preflight does not change models')
+  await runtime.warmup()
+  await runtime.warmup()
+  assert.equal(mcps().length, 1)
+  await runtime.warmup({ force: true })
+  assert.equal(mcps().length, 2)
+  const gate = Promise.withResolvers()
+  const entered = Promise.withResolvers()
+  const open = proc.newSession.bind(proc)
+  t.mock.method(proc, 'newSession', async (...args) => {
+    entered.resolve()
+    await gate.promise
+    return open(...args)
+  })
+  const controller = new AbortController()
+  const cancelled = runtime.warmup({ force: true, signal: controller.signal })
+  await entered.promise
+  const shared = runtime.warmup({ force: true })
+  controller.abort()
+  await assert.rejects(cancelled, { name: 'AbortError' })
+  gate.resolve()
+  await shared
+  assert.equal(mcps().length, 3)
+  const id = mcps().at(-1).session
+  assert.equal(
+    existsSync(join(home, 'agy', 'conversations', `${id}.db`)),
+    false,
+  )
+  await assert.rejects(
+    runtime.warmup({ force: true, signal: AbortSignal.abort() }),
+    { name: 'AbortError' },
+  )
+  assert.equal(mcps().length, 3)
+})
+
+test('light conversation reset releases sessions and their files while keeping the live process and caches', async () => {
+  const { runtime, inits, home } = makeRuntime()
+  const request = {
+    model: 'gemini-4-argon',
+    sessionId: 'LIGHT',
+    messages: [sys, user('light', 'hello')],
+  }
+  await collect(runtime.stream(request))
+  const proc = await runtime.ensureReady()
+  const url = runtime.bridge.url
+  const preflight = runtime.preflight
+  const catalog = runtime.catalog
+  const quota = runtime.quota
+  const id = runtime.conversations.get('LIGHT').sessionId
+  await runtime.resetConversations()
+  assert.equal(runtime.status().liveSessions, 0)
+  assert.equal(runtime.tenants.size, 0)
+  assert.equal(
+    existsSync(join(home, 'agy', 'conversations', `${id}.db`)),
+    false,
+  )
+  assert.equal(existsSync(join(home, 'agy', 'brain', id)), false)
+  assert.equal(proc.alive, true)
+  assert.equal(runtime.bridge.url, url)
+  assert.equal(runtime.preflight, preflight)
+  assert.equal(runtime.catalog, catalog)
+  assert.equal(runtime.quota, quota)
+  await collect(runtime.stream(request))
+  assert.equal(inits().length, 1)
+  assert.notEqual(runtime.conversations.get('LIGHT').sessionId, id)
 })
 
 const sys = {
@@ -366,6 +428,7 @@ test('single turn streams reasoning, text, exact usage, and the selected model a
   assert.equal(adapter.status().lastTurn.model, 'gemini-3.8-flash')
   assert.ok(adapter.status().lastTurn.durationMs >= 0)
   assert.equal(adapter.status().lastTurn.retryNotices, 0)
+  assert.equal(adapter.status().lastTurn.usage.inputTokens, 600)
 })
 
 test('a tool call parks, ends the step, and resumes the same ACP turn with the Pi result', async () => {
@@ -754,6 +817,62 @@ test('cancellation aborts the step and the next turn rebuilds', async () => {
   )
 })
 
+test('cancelled prompts settle despite queued text, including continuations and failures', async (t) => {
+  for (const continuation of [false, true]) {
+    for (const fails of [false, true]) {
+      await t.test(
+        `continuation=${continuation}, fails=${fails}`,
+        { timeout: 1500 },
+        async () => {
+          const { runtime } = makeRuntime()
+          const conv = runtime.createConversation('settlement')
+          const turn = (conv.turn = new AcpTurn('test'))
+          const pending = deferred()
+          let prompts = 0
+          const proc = {
+            prompt: () =>
+              ++prompts === 1 && continuation
+                ? Promise.resolve({ stopReason: 'max_tokens' })
+                : pending.promise,
+            cancel: () => {},
+          }
+          runtime.startPrompt(conv, proc, [])
+          const controller = new AbortController()
+          const stream = runtime.pump(
+            conv,
+            proc,
+            { model: 'gemini-4-argon', signal: controller.signal },
+            'high',
+          )
+          const finish = stream.next()
+          await new Promise(setImmediate)
+          assert.equal(prompts, continuation ? 2 : 1)
+          controller.abort()
+          turn.events.push({ kind: 'text', text: 'late text' })
+          assert.equal((await finish).value.reason.kind, 'aborted')
+          let settled = false
+          const done = stream.next().then((result) => {
+            settled = true
+            return result
+          })
+          await new Promise(setImmediate)
+          assert.equal(settled, false, 'cleanup waits for the pending prompt')
+          if (fails) pending.reject(new Error('cancelled transport'))
+          else pending.resolve({ stopReason: 'cancelled' })
+          assert.equal((await done).done, true)
+          assert.equal(
+            turn.events.peek().kind,
+            'text',
+            'settlement does not depend on draining output',
+          )
+          assert.equal(conv.dirty, true)
+          assert.equal(conv.turn, undefined)
+        },
+      )
+    }
+  }
+})
+
 test('an output-length stop continues automatically (long decode)', async () => {
   const { adapter } = makeRuntime()
   const chunks = await collect(
@@ -766,6 +885,7 @@ test('an output-length stop continues automatically (long decode)', async () => 
   )
   assert.equal(finishOf(chunks).reason.kind, 'stop')
   assert.match(textOf(chunks), /^part-one echo:/)
+  assert.equal(adapter.status().lastTurn.usage.inputTokens, 600)
 })
 
 test('images in user input are sent as ACP image blocks', async () => {
@@ -896,6 +1016,7 @@ test('the ACP client identifies itself as pi-agy-acp', async () => {
     }),
   )
   assert.equal(inits()[0].clientInfo.name, 'pi-agy-acp')
+  assert.equal(inits()[0].clientInfo.version, VERSION)
 })
 
 test('Claude honors the requested thinking level', async () => {

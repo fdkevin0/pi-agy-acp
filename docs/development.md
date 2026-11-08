@@ -3,9 +3,11 @@
 Start with the [installation guide](../README.md#install) to use the extension.
 For settings and user-visible limits, see the [reference](reference.md).
 
-For development, run these commands from your clone:
+Clone the repository and install its dependencies:
 
 ```sh
+git clone https://github.com/fdkevin0/pi-agy-acp.git
+cd pi-agy-acp
 npm install
 pi -e ./index.ts
 ```
@@ -24,13 +26,34 @@ pi -e ./index.ts
 5. The adapter drains the runtime's generator before publishing completion, so
    session cleanup finishes before Pi can start its next step.
 
-Provider registration and cache-only refresh do not start processes, sockets, or
-timers. Successful session replacement is cleaned up through `session_shutdown`;
-pre-switch and pre-fork interception hooks do not reset the runtime.
-
-The bridge binds to `127.0.0.1`, uses per-session bearer credentials, and checks
-structured tool identity before granting permissions. Session changes and
-compaction trigger cleanup and rebuilding; shutdown closes processes and the bridge.
+- **Model discovery:** Registration and cache-only refresh start no processes,
+  sockets, or timers. Concurrent refreshes share a discovery session; after a live
+  catalog is observed, later refreshes reuse it unless forced. Refresh suppresses
+  provider re-registration so it cannot cancel itself. Cancellation ends the
+  caller's wait; shared discovery still closes its session and cleans its files.
+- **Session lifecycle:** The bridge binds to `127.0.0.1`, uses per-session bearer
+  credentials, and validates structured tool identity before granting permissions.
+  Tree navigation and compaction close conversation sessions and their files,
+  retaining the process, bridge, and caches. Pi 1.5.0 reports completed switches
+  through `session_start` (`new`, `resume`, or `fork`), which uses the same light
+  reset if the runtime survives. `session_shutdown` and `/agy-acp reset` dispose
+  the runtime. Cancelled turns wait for prompt settlement for up to five seconds,
+  then mark the conversation for rebuilding.
+- **Quota and TUI:** Settled checks share the reader's TTL and in-flight request
+  without blocking Pi. Model selection reads memory only. UI generation checks
+  discard stale background results; warning keys include bucket, reset time, and
+  threshold. An explicit quota query can discover uncached account tiers through
+  one tool-less ACP session per runtime, persisting the tier in `catalog.json`.
+  Email lookup reads at most the last 64 KiB of each candidate login log and uses
+  the last match in the first matching file. Runtime warnings stay off stderr to
+  preserve TUI rendering; diagnostics use status and agy's logs.
+- **Pi stream and error contracts:** `onPayload` can replace the request, and
+  `onProviderStreamEvent` observes events before conversion. At the first stream
+  event, `onResponse` receives synthetic status `200` and empty headers before
+  normalization; startup failures and an initial aborted finish emit no response.
+  ACP supplies no HTTP response metadata. Context overflow and exhausted quota
+  receive `context_length_exceeded` and `quota exceeded` markers for Pi's
+  compaction and retry decisions; transport timeouts remain distinct.
 
 ## Source layout
 
@@ -38,10 +61,11 @@ compaction trigger cleanup and rebuilding; shutdown closes processes and the bri
 | --- | --- |
 | `index.ts` | Provider registration, commands, and Pi lifecycle hooks. |
 | `src/pi-stream.ts`, `src/protocol.ts` | Pi message conversion and bridge event contracts. |
-| `src/runtime.ts`, `src/conversation.ts`, `src/history.ts` | Sessions, pending tool calls, streaming, and history replay. |
-| `src/acp-process.ts`, `src/jsonrpc.ts`, `src/mcp-bridge.ts` | ACP transport and local MCP server. |
+| `src/runtime.ts`, `src/conversation.ts`, `src/history.ts` | Session orchestration, pending calls, tool identity metadata, streaming, and history replay. |
+| `src/acp-process.ts`, `src/jsonrpc.ts`, `src/mcp-bridge.ts` | ACP transport, local MCP server, tool schema compression, and tool deltas. |
 | `src/host.ts`, `src/preflight.ts`, `src/config.ts` | Process execution, executable discovery, and isolated home setup. |
 | `src/catalog.ts`, `src/quota.ts`, `src/format.ts`, `src/util.ts` | Model catalog, quota queries, TUI notice formatting, and shared utilities. |
+| `src/version.ts` | ACP/MCP version read from `package.json`. |
 | `tests/` | Scripted agy fixture, runtime tests, and Pi integration tests. |
 
 Upstream provenance and licensing are recorded in [NOTICE](../NOTICE) and
@@ -59,9 +83,8 @@ Tests run directly with Node's native TypeScript support; `tsx` is not required.
 Automated tests use a scripted local `agy` substitute so `npm test` runs offline
 without consuming account quota. They need permission to listen on `127.0.0.1`.
 
-Coverage includes tool suspension and resumption, parallel calls, permission
-checks, cancellation, history rewrites, images, quota errors, model discovery,
-account metadata caching, bounded login-log reads, and Pi stream completion.
+Tests cover ACP transport and sessions, tool routing and permissions, model and
+account discovery, Pi streaming and cancellation, and quota UI behavior.
 Listing models verifies extension loading, not access to the real service.
 
 To inspect the package contents without publishing:

@@ -13,12 +13,15 @@
 
 import { LlmError } from './protocol.ts'
 import type { ContentBlock, StreamChunk, TokenUsage } from './protocol.ts'
-import type { AcpPromptResult, AcpSessionUpdate } from './acp-process.ts'
+import type {
+  AcpPromptResult,
+  AcpSessionUpdate,
+  AcpPermissionRequest,
+  AcpToolCallMeta,
+} from './acp-process.ts'
 import type { BridgeTool, BridgeToolResult } from './mcp-bridge.ts'
 import { AGENT_TOOL_PREFIX, CALL_TOOL_NAME } from './history.ts'
 import { AsyncQueue, deferred, type Deferred } from './util.ts'
-
-export { CALL_TOOL_NAME }
 
 /** Agent-side transport retry notice streamed as message text, e.g. `⚠ API error (attempt 1): …`. */
 const AGENT_RETRY_NOTICE = /^\s*⚠\s*API error \(attempt \d+\)/
@@ -144,6 +147,9 @@ export class AcpTurn {
   continuations = 0
   /** The agent ended the prompt. */
   finished = false
+  /** Settles after the current prompt's result or error has been queued. */
+  promptSettled: Promise<void> = Promise.resolve()
+  usage?: AcpPromptResult['usage']
   /** A parked call was answered with a still-running notice and the agent has not resumed waiting yet. */
   relaying = false
   /** The turn produced visible text or a tool call. */
@@ -258,8 +264,6 @@ export interface PumpHost {
   continuePrompt(): Promise<AcpPromptResult>
   /** Request cancellation of the running turn. */
   cancel(): void
-  /** Observe the final usage of a prompt turn. */
-  recordUsage(usage: AcpPromptResult['usage'], steps: number): void
 }
 
 /**
@@ -427,7 +431,7 @@ export async function* pumpStep(
           turn.continuations < host.maxContinuations
         ) {
           turn.continuations++
-          void host.continuePrompt().then(
+          turn.promptSettled = host.continuePrompt().then(
             (result) => turn.events.push({ kind: 'done', result }),
             (error: unknown) =>
               turn.events.push({
@@ -441,7 +445,7 @@ export async function* pumpStep(
         turn.finished = true
         yield* close()
         const calls = turn.toolSteps + turn.continuations + 1
-        host.recordUsage(event.result.usage, calls)
+        turn.usage = event.result.usage
         const usage = toTokenUsage(event.result.usage, calls)
         if (usage !== undefined) yield { type: 'usage', usage }
         if (stop === 'end_turn' && !turn.produced) {
@@ -517,4 +521,100 @@ export function relayNotice(call: ParkedCall): BridgeToolResult {
       },
     ],
   }
+}
+
+/** Structured MCP metadata the agent reported for one tool call. */
+export interface ReportedToolCall {
+  kind?: string
+  serverName?: string
+  toolName?: string
+  /** Set when later updates contradicted an already established field. */
+  conflict?: boolean
+}
+
+/** Read a non-empty string field. */
+function nonEmpty(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined
+}
+
+/**
+ * Extract the structured `(serverName, toolName)` an agent claimed in one
+ * permission request: top-level `mcpServerName`/`mcpToolName` or `_meta`.
+ * `title` and `rawInput` are deliberately not consulted.
+ */
+export function structuredToolMeta(
+  toolCall: AcpPermissionRequest['toolCall'],
+): {
+  serverName?: string
+  toolName?: string
+} {
+  const meta: AcpToolCallMeta | undefined = toolCall?._meta
+  const serverName =
+    nonEmpty(toolCall?.mcpServerName) ??
+    nonEmpty(meta?.mcpServerName) ??
+    nonEmpty(meta?.serverName) ??
+    nonEmpty(meta?.server)
+  const toolName =
+    nonEmpty(toolCall?.mcpToolName) ??
+    nonEmpty(meta?.mcpToolName) ??
+    nonEmpty(meta?.toolName) ??
+    nonEmpty(meta?.tool)
+  return {
+    ...(serverName !== undefined ? { serverName } : {}),
+    ...(toolName !== undefined ? { toolName } : {}),
+  }
+}
+
+/**
+ * Record the structured metadata of one agent-reported tool-call update.
+ * The first report establishes the identity; later updates merge only the
+ * fields actually present, so a status-only `tool_call_update` never wipes an
+ * established `server`/`tool`/`kind`. A later field that contradicts the
+ * established identity keeps the original value and marks the record
+ * anomalous — the permission gate refuses every further request for that call.
+ * @returns 'created' | 'merged' | 'conflict', or undefined for ignored updates.
+ */
+export function recordReportedToolCall(
+  conv: { reportedToolCalls: Map<string, ReportedToolCall> },
+  update: AcpSessionUpdate,
+): 'created' | 'merged' | 'conflict' | undefined {
+  if (
+    update.sessionUpdate !== 'tool_call' &&
+    update.sessionUpdate !== 'tool_call_update'
+  )
+    return
+  if (typeof update.toolCallId !== 'string' || update.toolCallId.length === 0)
+    return
+  const { serverName, toolName } = structuredToolMeta(update)
+  const kind = typeof update.kind === 'string' ? update.kind : undefined
+  const existing = conv.reportedToolCalls.get(update.toolCallId)
+  const merged: ReportedToolCall = existing === undefined ? {} : { ...existing }
+  let conflict = false
+  if (kind !== undefined) {
+    if (merged.kind !== undefined && merged.kind !== kind) conflict = true
+    else merged.kind = kind
+  }
+  if (serverName !== undefined) {
+    if (merged.serverName !== undefined && merged.serverName !== serverName)
+      conflict = true
+    else merged.serverName = serverName
+  }
+  if (toolName !== undefined) {
+    if (merged.toolName !== undefined && merged.toolName !== toolName)
+      conflict = true
+    else merged.toolName = toolName
+  }
+  if (conflict) merged.conflict = true
+  conv.reportedToolCalls.set(update.toolCallId, merged)
+  if (conflict) return 'conflict'
+  return existing === undefined ? 'created' : 'merged'
+}
+
+/** Whether `rawInput` carries no arguments at all (MCP server loading probes). */
+export function isEmptyInput(rawInput: unknown): boolean {
+  if (rawInput === undefined || rawInput === null) return true
+  if (typeof rawInput === 'string') return rawInput.trim().length === 0
+  if (Array.isArray(rawInput)) return rawInput.length === 0
+  if (typeof rawInput === 'object') return Object.keys(rawInput).length === 0
+  return false
 }

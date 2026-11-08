@@ -14,38 +14,25 @@ parallel tool calls.
 
 ## Install
 
-From GitHub (recommended):
+Install from GitHub (recommended) or npm:
 
 ```sh
 pi install git:github.com/fdkevin0/pi-agy-acp
-```
-
-From npm:
-
-```sh
+# Or:
 pi install npm:pi-agy-acp
 ```
 
-To install only for the current project, writing to `.pi/settings.json`:
-
-```sh
-pi install -l git:github.com/fdkevin0/pi-agy-acp
-```
-
-To try it for one invocation without saving an installation to settings:
+Add `-l` to install only for the current project (`.pi/settings.json`). To try,
+update, or remove the extension:
 
 ```sh
 pi -e git:github.com/fdkevin0/pi-agy-acp
+pi update --extensions
+pi remove git:github.com/fdkevin0/pi-agy-acp
 ```
 
-To install a local clone for development:
-
-```sh
-git clone https://github.com/fdkevin0/pi-agy-acp.git
-pi install ./pi-agy-acp
-```
-
-See [development setup](docs/development.md) for dependencies and local testing.
+For npm, remove `npm:pi-agy-acp` instead. Add `-l` when removing a project-local
+installation. See [development setup](docs/development.md) for local testing.
 
 ## Usage
 
@@ -57,23 +44,11 @@ automatically from your account.
 | Command | Purpose |
 | --- | --- |
 | `/agy-acp` or `/agy-acp status` | Show runtime state, account details, models, sessions, and the last turn. |
-| `/agy-acp quota` | Show a loading animation in the TUI, then account email, subscription plan, grouped 5h/weekly quota bars, and reset countdowns when available. |
+| `/agy-acp quota` | Show account details, grouped quota bars, and reset countdowns. |
 | `/agy-acp reset` | Close ACP sessions; the next request rebuilds the connection. |
 
-Update installed extensions:
-
-```sh
-pi update --extensions
-```
-
-Remove a GitHub installation:
-
-```sh
-pi remove git:github.com/fdkevin0/pi-agy-acp
-```
-
-For an npm installation, use `pi remove npm:pi-agy-acp`. Add `-l` when removing
-a project-local installation.
+After an Antigravity turn settles, the status bar shows remaining quota (for example,
+`AGY 80%`) and warns when quota is low; see [quota status](docs/reference.md#quota-status-and-warnings).
 
 Default prices are zero, not a promise of free calls. Pi pricing overrides are
 used when configured.
@@ -82,4 +57,5 @@ used when configured.
 
 - [Reference](docs/reference.md): commands, configuration, stored data, model discovery, and limitations.
 - [Development](docs/development.md): setup, request flow, source layout, and verification.
+- [Changelog](CHANGELOG.md): release history and upcoming changes.
 - [Attribution](NOTICE) and [MIT license](LICENSE).

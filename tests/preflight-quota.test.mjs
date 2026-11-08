@@ -520,14 +520,14 @@ test('provider registration is lazy, refresh respects context, and catalog chang
       signal: AbortSignal.abort(),
     })
     assert.equal(warmups, 0)
-    await provider.refreshModels({
+    const refreshed = await provider.refreshModels({
       allowNetwork: true,
       signal: new AbortController().signal,
     })
     await Promise.all(offlineRefreshes)
     assert.equal(warmups, 1)
-    assert.equal(registrations.length, 2)
-    assert.equal(registrations.at(-1).models[0].thinkingLevelMap.medium, null)
+    assert.equal(registrations.length, 1)
+    assert.equal(refreshed[0].thinkingLevelMap.medium, null)
     assert.equal(
       runtime.catalog.observe([
         { id: 'thought_level', options: [{ value: 'high' }] },
@@ -536,7 +536,7 @@ test('provider registration is lazy, refresh respects context, and catalog chang
     )
     runtime.host.onModelsChanged()
     assert.equal(registrations.at(-1).models[0].thinkingLevelMap.low, null)
-    assert.equal(registrations.length, 3)
+    assert.equal(registrations.length, 2)
     await provider.refreshModels()
     assert.equal(warmups, 2)
     assert.equal(handlers.has('session_before_switch'), false)
@@ -546,10 +546,16 @@ test('provider registration is lazy, refresh respects context, and catalog chang
       'dispose',
       async () => {},
     )
+    const lightReset = t.mock.method(
+      runtime,
+      'resetConversations',
+      async () => {},
+    )
     await handlers.get('session_tree')()
     await handlers.get('session_compact')()
     await handlers.get('session_shutdown')()
-    assert.equal(disposed.mock.callCount(), 3)
+    assert.equal(disposed.mock.callCount(), 1)
+    assert.equal(lightReset.mock.callCount(), 2)
     assert.deepEqual(
       command.getArgumentCompletions(''),
       ['status', 'quota', 'reset'].map((value) => ({ value, label: value })),
@@ -684,7 +690,6 @@ const statusSnapshot = {
   home: '/tmp/pi-home',
   contextWindow: 256000,
   defaultEffort: 'high',
-  longDecodeContinuations: 3,
   efforts: ['low', 'medium', 'high'],
   liveSessions: 0,
   activeTurns: 0,

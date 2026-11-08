@@ -1,10 +1,10 @@
-import { createHash } from 'node:crypto'
 import {
   createAssistantMessageEventStream,
   calculateCost,
   getCurrentTools,
   getSystemMessageText,
   renderSystemMessageUpdate,
+  ToolCallArgumentsStream,
 } from '@earendil-works/pi-ai'
 import type {
   AssistantMessage,
@@ -20,26 +20,30 @@ import type {
   RequestMessage,
   StreamChunk,
 } from './protocol.ts'
+import { LlmError } from './protocol.ts'
+import { digest } from './util.ts'
 
 export function requestMessages(messages: Message[]): RequestMessage[] {
-  return messages.map((message, index) => {
-    const id = createHash('sha256')
-      .update(JSON.stringify(message))
-      .digest('hex')
-    if (message.role === 'system')
+  let leadingSystem = true
+  return messages.flatMap<RequestMessage>((message) => {
+    const id = digest(message)
+    if (message.role === 'system') {
+      const text = leadingSystem
+        ? getSystemMessageText(message)
+        : renderSystemMessageUpdate(message)
+      if (!leadingSystem && text.trim().length === 0) return []
       return {
         id,
         role: 'system',
         content: [
           {
             type: 'text',
-            text:
-              index === 0
-                ? getSystemMessageText(message)
-                : renderSystemMessageUpdate(message),
+            text,
           },
         ],
       }
+    }
+    leadingSystem = false
     const content: ContentBlock[] =
       typeof message.content === 'string'
         ? [{ type: 'text', text: message.content }]
@@ -54,8 +58,6 @@ export function requestMessages(messages: Message[]): RequestMessage[] {
                   name: block.name,
                   arguments: JSON.stringify(block.arguments),
                 }
-              case 'image':
-                return block
               default:
                 return block
             }
@@ -77,6 +79,23 @@ export function requestMessages(messages: Message[]): RequestMessage[] {
       }
     return { id, role: 'user', content }
   })
+}
+
+function errorMessage(
+  message: string | undefined,
+  code?: string,
+): string | undefined {
+  if (
+    code === 'CONTEXT_WINDOW_EXCEEDED' &&
+    !/context_length_exceeded/i.test(message ?? '')
+  )
+    return `context_length_exceeded: ${message ?? ''}`
+  if (
+    code === 'QUOTA' &&
+    !/quota exceeded|insufficient_quota/i.test(message ?? '')
+  )
+    return `quota exceeded: ${message ?? ''}`
+  return message
 }
 export interface StreamRuntime {
   stream(options: GenerateOptions): AsyncIterable<StreamChunk>
@@ -117,16 +136,15 @@ export function streamPi(
         })),
         sessionId: options.sessionId,
         signal: options.signal,
-        reasoningEffort:
-          options.reasoning === 'minimal'
-            ? 'low'
-            : options.reasoning === 'xhigh' || options.reasoning === 'max'
-              ? 'high'
-              : options.reasoning === 'low' ||
-                  options.reasoning === 'medium' ||
-                  options.reasoning === 'high'
-                ? options.reasoning
-                : undefined,
+        reasoningEffort: {
+          off: undefined,
+          minimal: 'low',
+          low: 'low',
+          medium: 'medium',
+          high: 'high',
+          xhigh: 'high',
+          max: 'high',
+        }[options.reasoning ?? 'off'],
       }
       const replacement = await options.onPayload?.(request, model)
       if (replacement !== undefined)
@@ -137,8 +155,12 @@ export function streamPi(
       stream.push({ type: 'start', partial: message })
       let finish: Extract<StreamChunk, { type: 'finish' }> | undefined
       let responseReported = false
+      const toolArguments = new Map<number, ToolCallArgumentsStream>()
       for await (const chunk of runtime.stream(request)) {
-        if (!responseReported) {
+        if (
+          !responseReported &&
+          !(chunk.type === 'finish' && chunk.reason.kind === 'aborted')
+        ) {
           // ACP has no HTTP headers; report a synthetic response before its first event.
           await options.onResponse?.({ status: 200, headers: {} }, model)
           responseReported = true
@@ -181,23 +203,25 @@ export function streamPi(
             partial: message,
           })
         } else if (chunk.type === 'tool-call-delta') {
-          message.content[chunk.index] = {
-            type: 'toolCall',
-            id: chunk.id,
-            name: chunk.name,
-            arguments: {},
+          let args = toolArguments.get(chunk.index)
+          if (!args) {
+            args = new ToolCallArgumentsStream()
+            toolArguments.set(chunk.index, args)
+            message.content[chunk.index] = {
+              type: 'toolCall',
+              id: chunk.id,
+              name: chunk.name,
+              arguments: {},
+            }
+            stream.push({
+              type: 'toolcall_start',
+              contentIndex: chunk.index,
+              partial: message,
+            })
           }
-          stream.push({
-            type: 'toolcall_start',
-            contentIndex: chunk.index,
-            partial: message,
-          })
-          message.content[chunk.index] = {
-            type: 'toolCall',
-            id: chunk.id,
-            name: chunk.name,
-            arguments: JSON.parse(chunk.argumentsDelta),
-          }
+          const block = message.content[chunk.index]!
+          if (block.type === 'toolCall')
+            block.arguments = args.append(chunk.argumentsDelta)
           stream.push({
             type: 'toolcall_delta',
             contentIndex: chunk.index,
@@ -206,14 +230,18 @@ export function streamPi(
           })
         } else if (chunk.type === 'block-end') {
           const block = message.content[chunk.index]!
-          if (block.type === 'toolCall')
+          if (block.type === 'toolCall') {
+            const args = toolArguments.get(chunk.index)!
+            if (chunk.block.type === 'tool-call')
+              args.replace(chunk.block.arguments)
+            Object.assign(block, args.finish())
             stream.push({
               type: 'toolcall_end',
               contentIndex: chunk.index,
               toolCall: block,
               partial: message,
             })
-          else
+          } else
             stream.push({
               type: block.type === 'thinking' ? 'thinking_end' : 'text_end',
               contentIndex: chunk.index,
@@ -229,7 +257,10 @@ export function streamPi(
         const reason = finish.reason.kind
         if (reason === 'aborted' || reason === 'error') {
           message.stopReason = reason
-          message.errorMessage = finish.reason.failure?.message
+          message.errorMessage = errorMessage(
+            finish.reason.failure?.message,
+            finish.reason.failure?.code,
+          )
           stream.push({ type: 'error', reason, error: message })
         } else {
           message.stopReason =
@@ -245,8 +276,10 @@ export function streamPi(
       throw new Error('ACP stream ended without a finish event')
     } catch (error) {
       message.stopReason = options.signal?.aborted ? 'aborted' : 'error'
-      message.errorMessage =
-        error instanceof Error ? error.message : String(error)
+      message.errorMessage = errorMessage(
+        error instanceof Error ? error.message : String(error),
+        error instanceof LlmError ? error.code : undefined,
+      )
       stream.push({ type: 'error', reason: message.stopReason, error: message })
     } finally {
       stream.end()

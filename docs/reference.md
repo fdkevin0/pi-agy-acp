@@ -63,20 +63,33 @@ response displays `No quota data available.`.
 
 ### Account details
 
-Both panels show the email and subscription plan when known. The plan comes from
-ACP session metadata and is saved in `catalog.json`. If no plan is cached, the
-first quota check also tries a tool-less ACP discovery session in parallel with
-the quota query. This starts ACP but sends no model prompt. Discovery is attempted
-once per runtime; failure still allows the quota result to appear. Use
-`/agy-acp reset` to allow another attempt. Viewing status never starts discovery.
+Both panels show the email and subscription plan when known, omitting unavailable
+fields. If no plan is cached, the first `/agy-acp quota` query also tries to discover
+it. This may start ACP but sends no model prompt; failure does not prevent quota
+from appearing. Use `/agy-acp reset` to retry discovery. Viewing status never starts it.
 
-The email is read from the latest login entry in the last 64 KiB of the isolated
-home's `acp.log`; it is not saved in the model cache. With the default home only,
-the reader also checks `~/.gemini/antigravity-cli/cli.log` if needed. A custom
-`PI_AGY_HOME` never falls back to that global log. Either field appears on its own
-when the other is unavailable; the account line is omitted when neither is known.
-These details are best-effort: cached plans and login logs can be stale after an
-account change.
+The email comes from login logs. With the default home only, the extension also
+checks `~/.gemini/antigravity-cli/cli.log` if needed; a custom `PI_AGY_HOME` stays
+isolated. Cached plans and login logs can be stale after an account change.
+
+### Quota status and warnings
+
+When a run using `antigravity-acp` fully settles, the extension checks `/usage`
+in the background and shows a compact status such as `AGY 80%`. It uses the
+lowest known window in the selected model family's group, falling back to the
+lowest known quota across groups when the family cannot be matched. Failed
+checks stay silent. Successful results and failures both respect the two-minute
+quota TTL, and overlapping background checks are skipped.
+
+At 20% and 5% remaining, a warning appears once per bucket, reset time, and
+threshold. `/agy-acp quota` explicitly refreshes quota and updates the status;
+`/agy-acp status` uses fresh cached quota only. Neither session start nor model
+selection launches a quota command. Selecting another provider hides the status;
+returning to Antigravity uses only a fresh in-memory snapshot. Reset and shutdown
+clear the status.
+
+While loaded, this extension vetoes Pi's automatic prompt-cache warming to avoid
+idle requests consuming quota. It does not alter explicit model requests.
 
 ## Configuration
 
@@ -98,13 +111,11 @@ PI_AGY_COMMAND=/absolute/path/to/agy pi -e ./index.ts
 The dedicated directory isolates the bridge agent from your normal agy tools and
 plugins. It contains agy-managed session data, logs, and the extension's model cache.
 
-Closed temporary ACP sessions have their database files and brain directories
-removed automatically. Before starting ACP, the extension also removes leftover
-session files, summary indexes, and numeric `acp.log.<pid>` backups. It retains
-the current `acp.log`, model cache, and authentication files; Pi owns the history
-used to rebuild sessions. Cleanup is best-effort if files are locked. Use a
-different `PI_AGY_HOME` for each concurrently running Pi instance, since startup
-cleanup assumes exclusive use of the directory.
+Temporary session data and old logs are removed automatically. The current log,
+model cache, and authentication files are retained; sessions rebuild from Pi's
+history. Cleanup is best-effort if files are locked. Use a different `PI_AGY_HOME`
+for each concurrently running Pi instance, since startup cleanup assumes exclusive
+use of the directory.
 
 With file-backed authentication, the extension copies the existing OAuth token
 from your normal agy directory and sets its permissions to `0600`. Do not commit
@@ -112,16 +123,12 @@ or share this directory. Authentication and token refresh remain agy's responsib
 
 ## Models and context
 
-Loading the extension reads the cached model catalog, or falls back to five model
-families, without starting agy. Pi's model refresh queries ACP for the account's
-catalog once per runtime. Concurrent refreshes share one discovery session;
-after a refresh or normal session observes the live catalog, later refreshes
-reuse it. The first request also discovers models and validates the selection.
-Cache-only refreshes and refreshes already cancelled before startup do not launch
-ACP. Server-advertised models are not hidden, and live catalog changes update
-Pi's model selector. The selector exposes only the ACP reasoning levels offered
-for each model. Direct requests map `minimal` to `low` and `xhigh` or `max` to
-`high`; `off` leaves the ACP effort unspecified, using the runtime default.
+Loading the extension uses the cached catalog, or five fallback model families,
+without starting agy. Model refresh or the first request updates available models
+and reasoning levels from ACP. A forced refresh queries again; refreshes can be
+cancelled. The selector exposes only the reasoning levels offered for each model.
+Direct requests map `minimal` to `low` and `xhigh` or `max` to `high`; `off` uses
+the runtime default.
 
 The fallback families are:
 
@@ -155,12 +162,6 @@ This version targets the `@earendil-works/*` Pi packages at version 1.5.x.
 Host peer dependencies use `*` as required by Pi package conventions; validation
 has been performed against version 1.5.0. Compatibility with older
 `@mariozechner/*` interfaces is not claimed.
-
-The bridge supports `onPayload` request replacement and `onProviderStreamEvent`
-observation before conversion to Pi events. At the first ACP stream event, it
-invokes `onResponse` with synthetic status `200` and empty headers before
-normalizing that event. This is a Pi instrumentation notification, not an HTTP
-response from agy. Startup errors before the first event do not emit it.
 
 Sampling parameters, output limits, forced `toolChoice`, and provider-scoped
 environment overrides are not mapped to ACP. See
