@@ -1,3 +1,4 @@
+import type { QuotaDisplay } from './config.ts'
 import type {
   AccountInfo,
   QuotaSnapshot,
@@ -48,12 +49,22 @@ export function quotaForModel(
   return lowest
 }
 
+/** Convert a remaining fraction (`0..1`) into the fraction shown for `display`. */
+export function displayFraction(
+  remainingFraction: number,
+  display: QuotaDisplay = 'used',
+): number {
+  return display === 'used' ? 1 - remainingFraction : remainingFraction
+}
+
 export function formatQuotaStatus(
   snapshot: QuotaSnapshot,
   model?: string,
+  display: QuotaDisplay = 'used',
 ): string | undefined {
   const quota = quotaForModel(snapshot, model)
-  return quota ? `AGY ${Math.round(quota.fraction * 100)}%` : undefined
+  if (!quota) return undefined
+  return `AGY ${Math.round(displayFraction(quota.fraction, display) * 100)}%`
 }
 
 function resetCountdown(resetTime: string, now: number): string {
@@ -71,6 +82,7 @@ function resetCountdown(resetTime: string, now: number): string {
 export function formatQuota(
   snapshot: QuotaSnapshot,
   now = Date.now(),
+  display: QuotaDisplay = 'used',
 ): FormattedNotice {
   const stale = snapshot.status === 'error' && snapshot.groups.length > 0
   const lines = [`Antigravity Quota${stale ? ' (stale)' : ''}`]
@@ -94,10 +106,12 @@ export function formatQuota(
       lines.push('    No quota windows available.')
     for (const bucket of group.buckets) {
       const fraction = clampFraction(bucket.remainingFraction)
-      const filled = fraction === undefined ? 0 : Math.round(fraction * 12)
+      const shown =
+        fraction === undefined ? undefined : displayFraction(fraction, display)
+      const filled = shown === undefined ? 0 : Math.round(shown * 12)
       const bar = '█'.repeat(filled) + '░'.repeat(12 - filled)
       const percent =
-        fraction === undefined ? 'n/a' : `${Math.round(fraction * 100)}%`
+        shown === undefined ? 'n/a' : `${Math.round(shown * 100)}%`
       const label = (
         bucket.window ||
         bucket.name ||

@@ -5,10 +5,18 @@ import {
   type ExtensionContext,
 } from '@earendil-works/pi-coding-agent'
 import { AntigravityRuntime } from './src/runtime.ts'
-import { defaults } from './src/config.ts'
+import {
+  asQuotaDisplay,
+  DEFAULT_QUOTA_DISPLAY,
+  defaults,
+  readQuotaDisplayPreference,
+  writeQuotaDisplayPreference,
+  type QuotaDisplay,
+} from './src/config.ts'
 import { spawnAcp, runCommand } from './src/host.ts'
 import { streamPi } from './src/pi-stream.ts'
 import {
+  displayFraction,
   formatQuota,
   formatStatus,
   formatQuotaStatus,
@@ -17,6 +25,7 @@ import {
 import type { QuotaSnapshot } from './src/quota.ts'
 
 export default function (pi: ExtensionAPI) {
+  const envQuotaDisplay = asQuotaDisplay(process.env.PI_AGY_QUOTA_DISPLAY)
   const config = {
     ...defaults,
     command: process.env.PI_AGY_COMMAND || '',
@@ -34,6 +43,10 @@ export default function (pi: ExtensionAPI) {
       },
     })
   let runtime = createRuntime()
+  let quotaDisplay: QuotaDisplay =
+    envQuotaDisplay ??
+    readQuotaDisplayPreference(runtime.status().home) ??
+    DEFAULT_QUOTA_DISPLAY
   const models = (): ProviderModelConfig[] =>
     runtime.catalog.list().map((m) => {
       const efforts = runtime.catalog.effortsFor(m.id)
@@ -100,7 +113,9 @@ export default function (pi: ExtensionAPI) {
     if (ctx.hasUI && (explicit || model?.provider === config.provider))
       ctx.ui.setStatus(
         config.provider,
-        snapshot ? formatQuotaStatus(snapshot, model?.id) : undefined,
+        snapshot
+          ? formatQuotaStatus(snapshot, model?.id, quotaDisplay)
+          : undefined,
       )
   }
   const reset = async () => {
@@ -155,8 +170,12 @@ export default function (pi: ExtensionAPI) {
         const key = `${quota.group.name}:${quota.bucket.id}:${quota.bucket.window}:${quota.bucket.resetTime || 'none'}:${threshold}`
         if (warned.has(key)) return
         warned.add(key)
+        const percent = Math.round(
+          displayFraction(quota.fraction, quotaDisplay) * 100,
+        )
+        const metric = `${percent}% ${quotaDisplay}`
         ctx.ui.notify(
-          `Antigravity quota low: ${Math.round(quota.fraction * 100)}% remaining (${quota.group.name}, ${quota.bucket.window}).`,
+          `Antigravity quota low: ${metric} (${quota.group.name}, ${quota.bucket.window}).`,
           'warning',
         )
       })
@@ -168,22 +187,46 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand('agy-acp', {
     description: 'Antigravity ACP status, quota, or reset',
     getArgumentCompletions: (prefix) => {
-      const items = ['status', 'quota', 'reset']
-        .filter((command) => command.startsWith(prefix.trim()))
+      const normalized = prefix.trimStart()
+      const items = [
+        'status',
+        'quota',
+        'quota used',
+        'quota remaining',
+        'reset',
+      ]
+        .filter((command) => command.startsWith(normalized))
         .map((value) => ({ value, label: value }))
       return items.length > 0 ? items : null
     },
     handler: async (args, ctx) => {
-      const command = args.trim()
-      if (command === 'reset') {
+      const tokens = args.trim().split(/\s+/).filter(Boolean)
+      const command = tokens[0] ?? ''
+      const requestedDisplay =
+        command === 'quota' && tokens.length === 2
+          ? asQuotaDisplay(tokens[1])
+          : undefined
+      if (command === 'reset' && tokens.length === 1) {
         clearStatus(ctx)
         await reset()
         ctx.ui.notify('Antigravity ACP sessions reset', 'info')
         return
       }
-      if (command !== '' && command !== 'status' && command !== 'quota') {
-        ctx.ui.notify('Usage: /agy-acp [status|quota|reset]', 'warning')
+      const isStatus =
+        (command === '' || command === 'status') && tokens.length <= 1
+      const isQuota =
+        command === 'quota' &&
+        (tokens.length === 1 || requestedDisplay !== undefined)
+      if (!isStatus && !isQuota) {
+        ctx.ui.notify(
+          'Usage: /agy-acp [status|quota [used|remaining]|reset]',
+          'warning',
+        )
         return
+      }
+      if (requestedDisplay !== undefined) {
+        quotaDisplay = requestedDisplay
+        writeQuotaDisplayPreference(runtime.status().home, quotaDisplay)
       }
       let snapshot: QuotaSnapshot | null = null
       const epoch = uiEpoch
@@ -207,12 +250,14 @@ export default function (pi: ExtensionAPI) {
               )
             : await runtime.readQuota(true)
         if (snapshot === null) {
+          if (epoch === uiEpoch)
+            updateStatus(ctx, runtime.quota.peek(), true)
           ctx.ui.notify('Quota check cancelled', 'info')
           return
         }
       }
       const notice = snapshot
-        ? formatQuota(snapshot)
+        ? formatQuota(snapshot, undefined, quotaDisplay)
         : formatStatus(runtime.status())
       if (epoch === uiEpoch)
         updateStatus(ctx, snapshot ?? runtime.quota.peek(), true)

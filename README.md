@@ -47,11 +47,11 @@ automatically from your account.
 | Command | Purpose |
 | --- | --- |
 | `/agy-acp` or `/agy-acp status` | Show runtime state, account details, models, sessions, and the last turn. |
-| `/agy-acp quota` | Show account details, grouped quota bars, and reset countdowns. |
+| `/agy-acp quota [used\|remaining]` | Show account details, grouped quota bars, and reset countdowns (remembers the last selected mode). |
 | `/agy-acp reset` | Close ACP sessions; the next request rebuilds the connection. |
 
-After an Antigravity turn settles, the status bar shows remaining quota (for example,
-`AGY 80%`) and warns when quota is low; see [quota status](docs/reference.md#quota-status-and-warnings).
+After an Antigravity turn settles, the status bar shows quota usage (for example,
+`AGY 20%`, or `AGY 80%` in `remaining` mode) and warns when quota is low; see [quota status](docs/reference.md#quota-status-and-warnings).
 
 Default prices are zero, not a promise of free calls. Pi pricing overrides are
 used when configured.
