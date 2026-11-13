@@ -55,7 +55,7 @@ jobs:
           ref: ${{ needs.release-please.outputs.tag_name && format('refs/tags/{0}', needs.release-please.outputs.tag_name) || github.ref }}
           persist-credentials: false
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
