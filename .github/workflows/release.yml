@@ -50,7 +50,7 @@ jobs:
       contents: write
       id-token: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.release-please.outputs.tag_name && format('refs/tags/{0}', needs.release-please.outputs.tag_name) || github.ref }}
           persist-credentials: false
