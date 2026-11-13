@@ -934,7 +934,7 @@ test('cancelled prompts settle despite queued text, including continuations and 
           runtime.startPrompt(conv, proc, [])
           const controller = new AbortController()
           const stream = runtime.pump(
-            conv,
+            conv, turn,
             proc,
             { model: 'gemini-4-argon', signal: controller.signal },
             'high',
@@ -2231,6 +2231,33 @@ test('parked cancellation settles bridge calls and releases capacity without a f
   assert.equal(finishOf(chunks).reason.kind, 'stop')
 })
 
+test('tool-result microtask cancellation finishes aborted and recovers capacity', async () => {
+  const { runtime } = makeRuntime({ config: { maxLiveSessions: 1 } })
+  const controller = new AbortController()
+  const request = { model: 'gemini-4-argon', sessionId: 'resume-owner', tools: [bash],
+    signal: controller.signal, messages: [sys, user('u1', 'CALL bash {"command":"long"}')] }
+  const first = await collect(runtime.stream(request))
+  const conv = runtime.conversations.get(request.sessionId)
+  const turn = conv.turn
+  const [call] = turn.pendingCalls.values()
+  // Resolve the tool first, then abort before the resuming caller's next microtask.
+  const cancelled = call.result.promise.then(() => controller.abort())
+  const chunks = await collect(runtime.stream({ ...request, messages: [
+    ...request.messages, assistantFrom('a1', first), tool('t1', call.id, 'finished'),
+  ] }))
+  await cancelled
+  assert.deepEqual(chunks.map(chunk => chunk.type), ['finish'])
+  assert.equal(finishOf(chunks).reason.kind, 'aborted')
+  assert.equal(conv.turn, undefined)
+  assert.equal(turn.cancellation.signal.aborted, true)
+  assert.equal(turn.releaseSignal, undefined)
+  assert.equal(runtime.status().activeTurns, 0)
+  assert.equal(runtime.status().lastTurn.outcome, 'aborted')
+  const next = await collect(runtime.stream({ model: request.model, sessionId: 'second',
+    messages: [sys, user('u2', 'hello')] }))
+  assert.equal(finishOf(next).reason.kind, 'stop')
+})
+
 test('already-aborted follow-up settles only its own parked session', async () => {
   const { runtime } = makeRuntime()
   const request = { model: 'gemini-4-argon', tools: [bash], messages: [sys, user('u1', 'CALL bash {"command":"long"}')] }
@@ -2265,7 +2292,7 @@ test('cancellation beats buffered text, park and done; old signals cannot cancel
     const turn = conv.turn = new AcpTurn(kind)
     if (kind === 'park') turn.park('bash', {})
     else turn.events.push(kind === 'text' ? { kind, text: 'buffered' } : { kind, result: { stopReason: 'end_turn' } })
-    const chunks = await collect(runtime.pump(conv, { cancel() {} }, { model: 'test', signal: AbortSignal.abort() }, 'high'))
+    const chunks = await collect(runtime.pump(conv, conv.turn, { cancel() {} }, { model: 'test', signal: AbortSignal.abort() }, 'high'))
     assert.deepEqual(chunks.map(c => c.type), ['finish'])
     assert.equal(finishOf(chunks).reason.kind, 'aborted')
     assert.equal(conv.turn, undefined)
@@ -2275,7 +2302,7 @@ test('cancellation beats buffered text, park and done; old signals cannot cancel
   const old = conv.turn = new AcpTurn('old')
   const controller = new AbortController()
   old.park('bash', {})
-  await collect(runtime.pump(conv, { cancel() {} }, { model: 'test', signal: controller.signal }, 'high'))
+  await collect(runtime.pump(conv, conv.turn, { cancel() {} }, { model: 'test', signal: controller.signal }, 'high'))
   runtime.dropTurn(conv, 'replaced')
   const replacement = conv.turn = new AcpTurn('new')
   controller.abort()
@@ -2346,7 +2373,7 @@ test('cancellation during the parallel-tool batching boundary suppresses the han
     if (args[1] !== undefined) controller.abort()
     return wait(...args)
   })
-  const chunks = await collect(runtime.pump(conv, { cancel() {} }, { model: 'test', signal: controller.signal }, 'high'))
+  const chunks = await collect(runtime.pump(conv, conv.turn, { cancel() {} }, { model: 'test', signal: controller.signal }, 'high'))
   assert.deepEqual(chunks.map(c => c.type), ['finish'])
   assert.equal(finishOf(chunks).reason.kind, 'aborted')
   assert.equal((await call.result.promise).isError, true)

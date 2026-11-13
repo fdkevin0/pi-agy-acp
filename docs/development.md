@@ -52,6 +52,8 @@ pi -e ./index.ts
   partial ACP history for rebuilding. A request cancelled while startup or a
   conversation lock is pending emits `finish(aborted)` after acquiring ownership,
   without opening a new ACP session. Startup and disposal failures still reject.
+  Tool-result delivery hands the exact resumed turn to the pump synchronously;
+  result-waiter microtasks may cancel and detach it before output resumes.
   Cancellation takes priority over buffered output and batched tools. Streaming cleanup waits for prompt settlement for up
   to five seconds; releasing a parked turn is immediate. Signal callbacks check
   turn identity, and ACP callbacks check the session's tenant identity before

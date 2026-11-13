@@ -484,16 +484,17 @@ export class AntigravityRuntime {
             'The conversation history was compacted or rewritten; rebuilding the session from the harness history.',
           )
         } else {
-          const resumed = await this.deliverResults(
+          // Tool waiters can abort in their result microtask; hand off the exact turn synchronously.
+          const resumed = this.deliverResults(
             conv,
             split.messages,
             proc,
             tools,
           )
           this.assertActive()
-          if (resumed) {
+          if (resumed !== undefined) {
             conv.knownIds = messageIds(split.messages)
-            yield* this.pump(conv, proc, options, effort)
+            yield* this.pump(conv, resumed, proc, options, effort)
             return
           }
           this.dropTurn(
@@ -528,9 +529,9 @@ export class AntigravityRuntime {
       // A new turn starts with an empty reported-identity space: ids from past
       // turns must never back a fresh permission request.
       conv.reportedToolCalls.clear()
-      conv.turn = new AcpTurn(randomBytes(6).toString('hex'))
+      const turn = conv.turn = new AcpTurn(randomBytes(6).toString('hex'))
       this.startPrompt(conv, proc, blocks)
-      yield* this.pump(conv, proc, options, effort)
+      yield* this.pump(conv, turn, proc, options, effort)
     } finally {
       release()
       if (conv !== undefined) {
@@ -1094,11 +1095,11 @@ export class AntigravityRuntime {
 
   private async *pump(
     conv: Conversation,
+    turn: AcpTurn,
     proc: AcpProcess,
     options: GenerateOptions,
     effort: Effort,
   ): AsyncGenerator<StreamChunk> {
-    const turn = conv.turn as AcpTurn
     const sessionId = conv.sessionId as string
     let finishKind: string | undefined
     let drained = false
@@ -1190,12 +1191,12 @@ export class AntigravityRuntime {
     }
   }
 
-  private async deliverResults(
+  private deliverResults(
     conv: Conversation,
     messages: readonly RequestMessage[],
     proc: AcpProcess,
     tools: readonly BridgeTool[],
-  ): Promise<boolean> {
+  ): AcpTurn | undefined {
     const turn = conv.turn as AcpTurn
     const results = new Map<string, Extract<RequestMessage, { role: 'tool' }>>()
     let last = -1
@@ -1208,10 +1209,10 @@ export class AntigravityRuntime {
         last = Math.max(last, index)
       }
     })
-    if (results.size !== turn.pendingCalls.size) return false
+    if (results.size !== turn.pendingCalls.size) return undefined
     const extras = messages.slice(last + 1)
     if (extras.some((m) => m.role === 'assistant' || m.role === 'tool'))
-      return false
+      return undefined
     const extraText = extras.length > 0 ? renderTranscript(extras) : ''
     const toolDelta = consumeToolDelta(conv, tools)
     const suffix = [toolDelta, extraText].filter(Boolean).join('\n\n')
@@ -1232,7 +1233,7 @@ export class AntigravityRuntime {
           text: `${transcript}${suffix ? `\n\n${suffix}` : ''}\n\nContinue the task with these tool results.`,
         },
       ])
-      return true
+      return conv.turn
     }
     for (const [index, call] of pending.entries()) {
       const message = results.get(call.id) as Extract<
@@ -1247,7 +1248,7 @@ export class AntigravityRuntime {
         result.content.push({ type: 'text', text: `\n\n${suffix}` })
       call.result.resolve(result)
     }
-    return true
+    return turn
   }
 
   private isTurnLive(turn: AcpTurn): boolean {
