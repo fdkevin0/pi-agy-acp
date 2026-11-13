@@ -88,6 +88,8 @@ export interface McpBridgeOptions {
   log?: (message: string) => void
 }
 
+const MAX_BODY_BYTES = 1_048_576
+
 const MCP_PROTOCOL_VERSION = '2025-06-18'
 const CONVERSATION_META_KEY = 'antigravity.google/conversation_id'
 
@@ -121,12 +123,29 @@ export class McpBridge {
   /** Bind the loopback listener on an ephemeral port. */
   async start(): Promise<void> {
     if (this.server !== undefined) return
-    const server = createServer((req, res) => {
-      void this.handle(req, res)
-    })
-    server.keepAliveTimeout = 0
-    server.requestTimeout = 0
-    server.headersTimeout = 0
+    const server = createServer(
+      {
+        headersTimeout: 10_000,
+        requestTimeout: 30_000,
+        connectionsCheckingInterval: 1_000,
+      },
+      (req, res) => {
+        void this.handle(req, res).catch((error: unknown) => {
+          this.log(`mcp: request failed: ${error instanceof Error ? error.message : 'unknown error'}`)
+          if (res.headersSent || res.destroyed) {
+            res.destroy()
+            return
+          }
+          // Close after flushing the error, including clients still uploading a body.
+          res.writeHead(error instanceof HttpError ? error.status : 500, {
+            connection: 'close',
+          })
+          res.end(() => res.destroy())
+        })
+      },
+    )
+    // Node's _http_server.checkConnections bounds reception, not completed SSE requests.
+    server.on('error', (error) => this.log(`mcp: server error: ${error.message}`))
     await new Promise<void>((resolve, reject) => {
       server.once('error', reject)
       server.listen(0, '127.0.0.1', () => {
@@ -146,7 +165,11 @@ export class McpBridge {
     this.openResponses.clear()
     this.handshakes.clear()
     if (server !== undefined)
-      await new Promise<void>((resolve) => server.close(() => resolve()))
+      await new Promise<void>((resolve) => {
+        server.close(() => resolve())
+        // Node's closeAllConnections includes parsers with incomplete headers/bodies.
+        server.closeAllConnections()
+      })
   }
 
   /**
@@ -163,11 +186,24 @@ export class McpBridge {
     if (tenantKey !== undefined) this.handshakes.delete(tenantKey)
   }
 
+  private log(message: string): void {
+    try {
+      this.options.log?.(message)
+    } catch {
+      // A diagnostic sink must not escape the HTTP error boundary.
+    }
+  }
+
   private async handle(
     req: IncomingMessage,
     res: ServerResponse,
   ): Promise<void> {
-    const url = new URL(req.url ?? '/', 'http://127.0.0.1')
+    let url: URL
+    try {
+      url = new URL(req.url ?? '/', 'http://127.0.0.1')
+    } catch {
+      throw new HttpError(400)
+    }
     const segments = url.pathname.split('/').filter(Boolean)
     if (segments[0] !== 'mcp' || segments.length > 2) {
       res.writeHead(404).end()
@@ -196,9 +232,10 @@ export class McpBridge {
       res.writeHead(405, { allow: 'POST, DELETE' }).end()
       return
     }
+    const text = await readBody(req)
     let body: unknown
     try {
-      body = JSON.parse(await readBody(req))
+      body = JSON.parse(text)
     } catch (_invalidJson) {
       // An unparsable body cannot be answered with a request id.
       writeJson(res, 400, {
@@ -312,6 +349,7 @@ export class McpBridge {
     let settled = false
     const onClose = (): void => {
       this.openResponses.delete(res)
+      clearInterval(keepAlive)
       if (!settled)
         controller.abort(new Error('MCP client closed the tool call'))
     }
@@ -367,7 +405,7 @@ export class McpBridge {
     this.openResponses.delete(res)
     res.off('close', onClose)
     if (controller.signal.aborted)
-      this.options.log?.(
+      this.log(
         `mcp: call ${name} finished after the agent disconnected`,
       )
   }
@@ -384,9 +422,26 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
 }
 
+class HttpError extends Error {
+  readonly status: number
+
+  constructor(status: number) {
+    super(`HTTP ${status}`)
+    this.status = status
+  }
+}
+
 async function readBody(req: IncomingMessage): Promise<string> {
+  if (Number(req.headers['content-length']) > MAX_BODY_BYTES)
+    throw new HttpError(413)
   const chunks: Buffer[] = []
-  for await (const chunk of req) chunks.push(chunk as Buffer)
+  let bytes = 0
+  // Readable.iterator otherwise destroys the socket on early exit, losing the 413.
+  for await (const chunk of req.iterator({ destroyOnReturn: false })) {
+    bytes += chunk.length
+    if (bytes > MAX_BODY_BYTES) throw new HttpError(413)
+    chunks.push(chunk as Buffer)
+  }
   return Buffer.concat(chunks).toString('utf8')
 }
 

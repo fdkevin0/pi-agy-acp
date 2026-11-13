@@ -63,6 +63,30 @@ pi -e ./index.ts
   receive `context_length_exceeded` and `quota exceeded` markers for Pi's
   compaction and retry decisions; transport timeouts remain distinct.
 
+## MCP HTTP boundary
+
+The loopback bridge returns 400 for invalid URLs and 413 for authenticated POST
+bodies exceeding 1 MiB (1,048,576 bytes), including chunked uploads. Rejected
+oversized uploads close their connection after the error response. JSON parse
+errors retain the MCP parse-error response. Unexpected handler failures return
+500 before headers or destroy an already-started response; listener errors go to
+the diagnostic sink.
+
+Node's HTTP parser enforces a 10-second header reception deadline and a 30-second
+whole-request reception deadline, checked every second. These are absolute
+reception limits, including trickling clients, not tool execution deadlines:
+completed requests may keep SSE responses open for long approvals, tools, and
+relay waits. Idle keepalive sockets use Node's default timeout. Shutdown stops
+accepting connections and destroys all HTTP connections, including incomplete
+headers, bodies, and active streams, without waiting for tool promises.
+
+Boundary regressions run in `tests/mcp-bridge.test.mjs`, including the isolated
+unauthenticated `GET http://[` crash probe. The implementation choices were
+checked against Node 26.13.1's embedded `_http_server` source (`checkConnections`,
+`onRequestTimeout`, and `closeAllConnections`) and live loopback traffic;
+`Readable.iterator({ destroyOnReturn: false })` preserves the socket long enough
+to flush a 413 when body iteration stops early.
+
 ## Source layout
 
 | File or group | Responsibility |
