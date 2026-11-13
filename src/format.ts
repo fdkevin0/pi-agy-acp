@@ -49,6 +49,14 @@ export function quotaForModel(
   return lowest
 }
 
+/** Convert a remaining fraction (`0..1`) into the fraction shown for `display`. */
+export function displayFraction(
+  remainingFraction: number,
+  display: QuotaDisplay = 'used',
+): number {
+  return display === 'used' ? 1 - remainingFraction : remainingFraction
+}
+
 export function formatQuotaStatus(
   snapshot: QuotaSnapshot,
   model?: string,
@@ -56,8 +64,7 @@ export function formatQuotaStatus(
 ): string | undefined {
   const quota = quotaForModel(snapshot, model)
   if (!quota) return undefined
-  const shown = display === 'used' ? 1 - quota.fraction : quota.fraction
-  return `AGY ${Math.round(shown * 100)}%`
+  return `AGY ${Math.round(displayFraction(quota.fraction, display) * 100)}%`
 }
 
 function resetCountdown(resetTime: string, now: number): string {
@@ -100,11 +107,7 @@ export function formatQuota(
     for (const bucket of group.buckets) {
       const fraction = clampFraction(bucket.remainingFraction)
       const shown =
-        fraction === undefined
-          ? undefined
-          : display === 'used'
-            ? 1 - fraction
-            : fraction
+        fraction === undefined ? undefined : displayFraction(fraction, display)
       const filled = shown === undefined ? 0 : Math.round(shown * 12)
       const bar = '█'.repeat(filled) + '░'.repeat(12 - filled)
       const percent =

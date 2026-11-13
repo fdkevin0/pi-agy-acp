@@ -55,9 +55,9 @@ Severity uses the actual remaining fraction rather than the rounded percentage:
 
 | Condition | Notification |
 | --- | --- |
-| All known windows above 20% | Info |
-| Any window at or below 20%, with none at or below 5% | Warning |
-| Any window at or below 5%, or a failed quota query | Error |
+| All known windows above 20% remaining (<80% used) | Info |
+| Any window at or below 20% remaining (≥80% used), with none at or below 5% remaining | Warning |
+| Any window at or below 5% remaining (≥95% used), or a failed quota query | Error |
 
 Errors include the reason. If cached groups are available after a failed query,
 the title marks them as `(stale)` and still displays their bars. An empty
@@ -78,10 +78,11 @@ isolated. Cached plans and login logs can be stale after an account change.
 
 When a run using `antigravity-acp` fully settles, the extension checks `/usage`
 in the background and shows a compact status such as `AGY 20%` (or `AGY 80%`
-in `remaining` mode). It uses the lowest known window in the selected model family's group, falling back to the lowest known quota across
-groups when the family cannot be matched. Failed checks stay silent. Successful
-results and failures both respect the two-minute quota TTL, and overlapping
-background checks are skipped.
+in `remaining` mode). It uses the lowest remaining window in the selected model
+family's group, falling back to the lowest remaining quota across groups when
+the family cannot be matched. Failed checks stay silent. Successful results and
+failures both respect the two-minute quota TTL, and overlapping background
+checks are skipped.
 
 At 20% and 5% remaining (80% and 95% used), a warning appears once per bucket,
 reset time, and threshold. `/agy-acp quota` explicitly refreshes quota and updates
@@ -101,7 +102,7 @@ Set these environment variables before starting Pi:
 | --- | --- | --- |
 | `PI_AGY_COMMAND` | Absolute path to the `agy` executable. | Automatic discovery. |
 | `PI_AGY_HOME` | Dedicated directory for this extension's agy state. | `~/.pi/agent/cache/antigravity-acp` |
-| `PI_AGY_QUOTA_DISPLAY` | Initial quota display mode (`used` or `remaining`), overriding the saved preference. | `used` |
+| `PI_AGY_QUOTA_DISPLAY` | Startup quota display mode (`used` or `remaining`), overriding `settings.json` for startup. Invalid values are ignored; `/agy-acp quota <mode>` overrides it for the active session. | `settings.json`, then `used` |
 
 For example:
 
@@ -115,8 +116,8 @@ The dedicated directory isolates the bridge agent from your normal agy tools and
 plugins. It contains agy-managed session data, logs, and the extension's model cache.
 
 Temporary session data and old logs are removed automatically. The current log,
-model cache, and authentication files are retained; sessions rebuild from Pi's
-history. Cleanup is best-effort if files are locked. Use a different `PI_AGY_HOME`
+model cache, `settings.json` (quota display preference), and authentication files
+are retained; sessions rebuild from Pi's history. Cleanup is best-effort if files are locked. Use a different `PI_AGY_HOME`
 for each concurrently running Pi instance, since startup cleanup assumes exclusive
 use of the directory.
 

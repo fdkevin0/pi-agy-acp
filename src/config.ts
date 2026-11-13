@@ -1,5 +1,11 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import {
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs'
+import { join } from 'node:path'
 
 /** Reasoning effort ids accepted by the Antigravity ACP `thought_level` option. */
 export const EFFORTS = ['low', 'medium', 'high'] as const
@@ -10,6 +16,8 @@ export type Effort = (typeof EFFORTS)[number]
 export const QUOTA_DISPLAY_MODES = ['used', 'remaining'] as const
 /** Quota percentage display convention (`used` counts up from 0%, `remaining` counts down from 100%). */
 export type QuotaDisplay = (typeof QUOTA_DISPLAY_MODES)[number]
+/** Default quota percentage display convention when no env var or saved preference is set. */
+export const DEFAULT_QUOTA_DISPLAY: QuotaDisplay = 'used'
 
 /** Validated plugin configuration. */
 export interface Config {
@@ -23,8 +31,6 @@ export interface Config {
   home: string
   /** Effort applied when a request carries none. */
   defaultEffort: Effort
-  /** Quota percentage convention shown in the status bar and `/agy-acp quota`. */
-  quotaDisplay: QuotaDisplay
   /** Maximum concurrent ACP sessions kept alive across conversations, subagents, and auxiliary calls. */
   maxLiveSessions: number
   /** Idle time after which an inactive ACP session is closed. */
@@ -47,7 +53,6 @@ export const defaults: Config = {
   command: '',
   home: '',
   defaultEffort: 'high',
-  quotaDisplay: 'used',
   maxLiveSessions: 16,
   idleSessionTtlMs: 1800000,
   parkSettleMs: 250,
@@ -72,22 +77,26 @@ export function asQuotaDisplay(
 
 const SETTINGS_FILE = 'settings.json'
 
+/** Read a JSON file as a plain object, returning `{}` when missing or invalid. */
+export function readJson(path: string): Record<string, unknown> {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(path, 'utf8'))
+    return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : {}
+  } catch {
+    return {}
+  }
+}
+
 /** Read the last remembered quota display preference from `home/settings.json`. */
 export function readQuotaDisplayPreference(
   home: string,
 ): QuotaDisplay | undefined {
-  try {
-    const path = join(home, SETTINGS_FILE)
-    if (!existsSync(path)) return undefined
-    const parsed = JSON.parse(readFileSync(path, 'utf8')) as {
-      quotaDisplay?: unknown
-    }
-    return typeof parsed?.quotaDisplay === 'string'
-      ? asQuotaDisplay(parsed.quotaDisplay)
-      : undefined
-  } catch {
-    return undefined
-  }
+  const settings = readJson(join(home, SETTINGS_FILE))
+  return typeof settings.quotaDisplay === 'string'
+    ? asQuotaDisplay(settings.quotaDisplay)
+    : undefined
 }
 
 /** Persist the user's quota display preference in `home/settings.json`. */
@@ -95,11 +104,22 @@ export function writeQuotaDisplayPreference(
   home: string,
   quotaDisplay: QuotaDisplay,
 ): void {
+  const path = join(home, SETTINGS_FILE)
+  const tempPath = join(
+    home,
+    `.${SETTINGS_FILE}.${process.pid}.${Date.now()}.tmp`,
+  )
   try {
-    const path = join(home, SETTINGS_FILE)
-    mkdirSync(dirname(path), { recursive: true })
-    writeFileSync(path, JSON.stringify({ quotaDisplay }))
+    mkdirSync(home, { recursive: true })
+    const existing = readJson(path)
+    const content = `${JSON.stringify({ ...existing, quotaDisplay }, null, 2)}\n`
+    writeFileSync(tempPath, content)
+    renameSync(tempPath, path)
   } catch {
-    // Preference persistence is best-effort.
+    try {
+      unlinkSync(tempPath)
+    } catch {
+      // Best-effort cleanup.
+    }
   }
 }

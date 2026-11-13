@@ -27,10 +27,14 @@ import { parseUsage, QuotaReader, readLoggedEmail } from '../src/quota.ts'
 function isolateHome(t) {
   const root = mkdtempSync(join(tmpdir(), 'pi-account-'))
   const previous = process.env.PI_AGY_HOME
+  const prevDisplay = process.env.PI_AGY_QUOTA_DISPLAY
   process.env.PI_AGY_HOME = root
+  delete process.env.PI_AGY_QUOTA_DISPLAY
   t.after(() => {
     if (previous === undefined) delete process.env.PI_AGY_HOME
     else process.env.PI_AGY_HOME = previous
+    if (prevDisplay === undefined) delete process.env.PI_AGY_QUOTA_DISPLAY
+    else process.env.PI_AGY_QUOTA_DISPLAY = prevDisplay
     rmSync(root, { recursive: true, force: true })
   })
   return root

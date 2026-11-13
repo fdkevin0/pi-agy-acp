@@ -7,6 +7,7 @@ import {
 import { AntigravityRuntime } from './src/runtime.ts'
 import {
   asQuotaDisplay,
+  DEFAULT_QUOTA_DISPLAY,
   defaults,
   readQuotaDisplayPreference,
   writeQuotaDisplayPreference,
@@ -15,6 +16,7 @@ import {
 import { spawnAcp, runCommand } from './src/host.ts'
 import { streamPi } from './src/pi-stream.ts'
 import {
+  displayFraction,
   formatQuota,
   formatStatus,
   formatQuotaStatus,
@@ -28,7 +30,6 @@ export default function (pi: ExtensionAPI) {
     ...defaults,
     command: process.env.PI_AGY_COMMAND || '',
     home: process.env.PI_AGY_HOME || '',
-    ...(envQuotaDisplay ? { quotaDisplay: envQuotaDisplay } : {}),
   }
   let refreshDepth = 0
   const createRuntime = () =>
@@ -45,7 +46,7 @@ export default function (pi: ExtensionAPI) {
   let quotaDisplay: QuotaDisplay =
     envQuotaDisplay ??
     readQuotaDisplayPreference(runtime.status().home) ??
-    defaults.quotaDisplay
+    DEFAULT_QUOTA_DISPLAY
   const models = (): ProviderModelConfig[] =>
     runtime.catalog.list().map((m) => {
       const efforts = runtime.catalog.effortsFor(m.id)
@@ -169,10 +170,10 @@ export default function (pi: ExtensionAPI) {
         const key = `${quota.group.name}:${quota.bucket.id}:${quota.bucket.window}:${quota.bucket.resetTime || 'none'}:${threshold}`
         if (warned.has(key)) return
         warned.add(key)
-        const metric =
-          quotaDisplay === 'used'
-            ? `${Math.round((1 - quota.fraction) * 100)}% used`
-            : `${Math.round(quota.fraction * 100)}% remaining`
+        const percent = Math.round(
+          displayFraction(quota.fraction, quotaDisplay) * 100,
+        )
+        const metric = `${percent}% ${quotaDisplay}`
         ctx.ui.notify(
           `Antigravity quota low: ${metric} (${quota.group.name}, ${quota.bucket.window}).`,
           'warning',
@@ -249,6 +250,8 @@ export default function (pi: ExtensionAPI) {
               )
             : await runtime.readQuota(true)
         if (snapshot === null) {
+          if (epoch === uiEpoch)
+            updateStatus(ctx, runtime.quota.peek(), true)
           ctx.ui.notify('Quota check cancelled', 'info')
           return
         }

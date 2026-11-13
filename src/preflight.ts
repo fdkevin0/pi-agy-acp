@@ -22,6 +22,7 @@ import {
 } from 'node:fs'
 import { homedir } from 'node:os'
 import { delimiter, isAbsolute, join } from 'node:path'
+import { readJson } from './config.ts'
 
 /** Agent id installed in the isolated home. */
 export const BRIDGE_AGENT = 'pi-bridge'
@@ -337,20 +338,6 @@ export async function readVersion(
 function writeIfChanged(path: string, content: string): void {
   if (existsSync(path) && readFileSync(path, 'utf8') === content) return
   writeFileSync(path, content)
-}
-
-function readJson(path: string): Record<string, unknown> {
-  try {
-    const parsed: unknown = JSON.parse(readFileSync(path, 'utf8'))
-    return parsed !== null &&
-      typeof parsed === 'object' &&
-      !Array.isArray(parsed)
-      ? (parsed as Record<string, unknown>)
-      : {}
-  } catch (_missingSettings) {
-    // A missing or unreadable settings file starts empty.
-    return {}
-  }
 }
 
 function isFile(path: string): boolean {

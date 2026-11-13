@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import extension from '../index.ts'
@@ -38,7 +38,10 @@ const snapshot = (remaining = 0.1, resetTime = '2030-01-01T00:00:00Z') => ({
 
 function harness(t, onRegister = () => {}) {
   const home = mkdtempSync(join(tmpdir(), 'pi-events-'))
+  const prevHome = process.env.PI_AGY_HOME
+  const prevDisplay = process.env.PI_AGY_QUOTA_DISPLAY
   process.env.PI_AGY_HOME = home
+  delete process.env.PI_AGY_QUOTA_DISPLAY
   const handlers = new Map()
   const registrations = []
   const notices = []
@@ -72,7 +75,10 @@ function harness(t, onRegister = () => {}) {
   }
   t.after(async () => {
     await handlers.get('session_shutdown')({}, ctx)
-    delete process.env.PI_AGY_HOME
+    if (prevHome === undefined) delete process.env.PI_AGY_HOME
+    else process.env.PI_AGY_HOME = prevHome
+    if (prevDisplay === undefined) delete process.env.PI_AGY_QUOTA_DISPLAY
+    else process.env.PI_AGY_QUOTA_DISPLAY = prevDisplay
     rmSync(home, { recursive: true, force: true })
   })
   return { handlers, registrations, command, ctx, statuses, notices }
@@ -260,11 +266,15 @@ test('quota selection uses the active family and falls back to the lowest valid 
 
 test('quota display mode switches via /agy-acp quota, remembers last choice across reloads, and respects env override', async (t) => {
   const home = mkdtempSync(join(tmpdir(), 'pi-quota-pref-'))
-  const originalEnv = { ...process.env }
+  const prevHome = process.env.PI_AGY_HOME
+  const prevDisplay = process.env.PI_AGY_QUOTA_DISPLAY
   process.env.PI_AGY_HOME = home
   delete process.env.PI_AGY_QUOTA_DISPLAY
   t.after(() => {
-    process.env = originalEnv
+    if (prevHome === undefined) delete process.env.PI_AGY_HOME
+    else process.env.PI_AGY_HOME = prevHome
+    if (prevDisplay === undefined) delete process.env.PI_AGY_QUOTA_DISPLAY
+    else process.env.PI_AGY_QUOTA_DISPLAY = prevDisplay
     rmSync(home, { recursive: true, force: true })
   })
 
@@ -299,14 +309,25 @@ test('quota display mode switches via /agy-acp quota, remembers last choice acro
     return { command, ctx, statuses, notices }
   }
 
+  // Malformed settings.json falls back cleanly to "used".
+  writeFileSync(join(home, 'settings.json'), '{not-json')
   const first = loadExtension()
   await first.command.handler('quota', first.ctx)
   assert.equal(first.statuses.at(-1), 'AGY 20%')
   assert.match(first.notices.at(-1).text, /\[██░░░░░░░░░░\]  20%/)
 
+  // Preserves unrelated keys in settings.json when saving mode.
+  writeFileSync(
+    join(home, 'settings.json'),
+    JSON.stringify({ customKey: 'keep-me' }),
+  )
   await first.command.handler('quota remaining', first.ctx)
   assert.equal(first.statuses.at(-1), 'AGY 80%')
   assert.match(first.notices.at(-1).text, /\[██████████░░\]  80%/)
+  assert.deepEqual(
+    JSON.parse(readFileSync(join(home, 'settings.json'), 'utf8')),
+    { customKey: 'keep-me', quotaDisplay: 'remaining' },
+  )
 
   // Reload remembers the last queried mode ("remaining").
   const second = loadExtension()
@@ -315,6 +336,15 @@ test('quota display mode switches via /agy-acp quota, remembers last choice acro
 
   await second.command.handler('quota used', second.ctx)
   assert.equal(second.statuses.at(-1), 'AGY 20%')
+
+  // Cancelled TUI loader on mode switch still refreshes the status bar pill.
+  await second.command.handler('quota remaining', {
+    ...second.ctx,
+    mode: 'tui',
+    ui: { ...second.ctx.ui, custom: async () => null },
+  })
+  assert.equal(second.statuses.at(-1), 'AGY 80%')
+  assert.equal(second.notices.at(-1).text, 'Quota check cancelled')
 
   // Environment variable overrides persisted preference at startup.
   process.env.PI_AGY_QUOTA_DISPLAY = 'remaining'
