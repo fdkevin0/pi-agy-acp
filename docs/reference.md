@@ -159,8 +159,8 @@ binary patch scripts.
 ## Compatibility limits
 
 This version targets the `@earendil-works/*` Pi packages at version 1.5.x.
-Host peer dependencies use `*` as required by Pi package conventions; validation
-has been performed against version 1.5.0. Compatibility with older
+Host peer dependencies use `*` as required by Pi package conventions; development
+dependencies constrain CI to Pi 1.5.x, which requires Node.js >= 22.19.0. Compatibility with older
 `@mariozechner/*` interfaces is not claimed.
 
 Sampling parameters, output limits, forced `toolChoice`, and provider-scoped

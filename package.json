@@ -27,7 +27,7 @@
     "NOTICE"
   ],
   "engines": {
-    "node": ">=22.18.0"
+    "node": ">=22.19.0"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
@@ -40,7 +40,10 @@
   },
   "devDependencies": {
     "typescript": "^5.9.0",
-    "@types/node": "^22.0.0"
+    "@types/node": "^22.0.0",
+    "@earendil-works/pi-ai": "~1.5.0",
+    "@earendil-works/pi-coding-agent": "~1.5.0",
+    "@earendil-works/pi-tui": "~1.5.0"
   },
   "keywords": [
     "pi-package",

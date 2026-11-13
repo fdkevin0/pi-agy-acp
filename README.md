@@ -1,5 +1,8 @@
 # pi-agy-acp
 
+[![CI](https://github.com/fdkevin0/pi-agy-acp/actions/workflows/ci.yml/badge.svg)](https://github.com/fdkevin0/pi-agy-acp/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/pi-agy-acp)](https://www.npmjs.com/package/pi-agy-acp)
+
 Use Google Antigravity in Pi through the official, locally installed `agy` CLI.
 This extension registers the `antigravity-acp` provider and lets Pi execute the
 model's tool calls. It supports streaming text and reasoning, images, and
@@ -7,7 +10,7 @@ parallel tool calls.
 
 ## Prerequisites
 
-- Node.js >= 22.18.0.
+- Node.js >= 22.19.0.
 - Pi (`@earendil-works/pi-coding-agent`) 1.5.x.
 - The official `agy` CLI >= 1.4.12, signed in with your Google account.
   Run `agy` in your terminal to complete sign-in before using the extension.
@@ -59,3 +62,5 @@ used when configured.
 - [Development](docs/development.md): setup, request flow, source layout, and verification.
 - [Changelog](CHANGELOG.md): release history and upcoming changes.
 - [Attribution](NOTICE) and [MIT license](LICENSE).
+
+For contributions, see [CONTRIBUTING.md](https://github.com/fdkevin0/pi-agy-acp/blob/main/CONTRIBUTING.md). Report vulnerabilities through the [security policy](https://github.com/fdkevin0/pi-agy-acp/blob/main/SECURITY.md).
