@@ -160,7 +160,7 @@ test('lifecycle uses light resets, cache warming stops, and selecting models onl
     { model: { provider, id: 'gemini-4-argon' } },
     h.ctx,
   )
-  assert.equal(h.statuses.at(-1), 'AGY 80%')
+  assert.equal(h.statuses.at(-1), 'AGY 20% used')
   cached = undefined
   h.handlers.get('model_select')({ model: h.ctx.model }, h.ctx)
   assert.equal(h.statuses.at(-1), undefined)
@@ -184,10 +184,11 @@ test('settled checks are nonblocking, coalesced, and warn once per bucket reset 
   assert.equal(h.statuses.length, 0)
   pending.resolve(snapshot())
   await tick()
-  assert.equal(h.statuses.at(-1), 'AGY 10%')
+  assert.equal(h.statuses.at(-1), 'AGY 90% used')
   assert.equal(h.notices.length, 1)
   assert.equal(h.notices[0].level, 'warning')
   assert.match(h.notices[0].text, /Claude\/GPT/)
+  assert.match(h.notices[0].text, /90% used/)
   const checkNotice = async (fraction, cycle, warnings) => {
     value = Promise.resolve(snapshot(fraction, cycle))
     settled({}, h.ctx)
@@ -241,12 +242,107 @@ test('late background results after model switches, reset, or shutdown cannot re
 })
 
 test('quota selection uses the active family and falls back to the lowest valid bucket', () => {
-  assert.equal(formatQuotaStatus(snapshot(), 'gemini-4-argon'), 'AGY 80%')
-  assert.equal(formatQuotaStatus(snapshot(), 'gpt-oss-120b-medium'), 'AGY 10%')
-  assert.equal(formatQuotaStatus(snapshot(), 'unknown'), 'AGY 10%')
+  assert.equal(formatQuotaStatus(snapshot(), 'gemini-4-argon'), 'AGY 20% used')
+  assert.equal(
+    formatQuotaStatus(snapshot(), 'gpt-oss-120b-medium'),
+    'AGY 90% used',
+  )
+  assert.equal(formatQuotaStatus(snapshot(), 'unknown'), 'AGY 90% used')
+  assert.equal(
+    formatQuotaStatus(snapshot(), 'gemini-4-argon', 'remaining'),
+    'AGY 80% left',
+  )
+  assert.equal(
+    formatQuotaStatus(snapshot(), 'gpt-oss-120b-medium', 'remaining'),
+    'AGY 10% left',
+  )
   assert.equal(quotaForModel(snapshot(0), 'claude-opus-5-5').fraction, 0)
   assert.equal(formatQuotaStatus(snapshot(NaN), 'claude-opus-5-5'), undefined)
   assert.equal(formatQuotaStatus({ ...snapshot(), status: 'error' }), undefined)
+})
+
+test('quota display mode switches via /agy-acp quota, remembers last choice across reloads, and respects env override', async (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'pi-quota-pref-'))
+  const prevHome = process.env.PI_AGY_HOME
+  const prevDisplay = process.env.PI_AGY_QUOTA_DISPLAY
+  process.env.PI_AGY_HOME = home
+  delete process.env.PI_AGY_QUOTA_DISPLAY
+  t.after(() => {
+    if (prevHome === undefined) delete process.env.PI_AGY_HOME
+    else process.env.PI_AGY_HOME = prevHome
+    if (prevDisplay === undefined) delete process.env.PI_AGY_QUOTA_DISPLAY
+    else process.env.PI_AGY_QUOTA_DISPLAY = prevDisplay
+    rmSync(home, { recursive: true, force: true })
+  })
+
+  t.mock.method(AntigravityRuntime.prototype, 'readQuota', async () =>
+    snapshot(0.1),
+  )
+  t.mock.method(QuotaReader.prototype, 'peek', () => snapshot(0.1))
+
+  const loadExtension = () => {
+    const handlers = new Map()
+    const statuses = []
+    const notices = []
+    let command
+    extension({
+      registerProvider() {},
+      registerCommand(_name, def) {
+        command = def
+      },
+      on(event, handler) {
+        handlers.set(event, handler)
+      },
+    })
+    const ctx = {
+      hasUI: true,
+      model: { provider, id: 'gemini-4-argon' },
+      ui: {
+        setStatus(_key, text) {
+          statuses.push(text)
+        },
+        notify(text, level) {
+          notices.push({ text, level })
+        },
+      },
+    }
+    return { handlers, command, ctx, statuses, notices }
+  }
+
+  const first = loadExtension()
+  assert.deepEqual(
+    first.command.getArgumentCompletions('quota ').map((i) => i.value),
+    ['quota used', 'quota remaining'],
+  )
+  await first.command.handler('quota invalid', first.ctx)
+  assert.equal(first.notices.at(-1).level, 'warning')
+  assert.match(first.notices.at(-1).text, /quota \[used\|remaining\]/)
+
+  await first.command.handler('quota', first.ctx)
+  assert.match(first.notices.at(-1).text, /Antigravity Quota \(used\)/)
+  assert.equal(first.statuses.at(-1), 'AGY 20% used')
+
+  await first.command.handler('quota remaining', first.ctx)
+  assert.match(first.notices.at(-1).text, /Antigravity Quota \(remaining\)/)
+  assert.equal(first.statuses.at(-1), 'AGY 80% left')
+
+  // Subsequent reload without explicit argument remembers "remaining".
+  const second = loadExtension()
+  await second.command.handler('quota', second.ctx)
+  assert.match(second.notices.at(-1).text, /Antigravity Quota \(remaining\)/)
+  assert.equal(second.statuses.at(-1), 'AGY 80% left')
+
+  // Switching back to "used" updates the remembered preference.
+  await second.command.handler('quota used', second.ctx)
+  assert.match(second.notices.at(-1).text, /Antigravity Quota \(used\)/)
+  assert.equal(second.statuses.at(-1), 'AGY 20% used')
+
+  // Environment variable overrides persisted preference at startup.
+  process.env.PI_AGY_QUOTA_DISPLAY = 'remaining'
+  const third = loadExtension()
+  await third.command.handler('quota', third.ctx)
+  assert.match(third.notices.at(-1).text, /Antigravity Quota \(remaining\)/)
+  assert.equal(third.statuses.at(-1), 'AGY 80% left')
 })
 
 test('quota TTL throttles successes and failures, while force bypasses it', async (t) => {
