@@ -258,6 +258,11 @@ test('timeout and cancellation cannot masquerade as overflow; quota and overflow
     mapError(new Error('context window limit exceeded')).code,
     'CONTEXT_WINDOW_EXCEEDED',
   )
+  assert.equal(
+    mapError(new Error('context limit reached')).code,
+    'CONTEXT_WINDOW_EXCEEDED',
+  )
+  assert.equal(mapError(new Error('rate limit reached')).code, 'RATE_LIMIT')
   const overflow = await result(
     {
       async *stream() {
@@ -336,4 +341,50 @@ test('a direct provider callback failure closes the runtime iterator and abandon
     await runtime.dispose()
     rmSync(home, { recursive: true, force: true })
   }
+})
+
+test('onPayload preserves routing metadata, inherits omitted tools, keeps empty tools, and rejects invalid payloads', async () => {
+  const seen = []
+  const runtime = {
+    async *stream(request) {
+      seen.push(request)
+      yield { type: 'finish', reason: { kind: 'stop' } }
+    },
+  }
+  const controller = new AbortController()
+  const toolDef = { name: 'bash', description: 'run', parameters: { type: 'object' } }
+  const ctx = {
+    messages: [
+      { role: 'system', content: 'sys', toolsAdded: [toolDef] },
+      user('hi'),
+    ],
+  }
+  await result(runtime, ctx, {
+    sessionId: 'sess-1',
+    signal: controller.signal,
+    onPayload: (p) => ({ model: 'custom-model', messages: p.messages }),
+  })
+  assert.equal(seen[0].sessionId, 'sess-1')
+  assert.equal(seen[0].signal, controller.signal)
+  assert.equal(seen[0].tools.length, 1)
+
+  await result(runtime, ctx, {
+    sessionId: 'sess-2',
+    signal: controller.signal,
+    onPayload: (p) => ({ model: 'custom-model', messages: p.messages, tools: [] }),
+  })
+  assert.equal(seen[1].sessionId, 'sess-2')
+  assert.deepEqual(seen[1].tools, [])
+
+  const badNull = await result(runtime, ctx, { onPayload: () => null })
+  assert.equal(badNull.message.stopReason, 'error')
+  assert.match(badNull.message.errorMessage, /payload object/)
+
+  const badModel = await result(runtime, ctx, { onPayload: () => ({ model: '', messages: [] }) })
+  assert.equal(badModel.message.stopReason, 'error')
+  assert.match(badModel.message.errorMessage, /non-empty string model/)
+
+  const badMessages = await result(runtime, ctx, { onPayload: () => ({ model: 'm', messages: 'nope' }) })
+  assert.equal(badMessages.message.stopReason, 'error')
+  assert.match(badMessages.message.errorMessage, /messages array/)
 })
