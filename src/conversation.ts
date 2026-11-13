@@ -560,6 +560,7 @@ async function* stepChunks(
         turn.finished = true
         turn.fail(event.error)
         turn.guard(undefined, signal)
+        return
     }
   }
 }

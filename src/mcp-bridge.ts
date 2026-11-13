@@ -130,6 +130,14 @@ export class McpBridge {
         connectionsCheckingInterval: 1_000,
       },
       (req, res) => {
+        req.on('error', (error) => {
+          this.log(`mcp: request stream error: ${error.message}`)
+          res.destroy()
+        })
+        res.on('error', (error) => {
+          this.log(`mcp: response stream error: ${error.message}`)
+          res.destroy()
+        })
         void this.handle(req, res).catch((error: unknown) => {
           this.log(`mcp: request failed: ${error instanceof Error ? error.message : 'unknown error'}`)
           if (res.headersSent || res.destroyed) {
@@ -338,6 +346,7 @@ export class McpBridge {
         ? (meta[CONVERSATION_META_KEY] as string)
         : undefined
 
+    if (res.destroyed || res.closed) return
     res.writeHead(200, {
       'content-type': 'text/event-stream',
       'cache-control': 'no-cache, no-transform',
@@ -356,22 +365,29 @@ export class McpBridge {
     res.on('close', onClose)
     let ticks = 0
     const keepAlive = setInterval(() => {
-      if (res.writableEnded) return
+      if (res.writableEnded || res.destroyed) return
       ticks++
-      res.write(': keepalive\n\n')
-      if (
-        typeof progressToken === 'string' ||
-        typeof progressToken === 'number'
-      ) {
-        writeEvent(res, {
-          jsonrpc: '2.0',
-          method: 'notifications/progress',
-          params: {
-            progressToken,
-            progress: ticks,
-            message: 'Pi is running the tool',
-          },
-        })
+      try {
+        res.write(': keepalive\n\n')
+        if (
+          typeof progressToken === 'string' ||
+          typeof progressToken === 'number'
+        ) {
+          writeEvent(res, {
+            jsonrpc: '2.0',
+            method: 'notifications/progress',
+            params: {
+              progressToken,
+              progress: ticks,
+              message: 'Pi is running the tool',
+            },
+          })
+        }
+      } catch (error) {
+        clearInterval(keepAlive)
+        this.log(
+          `mcp: keepalive write failed: ${error instanceof Error ? error.message : 'unknown error'}`,
+        )
       }
     }, this.options.keepAliveMs)
 

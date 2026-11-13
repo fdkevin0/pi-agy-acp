@@ -26,7 +26,7 @@ import {
   type AcpSpawner,
 } from './acp-process.ts'
 import { ModelCatalog, nearestEffort } from './catalog.ts'
-import { asEffort, type Config, type Effort } from './config.ts'
+import { asEffort, defaults, type Config, type Effort } from './config.ts'
 import {
   AcpTurn,
   AWAIT_TOOL,
@@ -81,11 +81,9 @@ import {
   type AccountInfo,
   type QuotaSnapshot,
 } from './quota.ts'
-import { delay, digest, KeyedMutex, abortable } from './util.ts'
+import { digest, KeyedMutex, abortable } from './util.ts'
 import { VERSION } from './version.ts'
 
-/** Parked calls answer with a still-running notice before Gemini cache TTL expiry and agy's 180-second MCP deadline. */
-export const DEFAULT_RELAY_AFTER_MS = 85_000
 const CONTINUE_PROMPT =
   'Continue exactly where your previous output stopped. Do not repeat any earlier text.'
 
@@ -361,11 +359,7 @@ export class AntigravityRuntime {
         )
           this.host.onModelsChanged()
       } finally {
-        try {
-          await proc.closeSession(result.sessionId)
-        } finally {
-          removeSessionArtifacts(this.home, result.sessionId)
-        }
+        await this.closeAndCleanSession(proc, result.sessionId)
       }
     })().finally(() => {
       this.warmupPromise = undefined
@@ -458,8 +452,7 @@ export class AntigravityRuntime {
       return
     }
     const proc = await this.ensureReady()
-    const scope = options.sessionId ?? `anon-${randomBytes(6).toString('hex')}`
-    const key = scope
+    const key = options.sessionId ?? `anon-${randomBytes(6).toString('hex')}`
     const release = await this.mutex.acquire(key, this.shutdown.signal)
     let conv: Conversation | undefined
     try {
@@ -539,6 +532,17 @@ export class AntigravityRuntime {
         const toolDelta = consumeToolDelta(conv, tools)
         if (toolDelta.length > 0)
           blocks.unshift({ type: 'text', text: `${toolDelta}\n\n` })
+      }
+      if (options.signal?.aborted) {
+        this.dropTurn(conv, 'The harness cancelled this request.')
+        yield {
+          type: 'finish',
+          reason: {
+            kind: 'aborted',
+            failure: { message: 'Request aborted', code: 'ABORTED' },
+          },
+        }
+        return
       }
       conv.knownIds = messageIds(split.messages)
       // A new turn starts with an empty reported-identity space: ids from past
@@ -801,11 +805,7 @@ export class AntigravityRuntime {
       )
       // A buffered session/new reply can resolve after its process has exited.
       if (!this.owns(proc, conv)) {
-        try {
-          await proc.closeSession(result.sessionId)
-        } finally {
-          removeSessionArtifacts(this.home, result.sessionId)
-        }
+        await this.closeAndCleanSession(proc, result.sessionId)
         this.assertActive()
         throw new LlmError('Conversation ownership changed', 'TRANSPORT')
       }
@@ -926,15 +926,12 @@ export class AntigravityRuntime {
       return reject('tool name conflict')
     if (reported.serverName !== MCP_SERVER_NAME)
       return reject(`unknown MCP server ${reported.serverName ?? '(none)'}`)
-    const allowedTools = new Set([
-      ...conv.advertisedToolNames,
-      AWAIT_TOOL_NAME,
-      CALL_TOOL_NAME,
-    ])
-    if (
-      reported.toolName === undefined ||
-      !allowedTools.has(reported.toolName)
-    ) {
+    const isAllowedTool =
+      reported.toolName !== undefined &&
+      (conv.advertisedToolNames.has(reported.toolName) ||
+        reported.toolName === AWAIT_TOOL_NAME ||
+        reported.toolName === CALL_TOOL_NAME)
+    if (!isAllowedTool) {
       return reject(
         `tool is not offered to this session: ${reported.toolName ?? '(none)'}`,
       )
@@ -963,13 +960,13 @@ export class AntigravityRuntime {
       )
     }
     if (conv.model !== model && modelOption?.currentValue !== model) {
-      const configOptions = await proc
-        .setConfigOption(sessionId, modelOption?.id ?? 'model', model)
-        .catch((error: unknown) => {
-          throw mapError(error)
-        })
-      this.assertOwner(proc, conv, sessionId)
-      conv.configOptions = configOptions
+      await this.applyConfigOption(
+        conv,
+        proc,
+        sessionId,
+        modelOption?.id ?? 'model',
+        model,
+      )
     }
     conv.model = model
     const levelOption = conv.configOptions.find(
@@ -984,15 +981,25 @@ export class AntigravityRuntime {
       conv.effort !== effort &&
       levelOption.currentValue !== effort
     ) {
-      const configOptions = await proc
-        .setConfigOption(sessionId, levelOption.id, effort)
-        .catch((error: unknown) => {
-          throw mapError(error)
-        })
-      this.assertOwner(proc, conv, sessionId)
-      conv.configOptions = configOptions
+      await this.applyConfigOption(conv, proc, sessionId, levelOption.id, effort)
     }
     conv.effort = effort
+  }
+
+  private async applyConfigOption(
+    conv: Conversation,
+    proc: AcpProcess,
+    sessionId: string,
+    optionId: string,
+    value: string,
+  ): Promise<void> {
+    const configOptions = await proc
+      .setConfigOption(sessionId, optionId, value)
+      .catch((error: unknown) => {
+        throw mapError(error)
+      })
+    this.assertOwner(proc, conv, sessionId)
+    conv.configOptions = configOptions
   }
 
   private plan(
@@ -1071,13 +1078,21 @@ export class AntigravityRuntime {
     return false
   }
 
+  private async closeAndCleanSession(
+    proc: AcpProcess,
+    sessionId: string,
+  ): Promise<void> {
+    try {
+      await proc.closeSession(sessionId)
+    } finally {
+      removeSessionArtifacts(this.home, sessionId)
+    }
+  }
+
   private async resetSession(conv: Conversation): Promise<void> {
     let closing: Promise<void> | undefined
     if (conv.sessionId !== undefined && conv.process !== undefined) {
-      const sessionId = conv.sessionId
-      closing = conv.process
-        .closeSession(sessionId)
-        .finally(() => removeSessionArtifacts(this.home, sessionId))
+      closing = this.closeAndCleanSession(conv.process, conv.sessionId)
     }
     this.clearSession(conv)
     conv.knownIds = undefined
@@ -1131,9 +1146,10 @@ export class AntigravityRuntime {
         this.dropTurn(conv, 'The harness cancelled this request.')
     }
     // Pi 1.5.2 pi-agent-core/dist/agent-loop.js shares this signal with tool execution.
+    turn.releaseSignal?.()
+    turn.releaseSignal = undefined
     if (options.signal !== undefined) {
       const signal = options.signal
-      turn.releaseSignal?.()
       signal.addEventListener('abort', cancel, { once: true })
       turn.releaseSignal = () => {
         signal.removeEventListener('abort', cancel)
@@ -1204,8 +1220,19 @@ export class AntigravityRuntime {
             conv.turn = undefined
           }
         }
-        if (finishKind === 'aborted' || !drained)
-          await Promise.race([turn.promptSettled, delay(5_000)])
+        if (finishKind === 'aborted' || !drained) {
+          let timer: ReturnType<typeof setTimeout> | undefined
+          try {
+            await Promise.race([
+              turn.promptSettled,
+              new Promise<void>((resolve) => {
+                timer = setTimeout(resolve, 5_000)
+              }),
+            ])
+          } finally {
+            clearTimeout(timer)
+          }
+        }
       }
     }
   }
@@ -1410,16 +1437,17 @@ export class AntigravityRuntime {
     const relayAfterMs =
       this.host.relayAfterMs ??
       this.host.config.relayAfterMs ??
-      DEFAULT_RELAY_AFTER_MS
+      defaults.relayAfterMs
     const relay = new Promise<'relay'>((resolve) => {
       timer = setTimeout(() => resolve('relay'), relayAfterMs)
     })
+    let onAbort: (() => void) | undefined
     const aborted = new Promise<'aborted'>((resolve) => {
       if (signal.aborted) resolve('aborted')
-      else
-        signal.addEventListener('abort', () => resolve('aborted'), {
-          once: true,
-        })
+      else {
+        onAbort = () => resolve('aborted')
+        signal.addEventListener('abort', onAbort, { once: true })
+      }
     })
     try {
       const outcome = await Promise.race([call.result.promise, relay, aborted])
@@ -1432,6 +1460,7 @@ export class AntigravityRuntime {
       return outcome
     } finally {
       if (timer !== undefined) clearTimeout(timer)
+      if (onAbort !== undefined) signal.removeEventListener('abort', onAbort)
     }
   }
 
@@ -1440,7 +1469,11 @@ export class AntigravityRuntime {
     const now = Date.now()
     for (const conv of [...this.conversations.values()]) {
       if (this.isIdle(conv) && now - conv.lastUsed > ttl) {
-        void this.resetSession(conv)
+        void this.resetSession(conv).catch((error: unknown) => {
+          this.host.log.warn(
+            `session sweep cleanup failed: ${error instanceof Error ? error.message : String(error)}`,
+          )
+        })
         this.conversations.delete(conv.key)
       }
     }

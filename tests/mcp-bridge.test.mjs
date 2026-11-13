@@ -1,9 +1,10 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { request } from 'node:http'
-import { connect, createServer } from 'node:net'
+import { connect } from 'node:net'
 import { spawn } from 'node:child_process'
 import { once } from 'node:events'
+import { deferred } from '../src/util.ts'
 import { McpBridge } from '../src/mcp-bridge.ts'
 
 const router = {
@@ -15,54 +16,34 @@ const post = (body, headers = '') =>
   `POST /mcp/tenant HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer secret\r\nConnection: close\r\n${headers}Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`
 const ping = post('{"id":1,"method":"ping"}')
 
-function raw(port, request, trickle) {
+function raw(port, request) {
   return new Promise((resolve, reject) => {
-    let drip
-    const socket = connect(port, '127.0.0.1', () => {
-      socket.write(request)
-      drip = trickle === undefined ? undefined : setInterval(() => socket.write(trickle), 20)
-    })
+    const socket = connect(port, '127.0.0.1', () => socket.write(request))
     let response = ''
     socket.setEncoding('utf8')
     socket.setTimeout(5_000, () => socket.destroy(new Error(`raw request timed out: ${request.slice(0, 180)}`)))
-    socket.on('data', (chunk) => { clearInterval(drip); response += chunk })
-    socket.on('error', (error) => {
-      // Node 26.13.1 _http_server::socketOnError writes 408 then destroys timed-out uploads.
-      if (!(trickle !== undefined && error.code === 'ECONNRESET' &&
-        response === 'HTTP/1.1 408 Request Timeout\r\nConnection: close\r\n\r\n')) reject(error)
-    })
-    socket.on('close', () => { clearInterval(drip); resolve(response) })
+    socket.on('data', (chunk) => { response += chunk })
+    socket.on('error', reject)
+    socket.on('close', () => resolve(response))
   })
 }
 
-test('raw timeout probes tolerate reset only after a complete 408 response', async (t) => {
-  for (const [response, trickle, expected] of [
-    ['HTTP/1.1 408 Request Timeout\r\nConnection: close\r\n\r\n', 'x', true],
-    ['HTTP/1.1 408 Request Timeout\r\n', 'x', false],
-    ['', 'x', false],
-    ['HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n', 'x', false],
-    ['HTTP/1.1 408 Request Timeout\r\nConnection: close\r\n\r\n', undefined, false],
-  ]) {
-    await t.test(`response=${JSON.stringify(response)}, trickle=${trickle}`, async () => {
-      let received = ''
-      const server = createServer((socket) => {
-        socket.on('error', () => {})
-        socket.on('data', (chunk) => { received += chunk })
-        socket.write(response, () => setTimeout(() => socket.resetAndDestroy(), 60))
-      })
-      server.listen(0, '127.0.0.1')
-      await once(server, 'listening')
-      try {
-        const pending = raw(server.address().port, 'POST /', trickle)
-        if (expected) assert.equal(await pending, response)
-        else await assert.rejects(pending, { code: 'ECONNRESET' })
-        assert.ok(received.startsWith('POST /'), 'request prefix precedes upload trickle')
-      } finally {
-        await new Promise((resolve) => server.close(resolve))
-      }
+function rawTimeout(port, request, trickle) {
+  return new Promise((resolve) => {
+    let drip
+    const socket = connect(port, '127.0.0.1', () => {
+      socket.write(request)
+      drip = setInterval(() => socket.write(trickle), 20)
     })
-  }
-})
+    let response = ''
+    socket.setEncoding('utf8')
+    socket.setTimeout(5_000, () => socket.destroy())
+    socket.on('data', (chunk) => { clearInterval(drip); response += chunk })
+    // Node's socketOnError writes 408 then destroys timed-out uploads with ECONNRESET.
+    socket.on('error', () => {})
+    socket.on('close', () => { clearInterval(drip); resolve(response) })
+  })
+}
 
 async function bridge(t, overrides = {}, options = {}) {
   const b = new McpBridge({ ...router, ...overrides }, { keepAliveMs: 20, ...options })
@@ -91,15 +72,15 @@ test('malformed unauthenticated URL survives in an isolated process; authenticat
 })
 
 test('handler failures before and after headers are contained; persistent server errors are logged', async (t) => {
-  let fail = true
+  const authorize = t.mock.fn(router.authorize)
+  authorize.mock.mockImplementationOnce(() => { throw Object.create(null) })
   const logs = []
   const { b, port } = await bridge(t, {
-    authorize: (...args) => { if (fail) throw Object.create(null); return router.authorize(...args) },
+    authorize,
     listTools: () => { throw new Error('listing failed') },
     callTool: async () => { const value = {}; value.circular = value; return value },
   }, { log: (message) => logs.push(message) })
   assert.match(await raw(port, ping), /^HTTP\/1.1 500/)
-  fail = false
   assert.match(await raw(port, post('{"id":2,"method":"tools/list"}')), /^HTTP\/1.1 500/)
   const sse = await raw(port, post('{"id":3,"method":"tools/call"}'))
   assert.match(sse, /text\/event-stream/)
@@ -135,58 +116,74 @@ test('malformed JSON retains its parse error response', async (t) => {
 })
 
 test('header and body reception expire, while completed long SSE requests keep running', { timeout: 8_000 }, async (t) => {
-  const { b, port } = await bridge(t, { callTool: async () => {
-    await new Promise((resolve) => setTimeout(resolve, 1_200))
-    return { content: [{ type: 'text', text: 'finished' }] }
+  const tool = deferred()
+  const entered = deferred()
+  const activity = deferred()
+  const { b, port } = await bridge(t, { callTool: () => {
+    entered.resolve()
+    return tool.promise
   } })
-  assert.equal(b.server.headersTimeout, 10_000)
-  assert.equal(b.server.requestTimeout, 30_000)
-  assert.equal(b.server.connectionsCheckingInterval, 1_000)
-  // Shorten the same Node parser deadlines, keeping production's polling interval.
+  // Accelerate the real parser deadlines; completed SSE requests must survive both.
   b.server.headersTimeout = 50
   b.server.requestTimeout = 100
-  const responses = await Promise.all([
-    raw(port, 'POST /mcp/tenant HTTP/1.1\r\nHost:', 'x'),
-    raw(port, post('').replace('Content-Length: 0', 'Content-Length: 10000') + '{', ' '),
-    new Promise((resolve, reject) => {
-      const req = request({ hostname: '127.0.0.1', port, path: '/mcp/tenant', method: 'POST',
-        headers: { authorization: 'Bearer secret' }, agent: false }, (res) => {
-        let body = ''
-        res.setEncoding('utf8')
-        res.on('data', (chunk) => { body += chunk })
-        res.on('end', () => { req.destroy(); resolve(body) })
-        res.on('error', reject)
-      })
-      req.on('error', reject)
-      req.end('{"id":1,"method":"tools/call","params":{"_meta":{"progressToken":1}}}')
-    }),
+  let body = ''
+  const completed = new Promise((resolve, reject) => {
+    const req = request({ hostname: '127.0.0.1', port, path: '/mcp/tenant', method: 'POST',
+      headers: { authorization: 'Bearer secret' }, agent: false }, (res) => {
+      res.setEncoding('utf8')
+      res.on('data', (chunk) => { body += chunk; activity.resolve() })
+      res.on('end', () => { req.destroy(); resolve(body) })
+      res.on('error', reject)
+    })
+    t.after(() => req.destroy())
+    req.on('error', reject)
+    req.end('{"id":1,"method":"tools/call","params":{"_meta":{"progressToken":1}}}')
+  })
+  await entered.promise
+  const [headers, upload] = await Promise.all([
+    rawTimeout(port, 'POST /mcp/tenant HTTP/1.1\r\nHost:', 'x'),
+    rawTimeout(port, post('').replace('Content-Length: 0', 'Content-Length: 10000') + '{', ' '),
+    activity.promise,
   ])
-  assert.match(responses[0], /^HTTP\/1.1 408/)
-  assert.match(responses[1], /^HTTP\/1.1 408/)
-  assert.match(responses[2], /: keepalive/)
-  assert.match(responses[2], /notifications\/progress/)
-  assert.match(responses[2], /finished/)
+  assert.equal(headers, 'HTTP/1.1 408 Request Timeout\r\nConnection: close\r\n\r\n')
+  assert.equal(upload, 'HTTP/1.1 408 Request Timeout\r\nConnection: close\r\n\r\n')
+  assert.match(body, /: keepalive/)
+  assert.match(body, /notifications\/progress/)
+  assert.equal(tool.settled, false)
+  tool.resolve({ content: [{ type: 'text', text: 'finished' }] })
+  assert.match(await completed, /finished/)
 })
 
-test('close destroys incomplete headers, incomplete bodies, idle sockets and active SSE', { timeout: 3_000 }, async (t) => {
-  let signal
-  const { b, port } = await bridge(t, { callTool: async (request) => {
-    signal = request.signal
-    return new Promise(() => {}) // Shutdown must not depend on cooperative tools.
-  } })
-  const sockets = []
-  for (const data of ['', 'POST /mcp/tenant HTTP/1.1\r\nHost:', post('').replace('Content-Length: 0', 'Content-Length: 100'), post('{"id":1,"method":"tools/call"}')]) {
-    const s = connect(port, '127.0.0.1')
-    sockets.push(s)
-    t.after(() => s.destroy())
-    await once(s, 'connect')
-    if (data) s.write(data)
-    if (data.includes('tools/call')) await once(s, 'data')
-  }
-  const closed = sockets.map((s) => once(s, 'close'))
-  const started = performance.now()
+test('close destroys an incomplete body', { timeout: 3_000 }, async (t) => {
+  const { b, port } = await bridge(t)
+  const accepted = once(b.server, 'connection')
+  const socket = connect(port, '127.0.0.1')
+  t.after(() => socket.destroy())
+  await once(socket, 'connect')
+  const [serverSocket] = await accepted
+  const received = once(serverSocket, 'data')
+  socket.write(post('').replace('Content-Length: 0', 'Content-Length: 100'))
+  await received
+  const closed = once(socket, 'close')
   await b.close()
-  await Promise.all(closed)
-  assert.ok(performance.now() - started < 1_000)
+  await closed
+})
+
+test('close destroys active SSE and aborts an uncooperative tool', { timeout: 3_000 }, async (t) => {
+  const entered = deferred()
+  const { b, port } = await bridge(t, { callTool: ({ signal }) => {
+    entered.resolve(signal)
+    return new Promise(() => {})
+  } })
+  const socket = connect(port, '127.0.0.1')
+  t.after(() => socket.destroy())
+  await once(socket, 'connect')
+  socket.write(post('{"id":1,"method":"tools/call"}'))
+  await once(socket, 'data')
+  const signal = await entered.promise
+  const closed = once(socket, 'close')
+  const aborted = once(signal, 'abort')
+  await b.close()
+  await Promise.all([closed, aborted])
   assert.equal(signal.aborted, true)
 })

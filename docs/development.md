@@ -34,67 +34,16 @@ pi -e ./index.ts
 - **Session lifecycle:** The bridge binds to `127.0.0.1`, uses per-session bearer
   credentials, and validates structured tool identity before granting permissions.
   Tree navigation and compaction close conversation sessions and their files,
-  retaining the process, bridge, and caches. Pi 1.5.0 reports completed switches
-  through `session_start` (`new`, `resume`, or `fork`), which uses the same light
-  reset if the runtime survives. `session_shutdown` and `/agy-acp reset` dispose
-  the runtime. Runtime ownership moves from active to disposing to disposed;
-  disposal is shared by concurrent callers and rejects new work immediately.
-  Preflight and lock waiters cancel without waiting for the underlying operation.
-  Startup tracks the child before ACP initialize, stops it on disposal, and drains
-  bridge binding before closing the listener. Late session replies from a dead or
-  replaced process, disposed runtime, or replaced conversation roll back their
-  session artifacts instead of registering a conversation or tenant. ACP stop
-  closes the JSON-RPC peer immediately so pending initialize/session requests reject without waiting
-  for child exit. Bridge shutdown destroys tracked sockets, including incomplete
-  requests and SSE connections.
-  A turn owns cancellation through streaming and parked tool execution. Only a
-  fully drained `tool-calls` handoff preserves it; early iterator closure, callback
-  failure, abort, or owning-run settlement abandons all tool waiters and marks
-  partial ACP history for rebuilding. A request cancelled while startup or a
-  conversation lock is pending emits `finish(aborted)` after acquiring ownership,
-  without opening a new ACP session. Startup and disposal failures still reject.
-  Process, conversation, and captured session identity are checked after async
-  startup, lock acquisition, session creation, and model/effort selection before
-  adopting results. Discovery also rejects replies from an obsolete process.
-  Synchronous prompt-dispatch failures enter the same error queue and pump cleanup
-  as asynchronous rejections, including replacement turns after tool completion.
-  The conversation lock remains held through asynchronous step cleanup, so an old
-  close cannot delete a session acquired by its successor.
-  Process exit detaches running and parked turns and settles their tool waiters.
-  Each turn retains its first interruption independently of the event queue:
-  cancellation first stays aborted; failure first retains the original error even
-  if cancellation or another failure follows. Prompt rejection and process exit
-  use the same failure path. A queued `done` is not a committed step completion:
-  it may follow parked tools or request a long-decode continuation. Success is
-  committed only after the consumer drains the step; loss after a yielded finish
-  but before drain still fails settlement.
-  One turn guard gates emission and settlement in both async generators, including
-  their delivery microtask, before tool identity accounting. The step generator
-  also checks before resuming production and after queue/batching waits, preventing
-  new tool emission, continuations, or tool-step accounting after known failure.
-  Partial blocks are abandoned on failure rather than completed into executable
-  tool calls. Old process callbacks cannot change a replacement runtime's status.
-  Tool-result delivery hands the exact resumed turn to the pump synchronously;
-  result-waiter microtasks may cancel and detach it before output resumes.
-  Cancellation takes priority over buffered output and batched tools. Streaming cleanup waits for prompt settlement for up
-  to five seconds; releasing a parked turn is immediate. Signal callbacks check
-  turn identity, and ACP callbacks check the session's tenant identity before
-  changing conversation state. Parked tools have no inactivity deadline.
-
-  Provenance: installed Pi **1.5.2** `pi-agent-core/dist/agent-loop.js` passes
-  the run signal to both `streamAssistantResponse` and `executeToolCalls`.
-  `pi-coding-agent/dist/core/agent-session.js::_emitAgentSettled` awaits extension
-  handlers after the run finishes; `core/extensions/types.d.ts::AgentSettledEvent`
-  guarantees no automatic retry, compaction, or queued continuation remains.
-  Its context exposes `sessionManager.getSessionId()`. The settlement hook uses
-  that ID regardless of selected provider, before quota gating. Tests use local
-  scripted ACP sessions and controlled queue boundaries, not live account traffic.
-  The terminal-boundary regressions reproduce real fake-ACP child exit after
-  `block-start(tool-call)` and synchronous ACP stop during batching, then cover
-  every tool/text/reasoning/usage/finish yield and the generator delivery microtask.
-  Continuation rejection and synchronous throws preserve the first interruption.
-  These reproduce the queue-ordering quirk against `AcpProcess`/`JsonRpcPeer`,
-  rather than assuming that process failure aborts the Pi request signal.
+  retaining the process, bridge, and caches. `session_start` (`new`, `resume`, or
+  `fork`) uses the same light reset if the runtime survives; `session_shutdown`
+  and `/agy-acp reset` dispose the runtime.
+  Disposal is idempotent, drains in-flight startup and bridge binding, cancels
+  waiters, and rolls back late session replies from obsolete processes or
+  conversations. A turn owns cancellation through streaming and parked tool
+  execution until its step drains, `agent_settled` runs, or the process exits;
+  only a fully drained `tool-calls` handoff preserves parked tool calls.
+  First interruption wins (`abandon` vs. `fail`), cancellation takes priority
+  over buffered output, and turn/tenant identities guard all async callbacks.
 - **Quota and TUI:** Settled checks share the reader's TTL and in-flight request
   without blocking Pi. Model selection reads memory only. UI generation checks
   discard stale background results; warning keys include bucket, reset time, and
@@ -121,23 +70,9 @@ errors retain the MCP parse-error response. Unexpected handler failures return
 the diagnostic sink.
 
 Node's HTTP parser enforces a 10-second header reception deadline and a 30-second
-whole-request reception deadline, checked every second. These are absolute
-reception limits, including trickling clients, not tool execution deadlines:
-completed requests may keep SSE responses open for long approvals, tools, and
-relay waits. Idle keepalive sockets use Node's default timeout. Shutdown stops
-accepting connections and destroys all HTTP connections, including incomplete
-headers, bodies, and active streams, without waiting for tool promises.
-
-Boundary regressions run in `tests/mcp-bridge.test.mjs`, including the isolated
-unauthenticated `GET http://[` crash probe. Deadline probes stop uploading when a
-response arrives and accept `ECONNRESET` only after the complete Node 408 response:
-Node 26.13.1's `socketOnError` writes that response then destroys the socket.
-Controlled TCP peers verify that missing/partial responses and unrelated resets
-still fail. The implementation choices were
-checked against Node 26.13.1's embedded `_http_server` source (`checkConnections`,
-`onRequestTimeout`, and `closeAllConnections`) and live loopback traffic;
-`Readable.iterator({ destroyOnReturn: false })` preserves the socket long enough
-to flush a 413 when body iteration stops early.
+whole-request reception deadline, checked every second. These are reception limits
+only and do not cap completed SSE tool streams. Shutdown stops accepting
+connections and destroys all tracked sockets without waiting for tool promises.
 
 ## Source layout
 
