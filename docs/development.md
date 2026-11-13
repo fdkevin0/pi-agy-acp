@@ -97,7 +97,7 @@ npm pack --dry-run
 
 `ci.yml` checks pull requests and pushes to `main`. `release.yml` runs only for
 version-tag pushes or manual runs on an existing tag, so ordinary commits do not
-run a second test suite or trigger publication. CI tests Node.js 22.18.0 and 24;
+run a second test suite or trigger publication. CI tests Node.js 22.19.0 and 24;
 releases use Node.js 24. There is no committed lockfile, so dependency
 installation uses `npm install`.
 

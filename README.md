@@ -10,7 +10,7 @@ parallel tool calls.
 
 ## Prerequisites
 
-- Node.js >= 22.18.0.
+- Node.js >= 22.19.0.
 - Pi (`@earendil-works/pi-coding-agent`) 1.5.x.
 - The official `agy` CLI >= 1.4.12, signed in with your Google account.
   Run `agy` in your terminal to complete sign-in before using the extension.
