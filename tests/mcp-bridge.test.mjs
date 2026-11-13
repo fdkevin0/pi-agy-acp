@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { request } from 'node:http'
-import { connect } from 'node:net'
+import { connect, createServer } from 'node:net'
 import { spawn } from 'node:child_process'
 import { once } from 'node:events'
 import { McpBridge } from '../src/mcp-bridge.ts'
@@ -17,16 +17,52 @@ const ping = post('{"id":1,"method":"ping"}')
 
 function raw(port, request, trickle) {
   return new Promise((resolve, reject) => {
-    const socket = connect(port, '127.0.0.1', () => socket.write(request))
-    const drip = trickle === undefined ? undefined : setInterval(() => socket.write(trickle), 20)
+    let drip
+    const socket = connect(port, '127.0.0.1', () => {
+      socket.write(request)
+      drip = trickle === undefined ? undefined : setInterval(() => socket.write(trickle), 20)
+    })
     let response = ''
     socket.setEncoding('utf8')
     socket.setTimeout(5_000, () => socket.destroy(new Error(`raw request timed out: ${request.slice(0, 180)}`)))
-    socket.on('data', (chunk) => { response += chunk })
-    socket.on('error', reject)
+    socket.on('data', (chunk) => { clearInterval(drip); response += chunk })
+    socket.on('error', (error) => {
+      // Node 26.13.1 _http_server::socketOnError writes 408 then destroys timed-out uploads.
+      if (!(trickle !== undefined && error.code === 'ECONNRESET' &&
+        response === 'HTTP/1.1 408 Request Timeout\r\nConnection: close\r\n\r\n')) reject(error)
+    })
     socket.on('close', () => { clearInterval(drip); resolve(response) })
   })
 }
+
+test('raw timeout probes tolerate reset only after a complete 408 response', async (t) => {
+  for (const [response, trickle, expected] of [
+    ['HTTP/1.1 408 Request Timeout\r\nConnection: close\r\n\r\n', 'x', true],
+    ['HTTP/1.1 408 Request Timeout\r\n', 'x', false],
+    ['', 'x', false],
+    ['HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n', 'x', false],
+    ['HTTP/1.1 408 Request Timeout\r\nConnection: close\r\n\r\n', undefined, false],
+  ]) {
+    await t.test(`response=${JSON.stringify(response)}, trickle=${trickle}`, async () => {
+      let received = ''
+      const server = createServer((socket) => {
+        socket.on('error', () => {})
+        socket.on('data', (chunk) => { received += chunk })
+        socket.write(response, () => setTimeout(() => socket.resetAndDestroy(), 60))
+      })
+      server.listen(0, '127.0.0.1')
+      await once(server, 'listening')
+      try {
+        const pending = raw(server.address().port, 'POST /', trickle)
+        if (expected) assert.equal(await pending, response)
+        else await assert.rejects(pending, { code: 'ECONNRESET' })
+        assert.ok(received.startsWith('POST /'), 'request prefix precedes upload trickle')
+      } finally {
+        await new Promise((resolve) => server.close(resolve))
+      }
+    })
+  }
+})
 
 async function bridge(t, overrides = {}, options = {}) {
   const b = new McpBridge({ ...router, ...overrides }, { keepAliveMs: 20, ...options })

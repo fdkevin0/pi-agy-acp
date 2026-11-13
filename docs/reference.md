@@ -156,6 +156,14 @@ estimates are not an invoice amount or a promise of free access.
 The extension does not inspect agy's private databases or invoke or distribute
 binary patch scripts.
 
+## MCP request limits
+
+The local MCP bridge accepts request bodies up to 1 MiB (1,048,576 bytes),
+including `tools/call` arguments. Larger requests receive HTTP 413 and the
+connection closes. Headers must arrive within 10 seconds and the whole request
+within 30 seconds. These upload deadlines do not limit tool execution or SSE
+response duration.
+
 ## Compatibility limits
 
 This version targets the `@earendil-works/*` Pi packages at version 1.5.x.

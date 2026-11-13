@@ -99,7 +99,11 @@ accepting connections and destroys all HTTP connections, including incomplete
 headers, bodies, and active streams, without waiting for tool promises.
 
 Boundary regressions run in `tests/mcp-bridge.test.mjs`, including the isolated
-unauthenticated `GET http://[` crash probe. The implementation choices were
+unauthenticated `GET http://[` crash probe. Deadline probes stop uploading when a
+response arrives and accept `ECONNRESET` only after the complete Node 408 response:
+Node 26.13.1's `socketOnError` writes that response then destroys the socket.
+Controlled TCP peers verify that missing/partial responses and unrelated resets
+still fail. The implementation choices were
 checked against Node 26.13.1's embedded `_http_server` source (`checkConnections`,
 `onRequestTimeout`, and `closeAllConnections`) and live loopback traffic;
 `Readable.iterator({ destroyOnReturn: false })` preserves the socket long enough
