@@ -1905,8 +1905,18 @@ test('dispose cancels blocked preflight without resurrecting shared startup', as
   const second = runtime.ensureReady()
   const failures = Promise.all([assert.rejects(first, /disposed/), assert.rejects(second, /disposed/)])
   await entered.promise
-  await Promise.all([runtime.dispose(), runtime.dispose()])
-  resume.resolve()
+  let deadline
+  try {
+    await Promise.race([
+      Promise.all([runtime.dispose(), runtime.dispose(), failures]),
+      new Promise((_, reject) => {
+        deadline = setTimeout(() => reject(new Error('disposal/callers waited for blocked preflight')), 1500)
+      }),
+    ])
+  } finally {
+    clearTimeout(deadline)
+    resume.resolve()
+  }
   await failures
   assert.equal(spawned, 0)
   assert.equal(runtime.process, undefined)
