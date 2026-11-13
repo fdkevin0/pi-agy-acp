@@ -780,22 +780,117 @@ test('steering input after tool results reaches the agent with the last result',
   assert.match(textOf(step2), /RESULT\(bash\)=r[\s\S]*also check tests/)
 })
 
-test('cancellation aborts the step and the next turn rebuilds', async () => {
+test('cancellation during deferred preflight finishes aborted without opening a session', async () => {
+  const entered = deferred(), resume = deferred()
+  const { runtime, prompts, mcps } = makeRuntime({ host: {
+    runCommand: async () => {
+      entered.resolve()
+      await resume.promise
+      return { code: 0, stdout: 'fake-agy 0.0.1', stderr: '' }
+    },
+  } })
+  const controller = new AbortController()
+  const request = { model: 'gemini-4-argon', sessionId: 'startup-abort',
+    signal: controller.signal, messages: [sys, user('u1', 'hello')] }
+  const pending = collect(runtime.stream(request))
+  await entered.promise
+  controller.abort()
+  resume.resolve()
+  const chunks = await pending
+  assert.deepEqual(chunks, [{ type: 'finish', reason: {
+    kind: 'aborted', failure: { message: 'Request aborted', code: 'ABORTED' },
+  } }])
+  assert.equal(prompts().length, 0)
+  assert.equal(mcps().length, 0)
+  assert.equal(runtime.conversations.size, 0)
+  assert.equal(runtime.tenants.size, 0)
+  assert.equal(runtime.status().activeTurns, 0)
+  assert.equal(finishOf(await collect(runtime.stream({ ...request, signal: undefined }))).reason.kind, 'stop')
+})
+
+test('cancellation while waiting for ownership releases only the acquired session turn', async (t) => {
+  const { runtime } = makeRuntime()
+  const request = { model: 'gemini-4-argon', sessionId: 'queued-abort', tools: [bash],
+    messages: [sys, user('u1', 'CALL bash {"command":"long"}')] }
+  await collect(runtime.stream(request))
+  await collect(runtime.stream({ ...request, sessionId: 'other-owner' }))
+  const conv = runtime.conversations.get(request.sessionId)
+  const oldTurn = conv.turn
+  const otherTurn = runtime.conversations.get('other-owner').turn
+  const waitingCall = [...oldTurn.calls.values()][0]
+  const release = await runtime.mutex.acquire(request.sessionId)
+  const entered = deferred()
+  const acquire = runtime.mutex.acquire.bind(runtime.mutex)
+  t.mock.method(runtime.mutex, 'acquire', (...args) => {
+    const pending = acquire(...args)
+    entered.resolve()
+    return pending
+  })
+  const controller = new AbortController()
+  const pending = collect(runtime.stream({ ...request, signal: controller.signal }))
+  await entered.promise
+  controller.abort()
+  assert.equal(conv.turn, oldTurn, 'queued request has no ownership yet')
+  release()
+  assert.equal(finishOf(await pending).reason.kind, 'aborted')
+  assert.equal(conv.turn, undefined)
+  assert.equal(conv.opening, false)
+  assert.equal(conv.dirty, true)
+  assert.equal((await waitingCall.result.promise).isError, true)
+  assert.equal(runtime.conversations.get('other-owner').turn, otherTurn)
+})
+
+test('startup failure and disposal remain failures when the request also cancels', async (t) => {
+  for (const dispose of [false, true]) {
+    await t.test(dispose ? 'disposal' : 'preflight failure', async () => {
+      const entered = deferred(), resume = deferred()
+      const { runtime } = makeRuntime()
+      t.mock.method(runtime, 'runPreflight', async () => {
+        entered.resolve()
+        await resume.promise
+        throw new Error('preflight failed')
+      })
+      const controller = new AbortController()
+      const failed = assert.rejects(collect(runtime.stream({ model: 'gemini-4-argon',
+        signal: controller.signal, messages: [sys, user('u1', 'hello')],
+      })), dispose ? /disposed/ : /preflight failed/)
+      await entered.promise
+      controller.abort()
+      if (dispose) await runtime.dispose()
+      resume.resolve()
+      await failed
+      assert.equal(runtime.conversations.size, 0)
+      assert.equal(runtime.bridge.server, undefined)
+    })
+  }
+})
+
+test('cancellation aborts the step and the next turn rebuilds', async (t) => {
   const { adapter, prompts } = makeRuntime()
+  const proc = await adapter.ensureReady()
+  const entered = deferred()
+  const prompt = proc.prompt.bind(proc)
+  t.mock.method(proc, 'prompt', (...args) => {
+    const pending = prompt(...args)
+    entered.resolve()
+    return pending
+  })
   const controller = new AbortController()
   const base = {
     provider: 'antigravity',
     model: 'gemini-4-argon',
     sessionId: 'S7',
   }
-  setTimeout(() => controller.abort(), 150)
-  const chunks = await collect(
+  const pending = collect(
     adapter.stream({
       ...base,
       signal: controller.signal,
       messages: [sys, user('u1', 'SLEEP 2000')],
     }),
   )
+  await entered.promise
+  controller.abort()
+  const chunks = await pending
   assert.equal(finishOf(chunks).reason.kind, 'aborted')
   assert.equal(adapter.status().lastTurn.outcome, 'aborted')
   await collect(

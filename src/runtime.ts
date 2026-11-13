@@ -462,8 +462,15 @@ export class AntigravityRuntime {
 
       if (options.signal?.aborted) {
         this.dropTurn(conv, 'The harness cancelled this request.')
+        yield {
+          type: 'finish',
+          reason: {
+            kind: 'aborted',
+            failure: { message: 'Request aborted', code: 'ABORTED' },
+          },
+        }
+        return
       }
-      options.signal?.throwIfAborted()
       if (conv.turn !== undefined && conv.turn.pendingCalls.size > 0) {
         // Resuming a parked turn is only valid while the request still starts
         // with the exact history this ACP session already owns. A compaction

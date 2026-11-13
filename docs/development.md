@@ -49,8 +49,10 @@ pi -e ./index.ts
   A turn owns cancellation through streaming and parked tool execution. Only a
   fully drained `tool-calls` handoff preserves it; early iterator closure, callback
   failure, abort, or owning-run settlement abandons all tool waiters and marks
-  partial ACP history for rebuilding. Cancellation takes priority over buffered
-  output and batched tools. Streaming cleanup waits for prompt settlement for up
+  partial ACP history for rebuilding. A request cancelled while startup or a
+  conversation lock is pending emits `finish(aborted)` after acquiring ownership,
+  without opening a new ACP session. Startup and disposal failures still reject.
+  Cancellation takes priority over buffered output and batched tools. Streaming cleanup waits for prompt settlement for up
   to five seconds; releasing a parked turn is immediate. Signal callbacks check
   turn identity, and ACP callbacks check the session's tenant identity before
   changing conversation state. Parked tools have no inactivity deadline.
