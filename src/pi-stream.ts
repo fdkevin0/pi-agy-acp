@@ -146,12 +146,53 @@ export function streamPi(
           max: 'high',
         }[options.reasoning ?? 'off'],
       }
+      // onPayload may replace request content, but harness-owned routing/cancellation
+      // metadata (sessionId, signal) is always preserved. Omitting `tools` inherits
+      // the original tools; passing `tools: []` explicitly disables them.
       const replacement = await options.onPayload?.(request, model)
-      if (replacement !== undefined)
+      if (replacement !== undefined) {
+        if (
+          replacement === null ||
+          typeof replacement !== 'object' ||
+          Array.isArray(replacement)
+        ) {
+          throw new LlmError(
+            'onPayload must return a payload object or undefined',
+            'INVALID_PAYLOAD',
+          )
+        }
+        const candidate = replacement as Record<string, unknown>
+        if (
+          typeof candidate.model !== 'string' ||
+          candidate.model.trim().length === 0
+        ) {
+          throw new LlmError(
+            'onPayload replacement must include a non-empty string model',
+            'INVALID_PAYLOAD',
+          )
+        }
+        if (!Array.isArray(candidate.messages)) {
+          throw new LlmError(
+            'onPayload replacement must include a messages array',
+            'INVALID_PAYLOAD',
+          )
+        }
+        if (candidate.tools !== undefined && !Array.isArray(candidate.tools)) {
+          throw new LlmError(
+            'onPayload replacement tools must be an array when provided',
+            'INVALID_PAYLOAD',
+          )
+        }
         request = {
-          ...(replacement as GenerateOptions),
+          ...(candidate as unknown as GenerateOptions),
+          tools:
+            candidate.tools === undefined
+              ? request.tools
+              : (candidate.tools as GenerateOptions['tools']),
+          sessionId: options.sessionId,
           signal: options.signal,
         }
+      }
       stream.push({ type: 'start', partial: message })
       let finish: Extract<StreamChunk, { type: 'finish' }> | undefined
       let responseReported = false

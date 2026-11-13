@@ -133,6 +133,9 @@ export type TurnEvent =
   | { kind: 'done'; result: AcpPromptResult }
   | { kind: 'error'; error: Error }
 
+/** Bound on buffered text/thought chars accumulated while a tool call is relayed. */
+const MAX_RELAY_BUFFER_CHARS = 65_536
+
 /** One running ACP prompt turn. */
 export class AcpTurn {
   readonly cancellation = new AbortController()
@@ -154,8 +157,11 @@ export class AcpTurn {
   /** Settles after the current prompt's result or error has been queued. */
   promptSettled: Promise<void> = Promise.resolve()
   usage?: AcpPromptResult['usage']
-  /** A parked call was answered with a still-running notice and the agent has not resumed waiting yet. */
-  relaying = false
+  /** Relayed call ids whose results the agent has not yet re-awaited via `pi_await_result`. */
+  readonly relayedCalls = new Set<string>()
+  /** Bounded output buffered while one or more calls are relayed. */
+  private relayBuffer: Array<Extract<TurnEvent, { kind: 'text' | 'thought' }>> = []
+  private relayBufferChars = 0
   /** The turn produced visible text or a tool call. */
   produced = false
   /** Agent-side transport retry notices dropped from the output. */
@@ -188,6 +194,54 @@ export class AcpTurn {
     return call
   }
 
+  get isRelaying(): boolean {
+    return this.relayedCalls.size > 0
+  }
+
+  /** Record that `callId` timed out into a relay notice and awaits `pi_await_result`. */
+  markRelayed(callId: string): void {
+    this.relayedCalls.add(callId)
+  }
+
+  /** Clear one relayed call when `pi_await_result` resumes it, flushing buffered output once all relays clear. */
+  resumeRelay(callId: string): void {
+    if (this.relayedCalls.delete(callId) && this.relayedCalls.size === 0) {
+      for (const event of this.relayBuffer) this.events.push(event)
+      this.clearRelayBuffer()
+    }
+  }
+
+  /** Release all relay tracking and buffered output. */
+  clearRelay(): void {
+    this.relayedCalls.clear()
+    this.clearRelayBuffer()
+  }
+
+  private clearRelayBuffer(): void {
+    this.relayBuffer.length = 0
+    this.relayBufferChars = 0
+  }
+
+  private emitOrBuffer(
+    event: Extract<TurnEvent, { kind: 'text' | 'thought' }>,
+  ): void {
+    if (!this.isRelaying) {
+      this.events.push(event)
+      return
+    }
+    const remaining = MAX_RELAY_BUFFER_CHARS - this.relayBufferChars
+    if (remaining <= 0) return
+    const text =
+      event.text.length <= remaining ? event.text : event.text.slice(0, remaining)
+    this.relayBufferChars += text.length
+    const tail = this.relayBuffer[this.relayBuffer.length - 1]
+    if (tail !== undefined && tail.kind === event.kind) {
+      tail.text += text
+    } else {
+      this.relayBuffer.push({ kind: event.kind, text })
+    }
+  }
+
   /**
    * Route one ACP session update into the event queue.
    * @param update - the agent notification.
@@ -201,10 +255,8 @@ export class AcpTurn {
     }
     if (update.sessionUpdate === 'agent_thought_chunk') {
       const held = this.recoverNoticeHold()
-      if (held.length > 0 && !this.relaying)
-        this.events.push({ kind: 'text', text: held })
-      if (text.length > 0 && !this.relaying)
-        this.events.push({ kind: 'thought', text })
+      if (held.length > 0) this.emitOrBuffer({ kind: 'text', text: held })
+      if (text.length > 0) this.emitOrBuffer({ kind: 'thought', text })
     }
   }
 
@@ -224,7 +276,7 @@ export class AcpTurn {
       this.retryNotices++
       return
     }
-    if (!this.relaying) this.events.push({ kind: 'text', text: combined })
+    this.emitOrBuffer({ kind: 'text', text: combined })
   }
 
   /**
@@ -240,7 +292,7 @@ export class AcpTurn {
       this.retryNotices++
       return ''
     }
-    return this.relaying ? '' : held
+    return held
   }
 
   /**
@@ -250,12 +302,14 @@ export class AcpTurn {
   abandon(reason: string): void {
     this.terminal ??= { kind: 'cancelled' }
     if (this.terminal.kind === 'cancelled') this.cancellation.abort()
+    this.clearRelay()
     this.settleCalls(reason)
   }
 
   /** End transport ownership without misreporting a process failure as cancellation. */
   fail(error: Error): void {
     this.terminal ??= { kind: 'failed', error }
+    this.clearRelay()
     this.events.push({ kind: 'error', error })
     this.settleCalls(error.message)
   }
@@ -427,7 +481,7 @@ async function* stepChunks(
   for (;;) {
     await turn.events.wait(signal)
     if (turn.guard(undefined, signal) !== undefined) return
-    if (turn.events.peek()?.kind !== 'text') {
+    if (!turn.isRelaying && turn.events.peek()?.kind !== 'text') {
       const held = turn.recoverNoticeHold()
       if (held.length > 0) {
         turn.produced = true
@@ -505,6 +559,16 @@ async function* stepChunks(
         turn.usage = event.result.usage
         const usage = toTokenUsage(event.result.usage, calls)
         if (usage !== undefined) yield { type: 'usage', usage }
+        if (
+          turn.isRelaying &&
+          (stop === 'end_turn' || stop === 'max_tokens')
+        ) {
+          turn.clearRelay()
+          throw new LlmError(
+            'Antigravity ended the turn before retrieving relayed tool result(s)',
+            'PROVIDER_ERROR',
+          )
+        }
         if (stop === 'end_turn' && !turn.produced) {
           throw new LlmError(
             'Antigravity ended the turn without visible output',

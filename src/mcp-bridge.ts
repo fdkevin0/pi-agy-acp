@@ -477,13 +477,13 @@ function writeEvent(res: ServerResponse, value: unknown): void {
 /**
  * Diff active tools against the session's known tool set and render a compact
  * `<harness_tool_update>` block for newly added, modified, restored, or disabled tools.
- * @param conv - conversation tool state (`advertisedToolNames` and `knownTools`).
- * @param tools - active tools for the current step.
+ * @param conv - conversation tool state (`advertisedToolDigests` and `knownTools`).
+ * @param tools - active uncompacted tools for the current step.
  * @returns `<harness_tool_update>` text block, or `''` when unchanged.
  */
 export function consumeToolDelta(
   conv: {
-    readonly advertisedToolNames: ReadonlySet<string>
+    readonly advertisedToolDigests: ReadonlyMap<string, string>
     readonly knownTools: Map<string, string>
   },
   tools: readonly BridgeTool[],
@@ -495,8 +495,13 @@ export function consumeToolDelta(
     const hash = digest(tool)
     if (conv.knownTools.get(tool.name) === hash) continue
     conv.knownTools.set(tool.name, hash)
-    if (conv.advertisedToolNames.has(tool.name)) {
+    const advertisedHash = conv.advertisedToolDigests.get(tool.name)
+    if (advertisedHash === hash) {
       lines.push(`[tool restored: ${AGENT_TOOL_PREFIX}${tool.name}]`)
+    } else if (advertisedHash !== undefined) {
+      lines.push(
+        `[tool updated — direct ${AGENT_TOOL_PREFIX}${tool.name} is stale; invoke via ${AGENT_TOOL_PREFIX}${CALL_TOOL_NAME} with {"name":"${tool.name}","arguments":{...}}]: ${JSON.stringify({ name: tool.name, description: tool.description, parameters: tool.inputSchema })}`,
+      )
     } else {
       lines.push(
         `[tool available via ${AGENT_TOOL_PREFIX}${CALL_TOOL_NAME} with {"name":"${tool.name}","arguments":{...}}]: ${JSON.stringify({ name: tool.name, description: tool.description, parameters: tool.inputSchema })}`,
@@ -545,7 +550,7 @@ function compactSchemaNode(value: unknown, maxDescChars: number): unknown {
 /**
  * Keep each MCP-advertised tool schema under `agy`'s eager size threshold while
  * preserving every parameter name, type, required list, and enum constraint.
- * Full prose instructions remain in Pi's system prompt.
+ * Full prose instructions for compacted tools are appended to the session system prompt.
  * @param tool - raw bridge tool descriptor.
  * @returns compacted descriptor when oversized, otherwise the original descriptor.
  */
@@ -581,14 +586,12 @@ export function compactBridgeTool(tool: BridgeTool): BridgeTool {
 export function toBridgeTools(
   tools: readonly ToolSchema[] | undefined,
 ): BridgeTool[] {
-  return (tools ?? []).map((t) =>
-    compactBridgeTool({
-      name: t.name,
-      description: t.description,
-      inputSchema:
-        t.parameters.type === undefined
-          ? { type: 'object', ...t.parameters }
-          : t.parameters,
-    }),
-  )
+  return (tools ?? []).map((t) => ({
+    name: t.name,
+    description: t.description,
+    inputSchema:
+      t.parameters.type === undefined
+        ? { type: 'object', ...t.parameters }
+        : t.parameters,
+  }))
 }

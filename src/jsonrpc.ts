@@ -230,8 +230,25 @@ export class JsonRpcPeer {
       }
       const pending = this.pending.get(id)
       if (pending === undefined) return
-      this.pending.delete(id)
       if (message.error !== undefined) {
+        if (
+          message.error === null ||
+          typeof message.error !== 'object' ||
+          Array.isArray(message.error)
+        ) {
+          this.pending.delete(id)
+          this.handlers.onProtocolError?.(
+            `invalid error response for id ${id}: ${line.slice(0, 200)}`,
+          )
+          pending.reject(
+            new JsonRpcRemoteError(pending.method, {
+              code: -32603,
+              message: 'invalid error response',
+            }),
+          )
+          return
+        }
+        this.pending.delete(id)
         const rpc = message.error as JsonRpcErrorObject
         pending.reject(
           new JsonRpcRemoteError(pending.method, {
@@ -242,6 +259,7 @@ export class JsonRpcPeer {
           }),
         )
       } else {
+        this.pending.delete(id)
         pending.resolve(message.result)
       }
       return
