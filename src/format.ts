@@ -22,21 +22,117 @@ function formatAccount(account?: AccountInfo): string {
   return [account?.email, account?.plan].filter(Boolean).join(' · ')
 }
 
-/** Lowest known window for the model family; unknown groups fall back conservatively. */
+export type QuotaModelRef = string | { id: string; name?: string }
+
+const GENERIC_GROUP_TOKENS = new Set([
+  'gemini',
+  'claude',
+  'gpt',
+  'and',
+  'or',
+  'model',
+  'models',
+  'group',
+  'groups',
+  'all',
+  'other',
+  'default',
+  'general',
+])
+
+function normalizeTokens(text: string): string[] {
+  return text.toLowerCase().match(/[a-z0-9]+(?:\.[0-9]+)*/g) ?? []
+}
+
+function modelCandidates(id: string, name?: string): string[][] {
+  const raw = [id, id.replace(/-(?:low|medium|high)$/i, '')]
+  if (name) raw.push(name)
+  const seen = new Set<string>()
+  const out: string[][] = []
+  for (const item of raw) {
+    const tokens = normalizeTokens(item)
+    const key = tokens.join(' ')
+    if (tokens.length > 0 && !seen.has(key)) {
+      seen.add(key)
+      out.push(tokens)
+    }
+  }
+  return out
+}
+
+function groupPhrases(group: QuotaGroup): string[][] {
+  const rawDesc = group.description.replace(/^models within this group:\s*/i, '')
+  const parts = [group.name, ...rawDesc.split(/[,;\n/|&]+/)]
+  return parts.map(normalizeTokens).filter((tokens) => tokens.length > 0)
+}
+
+function isSubsetMatch(target: string[], candidate: string[]): boolean {
+  const specific = target.filter(
+    (t) => t !== 'model' && t !== 'models' && t !== 'group' && t !== 'groups',
+  )
+  if (specific.length < 2 || specific[0] !== candidate[0]) return false
+  let pos = 1
+  for (let i = 1; i < specific.length; i++) {
+    const found = candidate.indexOf(specific[i]!, pos)
+    if (found === -1) return false
+    pos = found + 1
+  }
+  return true
+}
+
+function isGenericFamilyGroup(group: QuotaGroup, family: string): boolean {
+  const nameTokens = normalizeTokens(group.name)
+  if (
+    !nameTokens.includes(family) ||
+    !nameTokens.every((t) => GENERIC_GROUP_TOKENS.has(t))
+  )
+    return false
+  return groupPhrases(group).every((tokens) =>
+    tokens.every((t) => GENERIC_GROUP_TOKENS.has(t)),
+  )
+}
+
+function selectQuotaGroups(
+  snapshot: QuotaSnapshot,
+  model?: QuotaModelRef,
+): QuotaGroup[] {
+  if (!model) return []
+  const id = typeof model === 'string' ? model : model.id
+  const name = typeof model === 'string' ? undefined : model.name
+  const candidates = modelCandidates(id, name)
+  if (candidates.length === 0) return []
+  const candPhrases = candidates.map((c) => c.join(' '))
+
+  const exact = snapshot.groups.filter((group) =>
+    groupPhrases(group).some((p) => candPhrases.includes(p.join(' '))),
+  )
+  if (exact.length > 0) return exact.length === 1 ? exact : []
+
+  const variant = snapshot.groups.filter((group) =>
+    groupPhrases(group).some((p) =>
+      candidates.some((c) => isSubsetMatch(p, c)),
+    ),
+  )
+  if (variant.length > 0) return variant.length === 1 ? variant : []
+
+  const family =
+    /^(gemini|claude|gpt)(?:-|$)/i.exec(id)?.[1]?.toLowerCase() ??
+    /^(gemini|claude|gpt)(?:\s|$)/i.exec(name ?? '')?.[1]?.toLowerCase()
+  if (!family) return []
+
+  const generic = snapshot.groups.filter((group) =>
+    isGenericFamilyGroup(group, family),
+  )
+  return generic.length === 1 ? generic : []
+}
+
+/** Lowest known window for the model's matching quota group; returns undefined when unknown or ambiguous. */
 export function quotaForModel(
   snapshot: QuotaSnapshot,
-  model?: string,
+  model?: QuotaModelRef,
 ): { group: QuotaGroup; bucket: QuotaBucket; fraction: number } | undefined {
   if (snapshot.status !== 'ok') return undefined
-  const family = /^(gemini|claude|gpt)(?:-|$)/i.exec(model ?? '')?.[1]
-  const matched = family
-    ? snapshot.groups.filter((group) =>
-        new RegExp(`\\b${family}\\b`, 'i').test(
-          `${group.name} ${group.description}`,
-        ),
-      )
-    : []
-  const groups = matched.length > 0 ? matched : snapshot.groups
+  const groups = selectQuotaGroups(snapshot, model)
   let lowest: ReturnType<typeof quotaForModel>
   for (const group of groups) {
     for (const bucket of group.buckets) {
@@ -59,7 +155,7 @@ export function displayFraction(
 
 export function formatQuotaStatus(
   snapshot: QuotaSnapshot,
-  model?: string,
+  model?: QuotaModelRef,
   display: QuotaDisplay = 'used',
 ): string | undefined {
   const quota = quotaForModel(snapshot, model)
