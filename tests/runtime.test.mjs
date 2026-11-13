@@ -19,14 +19,18 @@ import { fileURLToPath } from 'node:url'
 import { AntigravityRuntime } from '../src/runtime.ts'
 import {
   compactBridgeTool,
+  consumeToolDelta,
+  toBridgeTools,
   MAX_EAGER_BRIDGE_TOOL_BYTES,
 } from '../src/mcp-bridge.ts'
+import { JsonRpcPeer } from '../src/jsonrpc.ts'
 import { defaults } from '../src/config.ts'
 import { VERSION } from '../src/version.ts'
 import { AcpProcess } from '../src/acp-process.ts'
 import { AcpTurn, toTokenUsage, pumpStep } from '../src/conversation.ts'
-import { deferred } from '../src/util.ts'
+import { deferred, digest } from '../src/util.ts'
 import {
+  bridgeSystemPrompt,
   EMPTY_INPUT_CONTINUATION,
   REPLAY_BUDGET_BYTES,
 } from '../src/history.ts'
@@ -2823,4 +2827,131 @@ test('synchronous continuation failure preserves the first terminal event', asyn
   assert.equal((await call.result.promise).isError, true)
   assert.equal(turn.pendingCalls.size, 0)
   assert.equal(turn.toolSteps, 0)
+})
+
+test('JSON-RPC invalid error objects reject the affected request without throwing and keep the link open', async () => {
+  const input = new PassThrough()
+  const output = new PassThrough()
+  const protocolErrors = []
+  const rpc = new JsonRpcPeer(input, output, {
+    onNotification() {},
+    async onRequest() { return null },
+    onProtocolError(message) { protocolErrors.push(message) },
+  })
+  const first = rpc.request('session/prompt', {})
+  const second = rpc.request('session/prompt', {})
+  input.write('{"jsonrpc":"2.0","id":1,"error":null}\n')
+  await assert.rejects(first, { message: 'session/prompt: invalid error response' })
+  input.write('{"jsonrpc":"2.0","id":2,"result":{"ok":true}}\n')
+  assert.deepEqual(await second, { ok: true })
+  assert.equal(protocolErrors.length, 1)
+  rpc.close(new Error('done'))
+})
+
+test('parked-turn model or effort change abandons the old turn and rebuilds on the requested selection', async (t) => {
+  const { runtime, prompts } = makeRuntime(t)
+  const firstRequest = {
+    model: 'gemini-4-argon',
+    reasoningEffort: 'high',
+    sessionId: 'switch-parked',
+    tools: [bash],
+    messages: [sys, user('u1', 'CALL bash {"command":"pwd"}')],
+  }
+  const first = await collect(runtime.stream(firstRequest))
+  const call = first.find((c) => c.type === 'block-end' && c.block.type === 'tool-call').block
+  const second = await collect(runtime.stream({
+    ...firstRequest,
+    model: 'claude-opus-5-5',
+    reasoningEffort: 'low',
+    messages: [
+      ...firstRequest.messages,
+      assistant('a1', [{ type: 'tool-call', id: call.id, name: 'bash', arguments: call.arguments }]),
+      { id: 'tr1', role: 'tool', toolCallId: call.id, content: [{ type: 'text', text: '/tmp' }] },
+    ],
+  }))
+  assert.equal(finishOf(second).reason.kind, 'tool-calls')
+  const entries = prompts()
+  assert.equal(entries.length, 2)
+  assert.notEqual(entries[0].session, entries[1].session)
+  assert.equal(entries[1].model, 'claude-opus-5-5')
+  assert.equal(entries[1].level, 'low')
+  const conv = runtime.conversations.get('switch-parked')
+  assert.equal(conv.model, 'claude-opus-5-5')
+  assert.equal(conv.effort, 'low')
+})
+
+test('multi-call relay preserves buffered output once all relayed calls are awaited', async () => {
+  const turn = new AcpTurn('relay-multi')
+  const c1 = turn.park('bash', { command: 'a' })
+  const c2 = turn.park('bash', { command: 'b' })
+  turn.events.shift()
+  turn.events.shift()
+  turn.markRelayed(c1.id)
+  turn.markRelayed(c2.id)
+  turn.onUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'buffered ' } })
+  turn.resumeRelay(c1.id)
+  assert.equal(turn.isRelaying, true)
+  assert.equal(turn.events.peek(), undefined)
+  turn.onUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'text' } })
+  turn.resumeRelay(c2.id)
+  assert.equal(turn.isRelaying, false)
+  turn.events.push({ kind: 'done', result: { stopReason: 'end_turn' } })
+  const chunks = await collect(pumpStep(turn, {
+    parkSettleMs: 0, maxContinuations: 0,
+    continuePrompt: async () => ({ stopReason: 'end_turn' }), cancel() {},
+  }, undefined))
+  assert.equal(textOf(chunks), 'buffered text')
+  assert.equal(finishOf(chunks).reason.kind, 'stop')
+})
+
+test('premature completion while relayed calls remain unawaited fails with PROVIDER_ERROR', async () => {
+  const turn = new AcpTurn('relay-premature')
+  const call = turn.park('bash', { command: 'a' })
+  turn.events.shift()
+  turn.produced = true
+  turn.markRelayed(call.id)
+  turn.onUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'ungrounded' } })
+  turn.events.push({ kind: 'done', result: { stopReason: 'end_turn' } })
+  await assert.rejects(
+    collect(pumpStep(turn, {
+      parkSettleMs: 0, maxContinuations: 0,
+      continuePrompt: async () => ({ stopReason: 'end_turn' }), cancel() {},
+    }, undefined)),
+    { code: 'PROVIDER_ERROR' },
+  )
+  assert.equal(turn.isRelaying, false)
+})
+
+test('dynamic tool updates distinguish restored vs modified schemas and preserve compacted initial instructions', () => {
+  const longDesc = `${'Detailed tool instruction. '.repeat(60)}UNIQUE_TAIL_MARKER`
+  const initialRaw = toBridgeTools([
+    { name: 'bash', description: longDesc, parameters: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } },
+  ])
+  const compacted = initialRaw.map(compactBridgeTool)
+  assert.notEqual(digest(compacted[0]), digest(initialRaw[0]))
+  const promptText = bridgeSystemPrompt('base', initialRaw)
+  assert.match(promptText, /<harness_tool_instructions>/)
+  assert.match(promptText, /UNIQUE_TAIL_MARKER/)
+
+  const conv = {
+    advertisedToolDigests: new Map(initialRaw.map((tool) => [tool.name, digest(tool)])),
+    knownTools: new Map(initialRaw.map((tool) => [tool.name, digest(tool)])),
+  }
+  assert.equal(consumeToolDelta(conv, initialRaw), '')
+  assert.match(consumeToolDelta(conv, []), /\[tool disabled: bash\]/)
+  assert.match(consumeToolDelta(conv, initialRaw), /\[tool restored: mcp_pi_bash\]/)
+
+  const tailChanged = toBridgeTools([
+    { name: 'bash', description: `${longDesc}_CHANGED`, parameters: initialRaw[0].inputSchema },
+  ])
+  const tailDelta = consumeToolDelta(conv, tailChanged)
+  assert.match(tailDelta, /pi_call_tool/)
+  assert.match(tailDelta, /UNIQUE_TAIL_MARKER_CHANGED/)
+
+  const schemaChanged = toBridgeTools([
+    { name: 'bash', description: longDesc, parameters: { type: 'object', properties: { script: { type: 'string' } }, required: ['script'] } },
+  ])
+  const schemaDelta = consumeToolDelta(conv, schemaChanged)
+  assert.match(schemaDelta, /pi_call_tool/)
+  assert.match(schemaDelta, /"script"/)
 })

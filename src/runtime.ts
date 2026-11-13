@@ -54,6 +54,7 @@ import {
 import { JsonRpcClosedError, JsonRpcRemoteError } from './jsonrpc.ts'
 import {
   McpBridge,
+  compactBridgeTool,
   consumeToolDelta,
   toBridgeTools,
   type BridgeCallRequest,
@@ -140,7 +141,7 @@ interface Conversation {
   configOptions: AcpConfigOption[]
   systemHash: string | undefined
   advertisedTools: BridgeTool[]
-  advertisedToolNames: Set<string>
+  advertisedToolDigests: Map<string, string>
   knownTools: Map<string, string>
   toolNames: Set<string>
   /** Tool calls the agent reported via `session/update` — the only trusted permission source. */
@@ -481,15 +482,18 @@ export class AntigravityRuntime {
       }
       if (conv.turn !== undefined && conv.turn.pendingCalls.size > 0) {
         // Resuming a parked turn is only valid while the request still starts
-        // with the exact history this ACP session already owns. A compaction
-        // checkpoint or a pruned/rewritten prefix means the live server-side
-        // context is stale: resolving the parked calls would grow it further
-        // instead of adopting the compacted history, so abandon the turn and
-        // let plan() rebuild the session from Pi's authoritative messages.
-        if (!this.historyPrefixIntact(conv, split.system, split.messages)) {
+        // with the exact history and model/effort selection this ACP session
+        // already owns. A compaction checkpoint, pruned/rewritten prefix, or
+        // model/effort change means the live session is stale, so abandon the
+        // turn and let plan() rebuild from Pi's authoritative history.
+        if (
+          !this.historyPrefixIntact(conv, split.system, split.messages) ||
+          conv.model !== options.model ||
+          conv.effort !== effort
+        ) {
           this.dropTurn(
             conv,
-            'The conversation history was compacted or rewritten; rebuilding the session from the harness history.',
+            'The conversation history or model selection changed; rebuilding the session from the harness history.',
           )
         } else {
           // Tool waiters can abort in their result microtask; hand off the exact turn synchronously.
@@ -624,7 +628,7 @@ export class AntigravityRuntime {
       configOptions: [],
       systemHash: undefined,
       advertisedTools: [],
-      advertisedToolNames: new Set(),
+      advertisedToolDigests: new Map(),
       knownTools: new Map(),
       toolNames: new Set(),
       reportedToolCalls: new Map(),
@@ -749,9 +753,13 @@ export class AntigravityRuntime {
     this.assertOwner(proc, conv)
     syncOAuthToken(this.home)
     conv.reportedToolCalls.clear()
-    conv.advertisedTools = [...tools]
-    conv.advertisedToolNames = new Set(tools.map((t) => t.name))
-    conv.knownTools = new Map(tools.map((t) => [t.name, digest(t)]))
+    const compacted = tools.map(compactBridgeTool)
+    const supplementalTools = tools.filter(
+      (raw, index) => compacted[index] !== raw,
+    )
+    conv.advertisedTools = compacted
+    conv.advertisedToolDigests = new Map(tools.map((t) => [t.name, digest(t)]))
+    conv.knownTools = new Map(conv.advertisedToolDigests)
     const tenantKey = randomBytes(16).toString('hex')
     const tenantSecret = randomBytes(24).toString('hex')
     const mcpServers = [
@@ -772,7 +780,9 @@ export class AntigravityRuntime {
           mcpServers,
           _meta: {
             antigravity: {
-              systemPrompt: { append: bridgeSystemPrompt(system) },
+              systemPrompt: {
+                append: bridgeSystemPrompt(system, supplementalTools),
+              },
             },
           },
         },
@@ -928,7 +938,7 @@ export class AntigravityRuntime {
       return reject(`unknown MCP server ${reported.serverName ?? '(none)'}`)
     const isAllowedTool =
       reported.toolName !== undefined &&
-      (conv.advertisedToolNames.has(reported.toolName) ||
+      (conv.advertisedToolDigests.has(reported.toolName) ||
         reported.toolName === AWAIT_TOOL_NAME ||
         reported.toolName === CALL_TOOL_NAME)
     if (!isAllowedTool) {
@@ -1107,7 +1117,7 @@ export class AntigravityRuntime {
     conv.tenantSecret = undefined
     conv.process = undefined
     conv.advertisedTools = []
-    conv.advertisedToolNames.clear()
+    conv.advertisedToolDigests.clear()
     conv.knownTools.clear()
     conv.reportedToolCalls.clear()
   }
@@ -1402,7 +1412,7 @@ export class AntigravityRuntime {
       const call = turn.calls.get(callId)
       if (call === undefined)
         return toolError(`Unknown harness call id ${callId}.`)
-      turn.relaying = false
+      turn.resumeRelay(callId)
       return this.awaitCall(turn, call, request.signal)
     }
     let name = request.name
@@ -1452,7 +1462,7 @@ export class AntigravityRuntime {
     try {
       const outcome = await Promise.race([call.result.promise, relay, aborted])
       if (outcome === 'relay') {
-        turn.relaying = true
+        turn.markRelayed(call.id)
         return relayNotice(call)
       }
       if (outcome === 'aborted')
@@ -1513,10 +1523,6 @@ export function mapError(error: unknown): Error {
       { cause: error },
     )
   }
-  if (/quota|resource.?exhausted|limit reached|exceeded your/i.test(message))
-    return new LlmError(message, 'QUOTA', { cause: error })
-  if (/rate.?limit|429|too many requests|overloaded|capacity/i.test(message))
-    return new LlmError(message, 'RATE_LIMIT', { cause: error })
   if (/timeout|timed out|deadline/i.test(message))
     return new LlmError(message, 'TIMEOUT', { cause: error })
   if (
@@ -1525,6 +1531,10 @@ export function mapError(error: unknown): Error {
     )
   )
     return new LlmError(message, 'CONTEXT_WINDOW_EXCEEDED', { cause: error })
+  if (/rate.?limit|429|too many requests|overloaded|capacity/i.test(message))
+    return new LlmError(message, 'RATE_LIMIT', { cause: error })
+  if (/quota|resource.?exhausted|limit reached|exceeded your/i.test(message))
+    return new LlmError(message, 'QUOTA', { cause: error })
   if (error instanceof JsonRpcRemoteError)
     return new LlmError(`Antigravity: ${message}`, 'SERVER', { cause: error })
   return new LlmError(message, 'TRANSPORT', { cause: error })
