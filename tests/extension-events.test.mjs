@@ -260,9 +260,13 @@ test('quota selection uses the active family and falls back to the lowest valid 
 
 test('quota display mode switches via /agy-acp quota, remembers last choice across reloads, and respects env override', async (t) => {
   const home = mkdtempSync(join(tmpdir(), 'pi-quota-pref-'))
-  t.mock.property(process, 'env', { ...process.env, PI_AGY_HOME: home })
+  const originalEnv = { ...process.env }
+  process.env.PI_AGY_HOME = home
   delete process.env.PI_AGY_QUOTA_DISPLAY
-  t.after(() => rmSync(home, { recursive: true, force: true }))
+  t.after(() => {
+    process.env = originalEnv
+    rmSync(home, { recursive: true, force: true })
+  })
 
   t.mock.method(AntigravityRuntime.prototype, 'readQuota', async () =>
     snapshot(0.1),
