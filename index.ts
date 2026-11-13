@@ -211,16 +211,12 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify('Antigravity ACP sessions reset', 'info')
         return
       }
-      const validQuota =
+      const isStatus =
+        (command === '' || command === 'status') && tokens.length <= 1
+      const isQuota =
         command === 'quota' &&
         (tokens.length === 1 || requestedDisplay !== undefined)
-      if (
-        !(
-          (command === '' || command === 'status') &&
-          tokens.length <= 1
-        ) &&
-        !validQuota
-      ) {
+      if (!isStatus && !isQuota) {
         ctx.ui.notify(
           'Usage: /agy-acp [status|quota [used|remaining]|reset]',
           'warning',

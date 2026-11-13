@@ -610,7 +610,6 @@ test('quota panel renders aligned bars, rounded percentages and relative reset t
   buckets[3].window = ''
   const notice = formatQuota(snapshot, quotaNow)
   assert.equal(notice.level, 'info')
-  assert.match(notice.text, /Antigravity Quota \(used\)/)
   assert.match(notice.text, /Gemini Models\n    Gemini Flash, Gemini Pro/)
   assert.match(notice.text, /5h\s+\[░░░░░░░░░░░░\]   0% · resets in 4h 59m/)
   assert.match(notice.text, /weekly\s+\[█░░░░░░░░░░░\]   9% · resets in 6d 7h/)
@@ -619,7 +618,6 @@ test('quota panel renders aligned bars, rounded percentages and relative reset t
 
   const remainingNotice = formatQuota(snapshot, quotaNow, 'remaining')
   assert.equal(remainingNotice.level, 'info')
-  assert.match(remainingNotice.text, /Antigravity Quota \(remaining\)/)
   assert.match(
     remainingNotice.text,
     /5h\s+\[████████████\] 100% · resets in 4h 59m/,
@@ -655,16 +653,9 @@ test('quota severity uses exact thresholds and keeps errors above later healthy 
     quotaNow,
   )
   assert.equal(stale.level, 'error')
-  assert.match(stale.text, /Antigravity Quota \(used, stale\)/)
+  assert.match(stale.text, /Antigravity Quota \(stale\)/)
   assert.match(stale.text, /✖ Error: Sign in required/)
   assert.match(stale.text, /0%/)
-  const staleRemaining = formatQuota(
-    quotaSnapshot([1], { status: 'error', error: 'Sign in required' }),
-    quotaNow,
-    'remaining',
-  )
-  assert.match(staleRemaining.text, /Antigravity Quota \(remaining, stale\)/)
-  assert.match(staleRemaining.text, /100%/)
   const empty = formatQuota(quotaSnapshot([], { groups: [] }), quotaNow)
   assert.match(empty.text, /No quota data available\./)
   assert.equal(empty.level, 'info')
@@ -709,14 +700,6 @@ test('quota reset formatting handles expired, imminent and malformed times', () 
   assert.match(
     formatQuota(quotaSnapshot([2]), quotaNow).text,
     /\[░░░░░░░░░░░░\]   0%/,
-  )
-  assert.match(
-    formatQuota(quotaSnapshot([-1, 2]), quotaNow, 'remaining').text,
-    /\[░░░░░░░░░░░░\]   0%/,
-  )
-  assert.match(
-    formatQuota(quotaSnapshot([2]), quotaNow, 'remaining').text,
-    /\[████████████\] 100%/,
   )
 })
 

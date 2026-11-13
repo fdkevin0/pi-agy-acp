@@ -98,18 +98,7 @@ export function writeQuotaDisplayPreference(
   try {
     const path = join(home, SETTINGS_FILE)
     mkdirSync(dirname(path), { recursive: true })
-    let existing: Record<string, unknown> = {}
-    if (existsSync(path)) {
-      try {
-        const parsed = JSON.parse(readFileSync(path, 'utf8'))
-        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-          existing = parsed as Record<string, unknown>
-        }
-      } catch {
-        // Overwrite malformed settings with a valid object.
-      }
-    }
-    writeFileSync(path, JSON.stringify({ ...existing, quotaDisplay }, null, 2))
+    writeFileSync(path, JSON.stringify({ quotaDisplay }))
   } catch {
     // Preference persistence is best-effort.
   }

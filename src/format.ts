@@ -56,10 +56,8 @@ export function formatQuotaStatus(
 ): string | undefined {
   const quota = quotaForModel(snapshot, model)
   if (!quota) return undefined
-  if (display === 'remaining') {
-    return `AGY ${Math.round(quota.fraction * 100)}% left`
-  }
-  return `AGY ${Math.round((1 - quota.fraction) * 100)}% used`
+  const shown = display === 'used' ? 1 - quota.fraction : quota.fraction
+  return `AGY ${Math.round(shown * 100)}%`
 }
 
 function resetCountdown(resetTime: string, now: number): string {
@@ -80,8 +78,7 @@ export function formatQuota(
   display: QuotaDisplay = 'used',
 ): FormattedNotice {
   const stale = snapshot.status === 'error' && snapshot.groups.length > 0
-  const tags = [display, stale ? 'stale' : ''].filter(Boolean)
-  const lines = [`Antigravity Quota (${tags.join(', ')})`]
+  const lines = [`Antigravity Quota${stale ? ' (stale)' : ''}`]
   const account = formatAccount(snapshot.account)
   if (account) lines.push(`  Account:  ${account}`)
   let level: FormattedNotice['level'] =

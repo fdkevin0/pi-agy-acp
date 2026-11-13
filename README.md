@@ -51,7 +51,7 @@ automatically from your account.
 | `/agy-acp reset` | Close ACP sessions; the next request rebuilds the connection. |
 
 After an Antigravity turn settles, the status bar shows quota usage (for example,
-`AGY 20% used`, or `AGY 80% left` in `remaining` mode) and warns when quota is low; see [quota status](docs/reference.md#quota-status-and-warnings).
+`AGY 20%`, or `AGY 80%` in `remaining` mode) and warns when quota is low; see [quota status](docs/reference.md#quota-status-and-warnings).
 
 Default prices are zero, not a promise of free calls. Pi pricing overrides are
 used when configured.

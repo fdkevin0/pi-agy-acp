@@ -41,7 +41,7 @@ reset time. By default (`used` mode), bars and percentages count up from `0%`; p
 selected mode is saved in `settings.json` inside `PI_AGY_HOME`. For example:
 
 ```text
-Antigravity Quota (used)
+Antigravity Quota
   Account:  user@example.com · Google AI Ultra
 
   Gemini Models
@@ -60,8 +60,8 @@ Severity uses the actual remaining fraction rather than the rounded percentage:
 | Any window at or below 5%, or a failed quota query | Error |
 
 Errors include the reason. If cached groups are available after a failed query,
-the title marks them as `(used, stale)` or `(remaining, stale)` and still displays
-their bars. An empty successful response displays `No quota data available.`.
+the title marks them as `(stale)` and still displays their bars. An empty
+successful response displays `No quota data available.`.
 
 ### Account details
 
@@ -77,9 +77,8 @@ isolated. Cached plans and login logs can be stale after an account change.
 ### Quota status and warnings
 
 When a run using `antigravity-acp` fully settles, the extension checks `/usage`
-in the background and shows a compact status such as `AGY 20% used` (or
-`AGY 80% left` in `remaining` mode). It uses the lowest known window in the
-selected model family's group, falling back to the lowest known quota across
+in the background and shows a compact status such as `AGY 20%` (or `AGY 80%`
+in `remaining` mode). It uses the lowest known window in the selected model family's group, falling back to the lowest known quota across
 groups when the family cannot be matched. Failed checks stay silent. Successful
 results and failures both respect the two-minute quota TTL, and overlapping
 background checks are skipped.
