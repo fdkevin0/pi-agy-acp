@@ -2650,30 +2650,27 @@ test('conversation ownership lasts through asynchronous step cleanup', async (t)
   assert.equal(runtime.conversations.get('second').process, runtime.process)
 })
 
-test('process exit during tool block-start rejects the handoff and recovers capacity', async () => {
+test('process exit during tool block-start rejects the handoff and recovers capacity', async (t) => {
   const { runtime } = makeRuntime({ config: { maxLiveSessions: 1 } })
+  t.after(() => runtime.dispose())
   const stream = runtime.stream({ model: 'gemini-4-argon', sessionId: 'exit-handoff', tools: [bash],
     messages: [sys, user('u1', 'CALL bash {"command":"long"}')] })
-  for (;;) {
-    const item = await stream.next()
-    assert.equal(item.done, false)
-    if (item.value.type === 'block-start' && item.value.blockType === 'tool-call') break
-  }
+  const before = await Promise.all([stream.next(), stream.next(), stream.next(), stream.next()])
+  assert.deepEqual(before.at(-1), { done: false, value: { type: 'block-start', index: 1, blockType: 'tool-call' } })
   const conv = runtime.conversations.get('exit-handoff')
   const turn = conv.turn
+  const [call] = turn.calls.values()
   const proc = conv.process
   const exited = new Promise(resolve => proc.onExit(resolve))
   proc.child.terminate()
   await exited
   assert.equal(conv.turn, undefined)
-  const rest = []
-  await assert.rejects(async () => { for await (const chunk of stream) rest.push(chunk) },
-    error => error.code === 'TRANSPORT' && /process exited/.test(error.message))
-  assert.deepEqual(rest, [])
+  await assert.rejects(stream.next(), { code: 'TRANSPORT', message: /process exited/ })
+  assert.equal((await stream.next()).done, true)
   assert.equal(turn.toolSteps, 0)
   assert.equal(turn.pendingCalls.size, 0)
   assert.equal(turn.releaseSignal, undefined)
-  for (const call of turn.calls.values()) assert.equal((await call.result.promise).isError, true)
+  assert.equal((await call.result.promise).isError, true)
   assert.equal(runtime.status().lastTurn.outcome, 'error')
   assert.equal(runtime.status().activeTurns, 0)
   const second = await collect(runtime.stream({ model: 'gemini-4-argon', sessionId: 'second',
@@ -2683,22 +2680,19 @@ test('process exit during tool block-start rejects the handoff and recovers capa
 
 test('process exit during tool batching rejects before emission and recovers capacity', async (t) => {
   const { runtime } = makeRuntime({ config: { maxLiveSessions: 1 } })
+  t.after(() => runtime.dispose())
   const proc = await runtime.ensureReady()
   const conv = runtime.createConversation('exit-batch')
   conv.process = proc
   conv.sessionId = 'exit-batch'
   const turn = conv.turn = new AcpTurn('batch')
   const call = turn.park('bash', {})
-  const wait = turn.events.wait.bind(turn.events)
-  t.mock.method(turn.events, 'wait', async (...args) => {
-    if (args[1] !== undefined) proc.stop()
-    return wait(...args)
-  })
-  const chunks = []
-  await assert.rejects(async () => {
-    for await (const chunk of runtime.pump(conv, turn, proc, { model: 'test' }, 'high')) chunks.push(chunk)
-  }, { code: 'TRANSPORT' })
-  assert.deepEqual(chunks, [])
+  const wait = t.mock.method(turn.events, 'wait', turn.events.wait.bind(turn.events))
+  wait.mock.mockImplementationOnce(async () => { proc.stop(); return false }, 1)
+  const stream = runtime.pump(conv, turn, proc, { model: 'test' }, 'high')
+  await assert.rejects(stream.next(), { code: 'TRANSPORT' })
+  assert.equal(wait.mock.calls[1].arguments[1], runtime.host.config.parkSettleMs)
+  assert.equal((await stream.next()).done, true)
   assert.equal(turn.toolSteps, 0)
   assert.equal(turn.pendingCalls.size, 0)
   assert.equal((await call.result.promise).isError, true)
@@ -2708,103 +2702,191 @@ test('process exit during tool batching rejects before emission and recovers cap
   assert.equal(finishOf(second).reason.kind, 'stop')
 })
 
-test('terminal failure guards every tool, text, reasoning, usage and finish yield', async (t) => {
-  const cases = [
-    ['park', 4], // start, arguments, end, finish
-    ['parallel', 7], // two calls, then finish
-    ['text', 5], // start, delta, end, usage, finish
-    ['thought', 5],
-  ]
-  for (const [kind, count] of cases) for (let boundary = 0; boundary < count; boundary++) {
-    await t.test(`${kind} yield ${boundary}`, async () => {
-      const { runtime } = makeRuntime()
-      const proc = await runtime.ensureReady()
-      const conv = runtime.createConversation('boundary')
-      conv.process = proc
-      conv.sessionId = 'boundary'
-      const turn = conv.turn = new AcpTurn('boundary')
-      if (kind === 'park' || kind === 'parallel') {
-        turn.park('bash', {})
-        if (kind === 'parallel') turn.park('bash', {})
-      } else {
-        turn.produced = true
-        turn.events.push({ kind, text: 'output' })
-        turn.events.push({ kind: 'done', result: { stopReason: 'end_turn', usage: { outputTokens: 1 } } })
-      }
-      const stream = runtime.pump(conv, turn, proc, { model: 'test' }, 'high')
-      for (let i = 0; i <= boundary; i++) assert.equal((await stream.next()).done, false)
-      proc.stop()
-      const rest = []
-      await assert.rejects(async () => { for await (const chunk of stream) rest.push(chunk) }, { code: 'TRANSPORT' })
-      assert.deepEqual(rest, [])
-      assert.equal(runtime.status().lastTurn.outcome, 'error')
-      assert.equal(turn.pendingCalls.size, 0)
-      assert.equal(conv.turn, undefined)
-      for (const call of turn.calls.values()) assert.equal((await call.result.promise).isError, true)
-      assert.equal(turn.toolSteps, (kind === 'park' || kind === 'parallel') && boundary === count - 1 ? 1 : 0)
-    })
-  }
-})
+function queueTerminalTool(turn) {
+  const call = turn.park('bash', {})
+  return async () => assert.equal((await call.result.promise).isError, true)
+}
 
-test('first interruption wins over queued output and later terminal callbacks', async () => {
-  for (const first of ['failure', 'cancellation']) for (const kind of ['text', 'park', 'done']) {
-    const turn = new AcpTurn('precedence')
-    if (kind === 'park') turn.park('bash', {})
-    else turn.events.push(kind === 'text' ? { kind, text: 'queued' } : { kind, result: { stopReason: 'end_turn' } })
-    const error = new Error('original failure')
-    const controller = new AbortController()
-    const host = { parkSettleMs: 0, maxContinuations: 0, cancel() {}, continuePrompt() { assert.fail('no continuation') } }
-    const stream = pumpStep(turn, host, controller.signal)
-    if (first === 'failure') {
-      turn.fail(error)
-      turn.fail(new Error('later failure'))
-      controller.abort()
-      await assert.rejects(collect(stream), value => value === error)
-      assert.equal(turn.cancellation.signal.aborted, false)
-    } else {
-      turn.abandon('cancelled first')
-      turn.fail(error)
-      const chunks = await collect(stream)
-      assert.deepEqual(chunks.map(chunk => chunk.type), ['finish'])
-      assert.equal(finishOf(chunks).reason.kind, 'aborted')
-    }
-    assert.equal(turn.pendingCalls.size, 0)
-    for (const call of turn.calls.values()) assert.equal((await call.result.promise).isError, true)
+function queueTerminalParallel(turn) {
+  const first = turn.park('bash', {})
+  const second = turn.park('bash', {})
+  return async () => {
+    assert.equal((await first.result.promise).isError, true)
+    assert.equal((await second.result.promise).isError, true)
   }
-})
+}
 
+function queueTerminalText(turn) {
+  turn.events.push({ kind: 'text', text: 'output' })
+  turn.events.push({ kind: 'done', result: { stopReason: 'end_turn', usage: { outputTokens: 1 } } })
+  return async () => assert.equal(turn.calls.size, 0)
+}
+
+function queueTerminalThought(turn) {
+  turn.produced = true // A previous Pi step already delivered visible output.
+  turn.events.push({ kind: 'thought', text: 'output' })
+  turn.events.push({ kind: 'done', result: { stopReason: 'end_turn', usage: { outputTokens: 1 } } })
+  return async () => assert.equal(turn.calls.size, 0)
+}
+
+function queueTerminalDone(turn) {
+  turn.events.push({ kind: 'done', result: { stopReason: 'end_turn' } })
+  return async () => assert.equal(turn.calls.size, 0)
+}
+
+async function assertTerminalBoundary(t, seed, advance, expectedType, toolSteps = 0) {
+  const { runtime } = makeRuntime()
+  t.after(() => runtime.dispose())
+  const proc = await runtime.ensureReady()
+  const conv = runtime.createConversation('boundary')
+  conv.process = proc
+  conv.sessionId = 'boundary'
+  const turn = conv.turn = new AcpTurn('boundary')
+  const assertWaiters = seed(turn)
+  const stream = runtime.pump(conv, turn, proc, { model: 'test' }, 'high')
+  const reached = (await advance(stream)).at(-1)
+  assert.equal(reached.done, false)
+  assert.equal(reached.value.type, expectedType)
+  proc.stop()
+  await assert.rejects(stream.next(), { code: 'TRANSPORT' })
+  assert.equal((await stream.next()).done, true)
+  assert.equal(runtime.status().lastTurn.outcome, 'error')
+  assert.equal(turn.pendingCalls.size, 0)
+  assert.equal(conv.turn, undefined)
+  await assertWaiters()
+  assert.equal(turn.toolSteps, toolSteps)
+}
+
+test('terminal failure after tool yield 1 (block-start)', t =>
+  assertTerminalBoundary(t, queueTerminalTool, stream => Promise.all([stream.next()]), 'block-start', 0))
+
+test('terminal failure after tool yield 2 (tool-call-delta)', t =>
+  assertTerminalBoundary(t, queueTerminalTool, stream => Promise.all([stream.next(), stream.next()]), 'tool-call-delta', 0))
+
+test('terminal failure after tool yield 3 (block-end)', t =>
+  assertTerminalBoundary(t, queueTerminalTool, stream => Promise.all([stream.next(), stream.next(), stream.next()]), 'block-end', 0))
+
+test('terminal failure after tool yield 4 (finish)', t =>
+  assertTerminalBoundary(t, queueTerminalTool, stream => Promise.all([stream.next(), stream.next(), stream.next(), stream.next()]), 'finish', 1))
+
+test('terminal failure after parallel tool yield 1 (block-start)', t =>
+  assertTerminalBoundary(t, queueTerminalParallel, stream => Promise.all([stream.next()]), 'block-start', 0))
+
+test('terminal failure after parallel tool yield 2 (tool-call-delta)', t =>
+  assertTerminalBoundary(t, queueTerminalParallel, stream => Promise.all([stream.next(), stream.next()]), 'tool-call-delta', 0))
+
+test('terminal failure after parallel tool yield 3 (block-end)', t =>
+  assertTerminalBoundary(t, queueTerminalParallel, stream => Promise.all([stream.next(), stream.next(), stream.next()]), 'block-end', 0))
+
+test('terminal failure after parallel tool yield 4 (block-start)', t =>
+  assertTerminalBoundary(t, queueTerminalParallel, stream => Promise.all([stream.next(), stream.next(), stream.next(), stream.next()]), 'block-start', 0))
+
+test('terminal failure after parallel tool yield 5 (tool-call-delta)', t =>
+  assertTerminalBoundary(t, queueTerminalParallel, stream => Promise.all([stream.next(), stream.next(), stream.next(), stream.next(), stream.next()]), 'tool-call-delta', 0))
+
+test('terminal failure after parallel tool yield 6 (block-end)', t =>
+  assertTerminalBoundary(t, queueTerminalParallel, stream => Promise.all([stream.next(), stream.next(), stream.next(), stream.next(), stream.next(), stream.next()]), 'block-end', 0))
+
+test('terminal failure after parallel tool yield 7 (finish)', t =>
+  assertTerminalBoundary(t, queueTerminalParallel, stream => Promise.all([stream.next(), stream.next(), stream.next(), stream.next(), stream.next(), stream.next(), stream.next()]), 'finish', 1))
+
+test('terminal failure after text yield 1 (block-start)', t =>
+  assertTerminalBoundary(t, queueTerminalText, stream => Promise.all([stream.next()]), 'block-start', 0))
+
+test('terminal failure after text yield 2 (text-delta)', t =>
+  assertTerminalBoundary(t, queueTerminalText, stream => Promise.all([stream.next(), stream.next()]), 'text-delta', 0))
+
+test('terminal failure after text yield 3 (block-end)', t =>
+  assertTerminalBoundary(t, queueTerminalText, stream => Promise.all([stream.next(), stream.next(), stream.next()]), 'block-end', 0))
+
+test('terminal failure after text yield 4 (usage)', t =>
+  assertTerminalBoundary(t, queueTerminalText, stream => Promise.all([stream.next(), stream.next(), stream.next(), stream.next()]), 'usage', 0))
+
+test('terminal failure after text yield 5 (finish)', t =>
+  assertTerminalBoundary(t, queueTerminalText, stream => Promise.all([stream.next(), stream.next(), stream.next(), stream.next(), stream.next()]), 'finish', 0))
+
+test('terminal failure after reasoning yield 1 (block-start)', t =>
+  assertTerminalBoundary(t, queueTerminalThought, stream => Promise.all([stream.next()]), 'block-start', 0))
+
+test('terminal failure after reasoning yield 2 (reasoning-delta)', t =>
+  assertTerminalBoundary(t, queueTerminalThought, stream => Promise.all([stream.next(), stream.next()]), 'reasoning-delta', 0))
+
+test('terminal failure after reasoning yield 3 (block-end)', t =>
+  assertTerminalBoundary(t, queueTerminalThought, stream => Promise.all([stream.next(), stream.next(), stream.next()]), 'block-end', 0))
+
+test('terminal failure after reasoning yield 4 (usage)', t =>
+  assertTerminalBoundary(t, queueTerminalThought, stream => Promise.all([stream.next(), stream.next(), stream.next(), stream.next()]), 'usage', 0))
+
+test('terminal failure after reasoning yield 5 (finish)', t =>
+  assertTerminalBoundary(t, queueTerminalThought, stream => Promise.all([stream.next(), stream.next(), stream.next(), stream.next(), stream.next()]), 'finish', 0))
+
+async function assertFailureFirst(seed) {
+  const turn = new AcpTurn('failure-first')
+  const assertWaiters = seed(turn)
+  const error = new Error('original failure')
+  const controller = new AbortController()
+  const stream = pumpStep(turn, { parkSettleMs: 0, maxContinuations: 0, cancel() {},
+    continuePrompt() { assert.fail('no continuation') } }, controller.signal)
+  turn.fail(error)
+  turn.fail(new Error('later failure'))
+  controller.abort()
+  await assert.rejects(stream.next(), value => value === error)
+  assert.equal(turn.cancellation.signal.aborted, false)
+  assert.equal(turn.pendingCalls.size, 0)
+  await assertWaiters()
+}
+
+async function assertCancellationFirst(seed) {
+  const turn = new AcpTurn('cancel-first')
+  const assertWaiters = seed(turn)
+  const stream = pumpStep(turn, { parkSettleMs: 0, maxContinuations: 0, cancel() {},
+    continuePrompt() { assert.fail('no continuation') } }, undefined)
+  turn.abandon('cancelled first')
+  turn.fail(new Error('later failure'))
+  const chunks = await collect(stream)
+  assert.equal(chunks.length, 1)
+  assert.equal(finishOf(chunks).reason.kind, 'aborted')
+  assert.equal(turn.pendingCalls.size, 0)
+  await assertWaiters()
+}
+
+test('first interruption failure beats queued text and cancellation', () => assertFailureFirst(queueTerminalText))
+test('first interruption failure beats queued park and cancellation', () => assertFailureFirst(queueTerminalTool))
+test('first interruption failure beats queued done and cancellation', () => assertFailureFirst(queueTerminalDone))
+test('first interruption cancellation beats queued text and failure', () => assertCancellationFirst(queueTerminalText))
+test('first interruption cancellation beats queued park and failure', () => assertCancellationFirst(queueTerminalTool))
+test('first interruption cancellation beats queued done and failure', () => assertCancellationFirst(queueTerminalDone))
 
 test('terminal failure in the generator delivery microtask precedes runtime accounting', async (t) => {
   const { runtime } = makeRuntime()
+  t.after(() => runtime.dispose())
   const proc = await runtime.ensureReady()
   const conv = runtime.createConversation('delivery-gap')
   conv.process = proc
   conv.sessionId = 'delivery-gap'
   const turn = conv.turn = new AcpTurn('delivery-gap')
-  turn.park('bash', {})
+  const call = turn.park('bash', {})
+  const stream = runtime.pump(conv, turn, proc, { model: 'test' }, 'high')
+  assert.equal((await stream.next()).value.type, 'block-start')
+  assert.equal((await stream.next()).value.type, 'tool-call-delta')
   const guard = turn.guard.bind(turn)
-  let injected = false
-  t.mock.method(turn, 'guard', (chunk, signal) => {
-    const result = guard(chunk, signal)
-    if (chunk?.type === 'block-end' && !injected) {
-      injected = true
-      queueMicrotask(() => proc.stop())
-    }
-    return result
-  })
-  const chunks = []
-  await assert.rejects(async () => {
-    for await (const chunk of runtime.pump(conv, turn, proc, { model: 'test' }, 'high')) chunks.push(chunk)
-  }, { code: 'TRANSPORT' })
-  assert.equal(injected, true)
-  assert.deepEqual(chunks.map(chunk => chunk.type), ['block-start', 'tool-call-delta'])
+  const mocked = t.mock.method(turn, 'guard', guard)
+  mocked.mock.mockImplementationOnce((chunk, signal) => {
+    const guarded = guard(chunk, signal)
+    queueMicrotask(() => proc.stop())
+    return guarded
+  }, 1)
+  await assert.rejects(stream.next(), { code: 'TRANSPORT' })
+  assert.equal(mocked.mock.calls[1].arguments[0].type, 'block-end')
   assert.equal(conv.issuedIds.size, 0)
   assert.equal(turn.toolSteps, 0)
+  assert.equal((await call.result.promise).isError, true)
   assert.equal(runtime.status().lastTurn.outcome, 'error')
 })
 
-test('obsolete process and prompt callbacks cannot poison a replacement turn', async () => {
+test('obsolete process and prompt callbacks cannot poison a replacement turn', async (t) => {
   const { runtime } = makeRuntime()
+  t.after(() => runtime.dispose())
   const oldProc = await runtime.ensureReady()
   oldProc.stop()
   const proc = await runtime.ensureReady()
@@ -2826,16 +2908,15 @@ test('obsolete process and prompt callbacks cannot poison a replacement turn', a
   assert.equal(finishOf(chunks).reason.kind, 'stop')
 })
 
-
-test('terminal failure prevents a queued long-decode continuation and retains its original rejection', async () => {
+test('terminal failure during a long-decode continuation retains its original rejection', async () => {
   const turn = new AcpTurn('continuation')
   const result = deferred()
+  const dispatched = deferred()
   const stream = pumpStep(turn, { parkSettleMs: 0, maxContinuations: 1, cancel() {},
-    continuePrompt: () => result.promise }, undefined)
+    continuePrompt() { dispatched.resolve(); return result.promise } }, undefined)
   turn.events.push({ kind: 'done', result: { stopReason: 'max_tokens' } })
   const next = stream.next()
-  // Wait for the actual continuation dispatch rather than relying on a timer.
-  while (turn.continuations === 0) await Promise.resolve()
+  await dispatched.promise
   const call = turn.park('bash', {})
   const error = new Error('original continuation failure')
   result.reject(error)
@@ -2847,25 +2928,55 @@ test('terminal failure prevents a queued long-decode continuation and retains it
   assert.equal(turn.cancellation.signal.aborted, false)
 })
 
+test('synchronous continuation failure preserves the first terminal event', async () => {
+  const turn = new AcpTurn('continuation-throw')
+  const original = new Error('original transport failure')
+  const later = new Error('later synchronous throw')
+  const call = turn.park('bash', {})
+  turn.events.shift() // Keep a waiter without a tool handoff ahead of the continuation.
+  turn.events.push({ kind: 'done', result: { stopReason: 'max_tokens' } })
+  const stream = pumpStep(turn, { parkSettleMs: 0, maxContinuations: 1, cancel() {},
+    continuePrompt() {
+      turn.fail(original)
+      throw later
+    } }, undefined)
+  await assert.rejects(stream.next(), error => error === original)
+  assert.equal((await call.result.promise).isError, true)
+  assert.equal(turn.pendingCalls.size, 0)
+  assert.equal(turn.toolSteps, 0)
+})
 
-test('synchronous continuation throws preserve the first terminal event', async () => {
-  for (const first of ['failure', 'cancellation', 'throw']) {
-    const turn = new AcpTurn('continuation-throw')
-    const original = new Error('original transport failure')
-    const later = new Error('later synchronous throw')
-    const call = turn.park('bash', {})
-    turn.events.shift() // Keep a waiter without a tool handoff ahead of the continuation.
-    turn.events.push({ kind: 'done', result: { stopReason: 'max_tokens' } })
-    const stream = pumpStep(turn, { parkSettleMs: 0, maxContinuations: 1, cancel() {},
-      continuePrompt() {
-        if (first === 'failure') turn.fail(original)
-        if (first === 'cancellation') turn.abandon('cancelled before throw')
-        throw later
-      } }, undefined)
-    if (first === 'cancellation') assert.equal(finishOf(await collect(stream)).reason.kind, 'aborted')
-    else await assert.rejects(collect(stream), error => error === (first === 'failure' ? original : later))
-    assert.equal((await call.result.promise).isError, true)
-    assert.equal(turn.pendingCalls.size, 0)
-    assert.equal(turn.toolSteps, 0)
-  }
+test('synchronous continuation cancellation preserves the first terminal event', async () => {
+  const turn = new AcpTurn('continuation-throw')
+  const original = new Error('original transport failure')
+  const later = new Error('later synchronous throw')
+  const call = turn.park('bash', {})
+  turn.events.shift() // Keep a waiter without a tool handoff ahead of the continuation.
+  turn.events.push({ kind: 'done', result: { stopReason: 'max_tokens' } })
+  const stream = pumpStep(turn, { parkSettleMs: 0, maxContinuations: 1, cancel() {},
+    continuePrompt() {
+      turn.abandon('cancelled before throw')
+      throw later
+    } }, undefined)
+  assert.equal(finishOf(await collect(stream)).reason.kind, 'aborted')
+  assert.equal((await call.result.promise).isError, true)
+  assert.equal(turn.pendingCalls.size, 0)
+  assert.equal(turn.toolSteps, 0)
+})
+
+test('synchronous continuation throw preserves the first terminal event', async () => {
+  const turn = new AcpTurn('continuation-throw')
+  const original = new Error('original transport failure')
+  const later = new Error('later synchronous throw')
+  const call = turn.park('bash', {})
+  turn.events.shift() // Keep a waiter without a tool handoff ahead of the continuation.
+  turn.events.push({ kind: 'done', result: { stopReason: 'max_tokens' } })
+  const stream = pumpStep(turn, { parkSettleMs: 0, maxContinuations: 1, cancel() {},
+    continuePrompt() {
+      throw later
+    } }, undefined)
+  await assert.rejects(stream.next(), error => error === later)
+  assert.equal((await call.result.promise).isError, true)
+  assert.equal(turn.pendingCalls.size, 0)
+  assert.equal(turn.toolSteps, 0)
 })
