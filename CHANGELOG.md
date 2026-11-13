@@ -1,7 +1,9 @@
 # Changelog
 
-## Unreleased
+## [0.1.3]
 
+- Default quota display to `used` across the status bar, quota panel, and warnings, with `/agy-acp quota [used|remaining]` persistence in `settings.json` and `PI_AGY_QUOTA_DISPLAY` startup override.
+- Harden MCP HTTP request boundaries, runtime disposal, conversation turn ownership, and tool continuation/cancellation handling.
 - Correct the minimum Node.js version to 22.19.0 to match Pi 1.5.x requirements.
 - Add contribution and security policies, issue templates, dependency updates, and CI coverage for Node.js 22.19.0 and 24.
 
