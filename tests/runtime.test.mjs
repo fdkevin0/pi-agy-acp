@@ -926,13 +926,17 @@ test('cancelled prompts settle despite queued text, including continuations and 
           const pending = deferred()
           let prompts = 0
           const proc = {
+            alive: true,
+            stop: () => {},
             prompt: () =>
               ++prompts === 1 && continuation
                 ? Promise.resolve({ stopReason: 'max_tokens' })
                 : pending.promise,
             cancel: () => {},
           }
-          runtime.startPrompt(conv, proc, [])
+          runtime.process = conv.process = proc
+          conv.sessionId = 'settlement'
+          runtime.startPrompt(conv, turn, proc, [])
           const controller = new AbortController()
           const stream = runtime.pump(
             conv, turn,
@@ -2170,6 +2174,71 @@ test('session installation rejects process loss around a buffered reply', async 
   }
 })
 
+test('model selection rejects process loss around a buffered reply', async (t) => {
+  const { PassThrough, Writable } = await import('node:stream')
+  for (const configId of ['model', 'thought_level']) for (const ordering of ['exit-first', 'reply-first']) {
+    await t.test(`${configId}/${ordering}`, async () => {
+      let spawns = 0
+      const { runtime, home } = makeRuntime({ config: { maxLiveSessions: 1 }, host: { spawnAcp: () => {
+        const generation = ++spawns
+        const stdout = new PassThrough(), exited = deferred()
+        return { stdout, exited: exited.promise, stderrTail: () => '',
+          terminate: () => exited.resolve({ code: 0, signal: null }),
+          stdin: new Writable({ write(data, _encoding, done) {
+            const request = JSON.parse(data)
+            let result = {}
+            if (request.method === 'session/new') {
+              result = { sessionId: `late-${generation}`, configOptions: [],
+                models: { availableModels: [{ modelId: 'obsolete-model', name: 'Obsolete' }] },
+                _meta: { antigravity: { tier: { name: 'Obsolete' } } } }
+              mkdirSync(join(home, 'agy', 'conversations'), { recursive: true })
+              writeFileSync(join(home, 'agy', 'conversations', `late-${generation}.db`), 'session')
+            }
+            if (request.method === 'session/set_config_option')
+              result = { configOptions: configId === 'thought_level' ? [{ id: 'thought_level', currentValue: 'low' }] : [] }
+            if (request.method === 'session/prompt') {
+              stdout.write(JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: {
+                sessionId: request.params.sessionId, update: { sessionUpdate: 'agent_message_chunk',
+                  content: { type: 'text', text: 'recovered' } },
+              } }) + '\n')
+              result = { stopReason: 'end_turn' }
+            }
+            // Real wire replies and exit promises compete before newSession's continuation.
+            const losesProcess = generation === 1 && request.method === 'session/set_config_option' && request.params.configId === configId
+            if (losesProcess && ordering === 'exit-first') exited.resolve({ code: 1, signal: null })
+            if (request.id !== undefined)
+              stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result }) + '\n')
+            if (losesProcess && ordering === 'reply-first') exited.resolve({ code: 1, signal: null })
+            done()
+          } }),
+        }
+      } } })
+      const old = await runtime.ensureReady()
+      const request = { model: 'gemini-4-argon', sessionId: 'owner', reasoningEffort: 'high', messages: [sys, user('u1', 'hello')] }
+      // The request must fail, and every registration from its late reply must roll back.
+      await assert.rejects(collect(runtime.stream(request)), { code: 'TRANSPORT' })
+      assert.equal(runtime.process, undefined)
+      assert.equal(old.alive, false)
+      assert.equal(old.listeners.size, 0)
+      assert.equal(old.peer.pending.size, 0)
+      assert.equal(runtime.conversations.size, 0)
+      assert.equal(runtime.tenants.size, 0)
+      assert.equal(runtime.status().liveSessions, 0)
+      assert.equal(runtime.status().activeTurns, 0)
+      const next = await collect(runtime.stream({ ...request, sessionId: 'second' }))
+      assert.equal(textOf(next), 'recovered')
+      assert.equal(finishOf(next).reason.kind, 'stop')
+      assert.equal(spawns, 2)
+      const replacement = runtime.conversations.get('second')
+      assert.equal(replacement.process, runtime.process)
+      assert.equal(replacement.process.alive, true)
+      assert.equal(replacement.sessionId, 'late-2')
+      assert.equal(runtime.tenants.size, 1)
+      assert.equal(replacement.process.listeners.size, 1)
+    })
+  }
+})
+
 test('dispose rolls back a session/new reply that was already received', async (t) => {
   const { runtime, home } = makeRuntime()
   const proc = await runtime.ensureReady()
@@ -2486,4 +2555,97 @@ test('cancellation during the parallel-tool batching boundary suppresses the han
   assert.deepEqual(chunks.map(c => c.type), ['finish'])
   assert.equal(finishOf(chunks).reason.kind, 'aborted')
   assert.equal((await call.result.promise).isError, true)
+})
+
+
+test('synchronous prompt dispatch failure cleans new and tool-continuation turns', async (t) => {
+  for (const resume of [false, true]) for (const exits of [false, true])
+    await t.test(`resume=${resume}/exit=${exits}`, async (t) => {
+    const { runtime } = makeRuntime({ config: { maxLiveSessions: 1 } })
+    const proc = await runtime.ensureReady()
+    const request = { model: 'gemini-4-argon', sessionId: 'dispatch', tools: [bash],
+      messages: [sys, user('u1', resume ? 'CALL bash {"command":"long"}' : 'hello')] }
+    if (resume) {
+      const first = await collect(runtime.stream(request))
+      const conv = runtime.conversations.get(request.sessionId)
+      const [call] = conv.turn.pendingCalls.values()
+      conv.turn.finished = true
+      request.messages.push(assistantFrom('a1', first), tool('t1', call.id, 'done'))
+    }
+    const failure = new Error('synchronous dispatch failure')
+    const prompt = t.mock.method(proc, 'prompt', () => {
+      if (exits) proc.stop()
+      throw failure
+    })
+    await assert.rejects(collect(runtime.stream(request)), error =>
+      error.code === 'TRANSPORT' && (exits
+        ? error.message === 'Antigravity ACP process exited: ACP process stopped'
+        : error.cause === failure))
+    assert.equal(runtime.status().activeTurns, 0)
+    assert.equal(runtime.status().lastTurn.outcome, 'error')
+    assert.equal(runtime.conversations.get(request.sessionId)?.turn, undefined)
+    prompt.mock.restore()
+    const next = await collect(runtime.stream({ ...request, sessionId: 'second', messages: [sys, user('u2', 'hello')] }))
+    assert.equal(finishOf(next).reason.kind, 'stop')
+  })
+})
+
+test('process loss releases parked ownership and keeps running failures distinct from abort', async (t) => {
+  for (const parked of [false, true]) await t.test(String(parked), async () => {
+    const { runtime } = makeRuntime({ config: { maxLiveSessions: 1 } })
+    const request = { model: 'gemini-4-argon', sessionId: 'lost-process', tools: [bash],
+      messages: [sys, user('u1', 'CALL bash {"command":"long"}')] }
+    const stream = runtime.stream(request)
+    if (parked) await collect(stream)
+    else await stream.next()
+    const conv = runtime.conversations.get(request.sessionId), turn = conv.turn
+    const calls = [...turn.calls.values()]
+    const proc = conv.process
+    proc.stop()
+    assert.equal(conv.turn, undefined)
+    assert.equal(turn.cancellation.signal.aborted, false)
+    assert.equal(turn.releaseSignal, undefined)
+    assert.equal(runtime.status().activeTurns, 0)
+    for (const call of calls) assert.equal((await call.result.promise).isError, true)
+    if (!parked) {
+      await assert.rejects(collect(stream), { code: 'TRANSPORT' })
+      assert.equal(runtime.status().lastTurn.outcome, 'error')
+    }
+    const next = await collect(runtime.stream({ ...request, sessionId: 'second', messages: [sys, user('u2', 'hello')] }))
+    assert.equal(finishOf(next).reason.kind, 'stop')
+  })
+})
+
+
+test('conversation ownership lasts through asynchronous step cleanup', async (t) => {
+  const { runtime } = makeRuntime({ config: { maxLiveSessions: 1 } })
+  const proc = await runtime.ensureReady()
+  const entered = deferred(), resume = deferred()
+  const close = proc.closeSession.bind(proc)
+  t.mock.method(proc, 'closeSession', async (...args) => {
+    entered.resolve()
+    await resume.promise
+    return close(...args)
+  })
+  const request = { model: 'gemini-4-argon', sessionId: 'anon-cleanup',
+    messages: [sys, user('u1', 'hello')] }
+  const first = collect(runtime.stream(request))
+  await entered.promise
+  let acquired = false
+  const lease = runtime.mutex.acquire(request.sessionId).then(release => {
+    acquired = true
+    return release
+  })
+  try {
+    await new Promise(setImmediate)
+    assert.equal(acquired, false, 'a replacement cannot enter before old session cleanup finishes')
+  } finally {
+    resume.resolve()
+    await first
+    const release = await lease
+    release()
+  }
+  const second = await collect(runtime.stream({ ...request, sessionId: 'second' }))
+  assert.equal(finishOf(second).reason.kind, 'stop')
+  assert.equal(runtime.conversations.get('second').process, runtime.process)
 })

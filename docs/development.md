@@ -53,6 +53,15 @@ pi -e ./index.ts
   partial ACP history for rebuilding. A request cancelled while startup or a
   conversation lock is pending emits `finish(aborted)` after acquiring ownership,
   without opening a new ACP session. Startup and disposal failures still reject.
+  Process, conversation, and captured session identity are checked after async
+  startup, lock acquisition, session creation, and model/effort selection before
+  adopting results. Discovery also rejects replies from an obsolete process.
+  Synchronous prompt-dispatch failures enter the same error queue and pump cleanup
+  as asynchronous rejections, including replacement turns after tool completion.
+  The conversation lock remains held through asynchronous step cleanup, so an old
+  close cannot delete a session acquired by its successor.
+  Process exit detaches running and parked turns and settles their tool waiters;
+  a running pump retains the transport failure rather than an aborted outcome.
   Tool-result delivery hands the exact resumed turn to the pump synchronously;
   result-waiter microtasks may cancel and detach it before output resumes.
   Cancellation takes priority over buffered output and batched tools. Streaming cleanup waits for prompt settlement for up

@@ -323,7 +323,7 @@ export class AntigravityRuntime {
       this.starting = undefined
     })
     const proc = await this.starting
-    this.assertActive()
+    this.assertOwner(proc)
     return proc
   }
 
@@ -341,7 +341,7 @@ export class AntigravityRuntime {
     if (!options.force && this.catalog.observed) return
     this.warmupPromise = (async () => {
       const proc = await this.ensureReady()
-      this.assertActive()
+      this.assertOwner(proc)
       const result = await proc.newSession(
         {
           cwd: this.preflight?.workspace ?? this.home,
@@ -351,7 +351,7 @@ export class AntigravityRuntime {
         120_000,
       )
       try {
-        this.assertActive()
+        this.assertOwner(proc)
         if (
           this.catalog.observe(
             result.configOptions,
@@ -425,6 +425,21 @@ export class AntigravityRuntime {
     if (this.lifecycle !== 'active') throw this.shutdown.signal.reason
   }
 
+  /** A captured owner remains usable only while every enclosing owner is current. */
+  private owns(proc: AcpProcess, conv?: Conversation, sessionId?: string): boolean {
+    return this.lifecycle === 'active' && this.process === proc && proc.alive &&
+      (conv === undefined || (
+        this.conversations.get(conv.key) === conv &&
+        (sessionId === undefined || (conv.process === proc && conv.sessionId === sessionId))
+      ))
+  }
+
+  private assertOwner(proc: AcpProcess, conv?: Conversation, sessionId?: string): void {
+    this.assertActive()
+    if (!this.owns(proc, conv, sessionId))
+      throw new LlmError('Conversation ownership changed', 'TRANSPORT')
+  }
+
   /**
    * Stream one Pi model step.
    * @param options - the model request.
@@ -450,7 +465,7 @@ export class AntigravityRuntime {
     try {
       this.assertActive()
       conv = await this.acquireConversation(key)
-      this.assertActive()
+      this.assertOwner(proc, conv)
       conv.lastUsed = Date.now()
       const split = splitSystem(options)
       const tools = toBridgeTools(options.tools)
@@ -508,14 +523,14 @@ export class AntigravityRuntime {
 
       const plan = this.plan(conv, split.system, split.messages)
       if (plan.rebuild) await this.resetSession(conv)
-      this.assertActive()
+      this.assertOwner(proc, conv)
       if (conv.sessionId === undefined) {
         conv.systemHash = digest(split.system)
         await this.openSession(conv, split.system, tools, proc)
       }
-      this.assertActive()
+      this.assertOwner(proc, conv, conv.sessionId)
       await this.select(conv, proc, options.model, effort)
-      this.assertActive()
+      this.assertOwner(proc, conv, conv.sessionId)
       let blocks: AcpPromptBlock[]
       if (plan.rebuild) {
         blocks = replayPrompt(plan.history, plan.input)
@@ -530,13 +545,16 @@ export class AntigravityRuntime {
       // turns must never back a fresh permission request.
       conv.reportedToolCalls.clear()
       const turn = conv.turn = new AcpTurn(randomBytes(6).toString('hex'))
-      this.startPrompt(conv, proc, blocks)
+      this.startPrompt(conv, turn, proc, blocks)
       yield* this.pump(conv, turn, proc, options, effort)
     } finally {
-      release()
-      if (conv !== undefined) {
-        conv.opening = false
-        await this.afterStep(conv)
+      try {
+        if (conv !== undefined) {
+          conv.opening = false
+          await this.afterStep(conv)
+        }
+      } finally {
+        release()
       }
     }
   }
@@ -653,7 +671,7 @@ export class AntigravityRuntime {
       const started = proc
       proc.onExit((error) => this.onProcessExit(started, error))
       await proc.start(120_000)
-      this.assertActive()
+      this.assertOwner(proc)
       this.state = 'ready'
       this.lastError = undefined
       return proc
@@ -707,13 +725,11 @@ export class AntigravityRuntime {
     }
     for (const conv of this.conversations.values()) {
       if (conv.process !== proc) continue
-      conv.turn?.events.push({
-        kind: 'error',
-        error: new LlmError(
-          `Antigravity ACP process exited: ${error.message}`,
-          'TRANSPORT',
-        ),
-      })
+      conv.turn?.fail(new LlmError(
+        `Antigravity ACP process exited: ${error.message}`,
+        'TRANSPORT',
+      ))
+      conv.turn = undefined
       this.clearSession(conv)
       conv.dirty = true
     }
@@ -725,7 +741,7 @@ export class AntigravityRuntime {
     tools: readonly BridgeTool[],
     proc: AcpProcess,
   ): Promise<void> {
-    this.assertActive()
+    this.assertOwner(proc, conv)
     syncOAuthToken(this.home)
     conv.reportedToolCalls.clear()
     conv.advertisedTools = [...tools]
@@ -758,8 +774,7 @@ export class AntigravityRuntime {
         {
           onUpdate: (update) => {
             if (
-              this.lifecycle !== 'active' ||
-              this.conversations.get(conv.key) !== conv ||
+              !this.owns(proc, conv) ||
               conv.tenantKey !== tenantKey
             ) return
             if (
@@ -777,18 +792,14 @@ export class AntigravityRuntime {
             }
             conv.turn?.onUpdate(update)
           },
-          onPermission: (request) => conv.tenantKey === tenantKey
+          onPermission: (request) => this.owns(proc, conv) && conv.tenantKey === tenantKey
             ? this.answerPermission(conv, request)
             : { outcome: 'cancelled' },
         },
         120_000,
       )
       // A buffered session/new reply can resolve after its process has exited.
-      if (
-        this.lifecycle !== 'active' ||
-        this.conversations.get(conv.key) !== conv ||
-        proc !== this.process || !proc.alive
-      ) {
+      if (!this.owns(proc, conv)) {
         try {
           await proc.closeSession(result.sessionId)
         } finally {
@@ -937,6 +948,7 @@ export class AntigravityRuntime {
     effort: Effort,
   ): Promise<void> {
     const sessionId = conv.sessionId as string
+    this.assertOwner(proc, conv, sessionId)
     const modelOption = conv.configOptions.find(
       (o) => o.id === 'model' || o.category === 'model',
     )
@@ -950,13 +962,14 @@ export class AntigravityRuntime {
       )
     }
     if (conv.model !== model && modelOption?.currentValue !== model) {
-      conv.configOptions = await proc
+      const configOptions = await proc
         .setConfigOption(sessionId, modelOption?.id ?? 'model', model)
         .catch((error: unknown) => {
           throw mapError(error)
         })
+      this.assertOwner(proc, conv, sessionId)
+      conv.configOptions = configOptions
     }
-    this.assertActive()
     conv.model = model
     const levelOption = conv.configOptions.find(
       (o) => o.id === 'thought_level' || o.category === 'thought_level',
@@ -970,13 +983,14 @@ export class AntigravityRuntime {
       conv.effort !== effort &&
       levelOption.currentValue !== effort
     ) {
-      conv.configOptions = await proc
+      const configOptions = await proc
         .setConfigOption(sessionId, levelOption.id, effort)
         .catch((error: unknown) => {
           throw mapError(error)
         })
+      this.assertOwner(proc, conv, sessionId)
+      conv.configOptions = configOptions
     }
-    this.assertActive()
     conv.effort = effort
   }
 
@@ -1084,15 +1098,21 @@ export class AntigravityRuntime {
 
   private startPrompt(
     conv: Conversation,
+    turn: AcpTurn,
     proc: AcpProcess,
     blocks: AcpPromptBlock[],
   ): void {
-    const turn = conv.turn as AcpTurn
-    turn.promptSettled = proc.prompt(conv.sessionId as string, blocks).then(
-      (result) => turn.events.push({ kind: 'done', result }),
-      (error: unknown) =>
-        turn.events.push({ kind: 'error', error: mapError(error) }),
-    )
+    // AcpProcess.prompt's link() can throw before returning a promise (buffered reply + exit).
+    // Queue that failure too, so every allocated turn reaches the pump's cleanup owner.
+    try {
+      this.assertOwner(proc, conv, conv.sessionId)
+      turn.promptSettled = proc.prompt(conv.sessionId as string, blocks).then(
+        (result) => turn.events.push({ kind: 'done', result }),
+        (error: unknown) => turn.events.push({ kind: 'error', error: mapError(error) }),
+      )
+    } catch (error) {
+      turn.events.push({ kind: 'error', error: mapError(error) })
+    }
   }
 
   private async *pump(
@@ -1199,6 +1219,7 @@ export class AntigravityRuntime {
     proc: AcpProcess,
     tools: readonly BridgeTool[],
   ): AcpTurn | undefined {
+    this.assertOwner(proc, conv, conv.sessionId)
     const turn = conv.turn as AcpTurn
     const results = new Map<string, Extract<RequestMessage, { role: 'tool' }>>()
     let last = -1
@@ -1228,14 +1249,14 @@ export class AntigravityRuntime {
       // The old turn is over: its reported identities do not carry into the continuation.
       turn.abandon('The agent ended the tool-waiting prompt.')
       conv.reportedToolCalls.clear()
-      conv.turn = new AcpTurn(randomBytes(6).toString('hex'))
-      this.startPrompt(conv, proc, [
+      const next = conv.turn = new AcpTurn(randomBytes(6).toString('hex'))
+      this.startPrompt(conv, next, proc, [
         {
           type: 'text',
           text: `${transcript}${suffix ? `\n\n${suffix}` : ''}\n\nContinue the task with these tool results.`,
         },
       ])
-      return conv.turn
+      return next
     }
     for (const [index, call] of pending.entries()) {
       const message = results.get(call.id) as Extract<

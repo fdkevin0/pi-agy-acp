@@ -246,9 +246,19 @@ export class AcpTurn {
    * @param reason - message delivered to the agent.
    */
   abandon(reason: string): void {
+    this.cancellation.abort()
+    this.settleCalls(reason)
+  }
+
+  /** End transport ownership without misreporting a process failure as cancellation. */
+  fail(error: Error): void {
+    this.events.push({ kind: 'error', error })
+    this.settleCalls(error.message)
+  }
+
+  private settleCalls(reason: string): void {
     this.releaseSignal?.()
     this.releaseSignal = undefined
-    this.cancellation.abort()
     for (const call of this.calls.values()) {
       call.result.resolve({
         content: [{ type: 'text', text: reason }],
