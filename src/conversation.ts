@@ -208,6 +208,8 @@ export class AcpTurn {
     if (this.relayedCalls.delete(callId) && this.relayedCalls.size === 0) {
       for (const event of this.relayBuffer) this.events.push(event)
       this.clearRelayBuffer()
+      const held = this.recoverNoticeHold()
+      if (held.length > 0) this.events.push({ kind: 'text', text: held })
     }
   }
 

@@ -498,13 +498,16 @@ export function consumeToolDelta(
     const advertisedHash = conv.advertisedToolDigests.get(tool.name)
     if (advertisedHash === hash) {
       lines.push(`[tool restored: ${AGENT_TOOL_PREFIX}${tool.name}]`)
-    } else if (advertisedHash !== undefined) {
-      lines.push(
-        `[tool updated — direct ${AGENT_TOOL_PREFIX}${tool.name} is stale; invoke via ${AGENT_TOOL_PREFIX}${CALL_TOOL_NAME} with {"name":"${tool.name}","arguments":{...}}]: ${JSON.stringify({ name: tool.name, description: tool.description, parameters: tool.inputSchema })}`,
-      )
     } else {
+      const spec = JSON.stringify({
+        name: tool.name,
+        description: tool.description,
+        parameters: tool.inputSchema,
+      })
       lines.push(
-        `[tool available via ${AGENT_TOOL_PREFIX}${CALL_TOOL_NAME} with {"name":"${tool.name}","arguments":{...}}]: ${JSON.stringify({ name: tool.name, description: tool.description, parameters: tool.inputSchema })}`,
+        advertisedHash !== undefined
+          ? `[tool updated — direct ${AGENT_TOOL_PREFIX}${tool.name} is stale; invoke via ${AGENT_TOOL_PREFIX}${CALL_TOOL_NAME} with {"name":"${tool.name}","arguments":{...}}]: ${spec}`
+          : `[tool available via ${AGENT_TOOL_PREFIX}${CALL_TOOL_NAME} with {"name":"${tool.name}","arguments":{...}}]: ${spec}`,
       )
     }
   }

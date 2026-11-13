@@ -755,7 +755,7 @@ export class AntigravityRuntime {
     conv.reportedToolCalls.clear()
     const compacted = tools.map(compactBridgeTool)
     const supplementalTools = tools.filter(
-      (raw, index) => digest(compacted[index]) !== digest(raw),
+      (raw, index) => compacted[index] !== raw,
     )
     conv.advertisedTools = compacted
     conv.advertisedToolDigests = new Map(tools.map((t) => [t.name, digest(t)]))
