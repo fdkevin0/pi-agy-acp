@@ -37,7 +37,15 @@ pi -e ./index.ts
   retaining the process, bridge, and caches. Pi 1.5.0 reports completed switches
   through `session_start` (`new`, `resume`, or `fork`), which uses the same light
   reset if the runtime survives. `session_shutdown` and `/agy-acp reset` dispose
-  the runtime. Cancelled turns wait for prompt settlement for up to five seconds,
+  the runtime. Runtime ownership moves from active to disposing to disposed;
+  disposal is shared by concurrent callers and rejects new work immediately.
+  Preflight and lock waiters cancel without waiting for the underlying operation.
+  Startup tracks the child before ACP initialize, stops it on disposal, and drains
+  bridge binding before closing the listener. Late session replies roll back
+  instead of registering a conversation or tenant. ACP stop closes the JSON-RPC
+  peer immediately so pending initialize/session requests reject without waiting
+  for child exit. Bridge HTTP draining is a separate concern (issue #3).
+  Cancelled turns wait for prompt settlement for up to five seconds,
   then mark the conversation for rebuilding.
 - **Quota and TUI:** Settled checks share the reader's TTL and in-flight request
   without blocking Pi. Model selection reads memory only. UI generation checks

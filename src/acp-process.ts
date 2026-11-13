@@ -202,7 +202,9 @@ export class AcpProcess {
 
   /** Terminate the process. */
   stop(): void {
-    this.fail(new Error('ACP process stopped'))
+    const error = new Error('ACP process stopped')
+    this.fail(error)
+    this.peer?.close(error)
     this.child?.terminate()
   }
 
@@ -223,7 +225,8 @@ export class AcpProcess {
       params,
       { timeoutMs },
     )
-    this.listeners.set(result.sessionId, listener)
+    // JsonRpcPeer can resolve a buffered reply before stop; leave its rollback to the owner.
+    if (this.alive) this.listeners.set(result.sessionId, listener)
     return result
   }
 
@@ -307,6 +310,7 @@ export class AcpProcess {
   private fail(error: Error): void {
     if (this.exitError !== undefined) return
     this.exitError = error
+    this.listeners.clear()
     for (const listener of this.exitListeners) listener(error)
   }
 

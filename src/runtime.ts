@@ -185,7 +185,9 @@ export class AntigravityRuntime {
   private readonly capacityMutex = new KeyedMutex()
   private sweeper: ReturnType<typeof setInterval> | undefined
   private lastTurn: RuntimeStatus['lastTurn']
-  private disposed = false
+  private lifecycle: 'active' | 'disposing' | 'disposed' = 'active'
+  private readonly shutdown = new AbortController()
+  private disposal: Promise<void> | undefined
   private readonly host: RuntimeHost
 
   /** @param host - host services. */
@@ -279,6 +281,7 @@ export class AntigravityRuntime {
 
   /** Fetch quota and try once per runtime to discover an uncached plan. */
   async readQuota(force = false): Promise<QuotaSnapshot> {
+    this.assertActive()
     const quota = this.quota.read(force)
     if (!this.catalog.tier()) {
       this.tierDiscovery ??= (async () => {
@@ -309,17 +312,19 @@ export class AntigravityRuntime {
    * @returns the running process.
    */
   async ensureReady(): Promise<AcpProcess> {
-    if (this.disposed)
-      throw new LlmError('Antigravity provider was disposed', 'TRANSPORT')
+    this.assertActive()
     if (this.sweeper === undefined) {
       this.sweeper = setInterval(() => this.sweep(), 60_000)
       this.sweeper.unref?.()
     }
-    if (this.process?.alive === true) return this.process
+    if (this.starting === undefined && this.process?.alive === true)
+      return this.process
     this.starting ??= this.start().finally(() => {
       this.starting = undefined
     })
-    return this.starting
+    const proc = await this.starting
+    this.assertActive()
+    return proc
   }
 
   /**
@@ -329,12 +334,14 @@ export class AntigravityRuntime {
   async warmup(
     options: { force?: boolean; signal?: AbortSignal } = {},
   ): Promise<void> {
+    this.assertActive()
     options.signal?.throwIfAborted()
     if (this.warmupPromise !== undefined)
       return abortable(this.warmupPromise, options.signal)
     if (!options.force && this.catalog.observed) return
     this.warmupPromise = (async () => {
       const proc = await this.ensureReady()
+      this.assertActive()
       const result = await proc.newSession(
         {
           cwd: this.preflight?.workspace ?? this.home,
@@ -344,6 +351,7 @@ export class AntigravityRuntime {
         120_000,
       )
       try {
+        this.assertActive()
         if (
           this.catalog.observe(
             result.configOptions,
@@ -367,12 +375,13 @@ export class AntigravityRuntime {
 
   /** Close conversation sessions while retaining the process and discovery/quota caches. */
   async resetConversations(): Promise<void> {
+    this.assertActive()
     const conversations = [...this.conversations.values()]
     for (const conv of conversations)
       this.dropTurn(conv, 'The Pi session changed.')
     await Promise.all(
       conversations.map(async (conv) => {
-        const release = await this.mutex.acquire(conv.key)
+        const release = await this.mutex.acquire(conv.key, this.shutdown.signal)
         try {
           if (this.conversations.get(conv.key) !== conv) return
           await this.resetSession(conv)
@@ -385,16 +394,35 @@ export class AntigravityRuntime {
   }
 
   /** Stop every session, the process, and the bridge. */
-  async dispose(): Promise<void> {
-    this.disposed = true
+  dispose(): Promise<void> {
+    if (this.disposal !== undefined) return this.disposal
+    this.lifecycle = 'disposing'
+    this.shutdown.abort(
+      new LlmError('Antigravity provider was disposed', 'TRANSPORT'),
+    )
     if (this.sweeper !== undefined) clearInterval(this.sweeper)
-    for (const conv of this.conversations.values())
+    this.sweeper = undefined
+    for (const conv of this.conversations.values()) {
       conv.turn?.abandon('The harness provider was unloaded.')
+      this.clearSession(conv)
+    }
     this.conversations.clear()
     this.tenants.clear()
     this.process?.stop()
     this.process = undefined
-    await this.bridge.close()
+    this.disposal = (async () => {
+      // Preflight waits are cancellable; binding must finish before closing its listener.
+      await this.starting?.catch(() => undefined)
+      await this.warmupPromise?.catch(() => undefined)
+      await this.bridge.close()
+      this.state = 'idle'
+      this.lifecycle = 'disposed'
+    })()
+    return this.disposal
+  }
+
+  private assertActive(): void {
+    if (this.lifecycle !== 'active') throw this.shutdown.signal.reason
   }
 
   /**
@@ -416,10 +444,12 @@ export class AntigravityRuntime {
     const proc = await this.ensureReady()
     const scope = options.sessionId ?? `anon-${randomBytes(6).toString('hex')}`
     const key = scope
-    const release = await this.mutex.acquire(key)
+    const release = await this.mutex.acquire(key, this.shutdown.signal)
     let conv: Conversation | undefined
     try {
+      this.assertActive()
       conv = await this.acquireConversation(key)
+      this.assertActive()
       conv.lastUsed = Date.now()
       const split = splitSystem(options)
       const tools = toBridgeTools(options.tools)
@@ -448,6 +478,7 @@ export class AntigravityRuntime {
             proc,
             tools,
           )
+          this.assertActive()
           if (resumed) {
             conv.knownIds = messageIds(split.messages)
             yield* this.pump(conv, proc, options, effort)
@@ -464,11 +495,14 @@ export class AntigravityRuntime {
 
       const plan = this.plan(conv, split.system, split.messages)
       if (plan.rebuild) await this.resetSession(conv)
+      this.assertActive()
       if (conv.sessionId === undefined) {
         conv.systemHash = digest(split.system)
         await this.openSession(conv, split.system, tools, proc)
       }
+      this.assertActive()
       await this.select(conv, proc, options.model, effort)
+      this.assertActive()
       let blocks: AcpPromptBlock[]
       if (plan.rebuild) {
         blocks = replayPrompt(plan.history, plan.input)
@@ -502,13 +536,18 @@ export class AntigravityRuntime {
    * deadlock.
    */
   private async acquireConversation(key: string): Promise<Conversation> {
+    this.assertActive()
     const existing = this.conversations.get(key)
     if (existing !== undefined) {
       existing.opening = true
       return existing
     }
-    const unlock = await this.capacityMutex.acquire('capacity')
+    const unlock = await this.capacityMutex.acquire(
+      'capacity',
+      this.shutdown.signal,
+    )
     try {
+      this.assertActive()
       const again = this.conversations.get(key)
       if (again !== undefined) {
         again.opening = true
@@ -523,6 +562,7 @@ export class AntigravityRuntime {
           const victim = idle.shift() as Conversation
           this.conversations.delete(victim.key)
           await this.resetSession(victim)
+          this.assertActive()
         }
       }
       if (this.conversations.size >= max) {
@@ -570,8 +610,10 @@ export class AntigravityRuntime {
     this.state = 'starting'
     let proc: AcpProcess | undefined
     try {
-      const preflight = await this.runPreflight()
+      const preflight = await abortable(this.runPreflight(), this.shutdown.signal)
+      this.assertActive()
       await this.bridge.start()
+      this.assertActive()
       const argv = [
         preflight.binary,
         'acp',
@@ -594,16 +636,20 @@ export class AntigravityRuntime {
         clientVersion: VERSION,
         log: (message) => this.host.log.warn(message),
       })
+      this.process = proc
       const started = proc
       proc.onExit((error) => this.onProcessExit(started, error))
       await proc.start(120_000)
-      this.process = proc
+      this.assertActive()
       this.state = 'ready'
       this.lastError = undefined
       return proc
     } catch (error) {
       proc?.stop()
+      if (this.process === proc) this.process = undefined
+      if (this.lifecycle !== 'active') throw this.shutdown.signal.reason
       await this.bridge.close()
+      this.assertActive()
       if (this.sweeper !== undefined) clearInterval(this.sweeper)
       this.sweeper = undefined
       this.state = 'error'
@@ -621,6 +667,7 @@ export class AntigravityRuntime {
       const config = this.host.config
       const binary = resolveAgyBinary(config.command)
       const version = await readVersion(binary, this.host.runCommand)
+      this.assertActive()
       assertSupportedAgyVersion(version, binary)
       const workspace = prepareHome(this.home)
       const result: PreflightResult = {
@@ -640,7 +687,7 @@ export class AntigravityRuntime {
 
   private onProcessExit(proc: AcpProcess, error: Error): void {
     if (this.process === proc) this.process = undefined
-    if (!this.disposed) {
+    if (this.lifecycle === 'active') {
       this.state = 'error'
       this.lastError = error.message
       this.host.log.warn(`antigravity-acp: ${error.message}`)
@@ -665,6 +712,7 @@ export class AntigravityRuntime {
     tools: readonly BridgeTool[],
     proc: AcpProcess,
   ): Promise<void> {
+    this.assertActive()
     syncOAuthToken(this.home)
     conv.reportedToolCalls.clear()
     conv.advertisedTools = [...tools]
@@ -697,6 +745,10 @@ export class AntigravityRuntime {
         {
           onUpdate: (update) => {
             if (
+              this.lifecycle !== 'active' ||
+              this.conversations.get(conv.key) !== conv
+            ) return
+            if (
               update.sessionUpdate === 'config_option_update' &&
               Array.isArray(update.configOptions)
             ) {
@@ -715,6 +767,18 @@ export class AntigravityRuntime {
         },
         120_000,
       )
+      if (
+        this.lifecycle !== 'active' ||
+        this.conversations.get(conv.key) !== conv
+      ) {
+        try {
+          await proc.closeSession(result.sessionId)
+        } finally {
+          removeSessionArtifacts(this.home, result.sessionId)
+        }
+        this.assertActive()
+        throw new LlmError('Conversation ownership changed', 'TRANSPORT')
+      }
       conv.sessionId = result.sessionId
       conv.process = proc
       conv.configOptions = result.configOptions ?? []
@@ -874,6 +938,7 @@ export class AntigravityRuntime {
           throw mapError(error)
         })
     }
+    this.assertActive()
     conv.model = model
     const levelOption = conv.configOptions.find(
       (o) => o.id === 'thought_level' || o.category === 'thought_level',
@@ -893,6 +958,7 @@ export class AntigravityRuntime {
           throw mapError(error)
         })
     }
+    this.assertActive()
     conv.effort = effort
   }
 

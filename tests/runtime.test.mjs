@@ -1888,3 +1888,223 @@ test('last turn reports both transport failures and provider error outcomes', as
   assert.equal(finishOf(chunks).reason.kind, 'error')
   assert.equal(runtime.status().lastTurn.outcome, 'error')
 })
+
+test('dispose cancels blocked preflight without resurrecting shared startup', async () => {
+  const entered = deferred()
+  const resume = deferred()
+  let spawned = 0
+  const { runtime } = makeRuntime({ host: {
+    runCommand: async () => {
+      entered.resolve()
+      await resume.promise
+      return { code: 0, stdout: 'fake-agy 0.0.1', stderr: '' }
+    },
+    spawnAcp: () => { spawned++; throw new Error('unexpected spawn') },
+  } })
+  const first = runtime.ensureReady()
+  const second = runtime.ensureReady()
+  const failures = Promise.all([assert.rejects(first, /disposed/), assert.rejects(second, /disposed/)])
+  await entered.promise
+  await Promise.all([runtime.dispose(), runtime.dispose()])
+  resume.resolve()
+  await failures
+  assert.equal(spawned, 0)
+  assert.equal(runtime.process, undefined)
+  assert.equal(runtime.bridge.server, undefined)
+})
+
+test('dispose drains bridge binding before closing its listener', async (t) => {
+  const { runtime } = makeRuntime()
+  const entered = deferred()
+  const resume = deferred()
+  const bind = runtime.bridge.start.bind(runtime.bridge)
+  t.mock.method(runtime.bridge, 'start', async () => {
+    entered.resolve()
+    await resume.promise
+    await bind()
+  })
+  const startup = assert.rejects(runtime.ensureReady(), /disposed/)
+  await entered.promise
+  const disposal = runtime.dispose()
+  assert.equal(disposal, runtime.dispose())
+  resume.resolve()
+  await Promise.all([startup, disposal])
+  assert.equal(runtime.bridge.server, undefined)
+  assert.equal(runtime.process, undefined)
+})
+
+test('dispose stops a child blocked in the ACP initialize RPC', async () => {
+  const { PassThrough, Writable } = await import('node:stream')
+  const entered = deferred()
+  const exited = deferred()
+  let terminated = 0
+  const { runtime } = makeRuntime({ host: { spawnAcp: () => ({
+    stdin: new Writable({ write(_data, _encoding, done) { entered.resolve(); done() } }),
+    stdout: new PassThrough(),
+    exited: exited.promise,
+    terminate: () => { terminated++; exited.resolve({ code: 0, signal: null }) },
+    stderrTail: () => '',
+  }) } })
+  const startup = assert.rejects(runtime.ensureReady(), /disposed/)
+  await entered.promise
+  const initializing = runtime.process
+  assert.ok(initializing)
+  await runtime.dispose()
+  await startup
+  assert.ok(terminated >= 1)
+  assert.equal(initializing.alive, false)
+  assert.equal(runtime.process, undefined)
+  assert.equal(runtime.bridge.server, undefined)
+})
+
+test('dispose rolls back a session/new reply that was already received', async (t) => {
+  const { runtime, home } = makeRuntime()
+  const proc = await runtime.ensureReady()
+  const newSession = proc.newSession.bind(proc)
+  const entered = deferred()
+  const resume = deferred()
+  let id
+  t.mock.method(proc, 'newSession', async (...args) => {
+    const result = await newSession(...args)
+    id = result.sessionId
+    entered.resolve()
+    await resume.promise
+    return result
+  })
+  const request = assert.rejects(collect(runtime.stream({
+    model: 'gemini-4-argon', sessionId: 'closing', messages: [sys, user('closing', 'hello')],
+  })), /disposed/)
+  await entered.promise
+  assert.equal(runtime.tenants.size, 1)
+  await runtime.dispose()
+  resume.resolve()
+  await request
+  assert.equal(runtime.conversations.size, 0)
+  assert.equal(runtime.tenants.size, 0)
+  assert.equal(proc.alive, false)
+  assert.equal(existsSync(join(home, 'agy', 'conversations', `${id}.db`)), false)
+})
+
+test('dispose rejects conversation and capacity lock waiters before locks release', async (t) => {
+  for (const gate of ['conversation', 'capacity']) {
+    await t.test(gate, async () => {
+      const { runtime } = makeRuntime()
+      const proc = await runtime.ensureReady()
+      const mutex = gate === 'conversation' ? runtime.mutex : runtime.capacityMutex
+      const key = gate === 'conversation' ? 'queued' : 'capacity'
+      const release = await mutex.acquire(key)
+      const entered = deferred()
+      const acquire = mutex.acquire.bind(mutex)
+      t.mock.method(mutex, 'acquire', (...args) => {
+        const waiting = acquire(...args)
+        entered.resolve()
+        return waiting
+      })
+      const request = assert.rejects(collect(runtime.stream({
+        model: 'gemini-4-argon', sessionId: 'queued', messages: [sys, user('queued', 'hello')],
+      })), /disposed/)
+      await entered.promise
+      await runtime.dispose()
+      await request
+      assert.equal(runtime.conversations.size, 0)
+      assert.equal(runtime.tenants.size, 0)
+      assert.equal(proc.alive, false)
+      release()
+    })
+  }
+})
+
+test('normal concurrent startup shares one initialized child', async () => {
+  const { runtime, inits } = makeRuntime()
+  const processes = await Promise.all(Array.from({ length: 8 }, () => runtime.ensureReady()))
+  assert.ok(processes.every((proc) => proc === processes[0] && proc.alive))
+  assert.equal(inits().length, 1)
+  await runtime.dispose()
+  await assert.rejects(runtime.ensureReady(), /disposed/)
+  await assert.rejects(runtime.warmup(), /disposed/)
+  await assert.rejects(runtime.readQuota(), /disposed/)
+})
+
+test('cancelling the last lock waiter cannot bypass the current holder', async () => {
+  const { KeyedMutex } = await import('../src/util.ts')
+  const mutex = new KeyedMutex()
+  const release = await mutex.acquire('key')
+  const controller = new AbortController()
+  const cancelled = assert.rejects(mutex.acquire('key', controller.signal), /cancelled/)
+  controller.abort(new Error('cancelled'))
+  await cancelled
+  let acquired = false
+  const next = mutex.acquire('key').then((unlock) => { acquired = true; unlock() })
+  await Promise.resolve()
+  await Promise.resolve()
+  assert.equal(acquired, false)
+  release()
+  await next
+  assert.equal(acquired, true)
+})
+
+test('dispose drains discovery and discards its late catalog result', async (t) => {
+  const { runtime } = makeRuntime()
+  const proc = await runtime.ensureReady()
+  const newSession = proc.newSession.bind(proc)
+  const entered = deferred(), resume = deferred()
+  t.mock.method(proc, 'newSession', async (...args) => {
+    const result = await newSession(...args)
+    entered.resolve()
+    await resume.promise
+    return result
+  })
+  const warmup = assert.rejects(runtime.warmup(), /disposed/)
+  await entered.promise
+  const disposal = runtime.dispose()
+  resume.resolve()
+  await Promise.all([warmup, disposal])
+  assert.equal(runtime.catalog.observed, false)
+  assert.equal(proc.alive, false)
+  assert.equal(proc.listeners.size, 0)
+  assert.equal(runtime.bridge.server, undefined)
+})
+
+test('dispose during capacity eviction cannot register a replacement conversation', async (t) => {
+  const { runtime } = makeRuntime({ config: { maxLiveSessions: 1 } })
+  await collect(runtime.stream({
+    model: 'gemini-4-argon', sessionId: 'old', messages: [sys, user('old', 'hello')],
+  }))
+  const proc = await runtime.ensureReady()
+  const close = proc.closeSession.bind(proc)
+  const entered = deferred(), resume = deferred()
+  t.mock.method(proc, 'closeSession', async (...args) => {
+    entered.resolve()
+    await resume.promise
+    await close(...args)
+  })
+  const request = assert.rejects(collect(runtime.stream({
+    model: 'gemini-4-argon', sessionId: 'new', messages: [sys, user('new', 'hello')],
+  })), /disposed/)
+  await entered.promise
+  await runtime.dispose()
+  resume.resolve()
+  await request
+  assert.equal(runtime.conversations.size, 0)
+  assert.equal(runtime.tenants.size, 0)
+})
+
+test('dispose during model selection cannot start a prompt', async (t) => {
+  const { runtime, prompts } = makeRuntime()
+  const proc = await runtime.ensureReady()
+  const entered = deferred(), resume = deferred()
+  t.mock.method(proc, 'setConfigOption', async () => {
+    entered.resolve()
+    await resume.promise
+    return []
+  })
+  const request = assert.rejects(collect(runtime.stream({
+    model: 'claude-sonnet-5-5', sessionId: 'selecting', messages: [sys, user('selecting', 'hello')],
+  })), /disposed/)
+  await entered.promise
+  await runtime.dispose()
+  resume.resolve()
+  await request
+  assert.equal(prompts().length, 0)
+  assert.equal(runtime.conversations.size, 0)
+})
