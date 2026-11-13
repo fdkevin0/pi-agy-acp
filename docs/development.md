@@ -115,8 +115,8 @@ npm pack --dry-run
 ## CI and releases
 
 `ci.yml` checks pull requests and pushes to `main`. `release.yml` runs on pushes
-to `main` (via `release-please`), version-tag pushes, or manual runs on an
-existing tag, so ordinary commits do not run a second publish suite. CI tests
+to `main` (to run `release-please`), version-tag pushes, or manual runs on an
+existing tag, so ordinary commits do not trigger the `publish` job. CI tests
 Node.js 22.19.0 and 24; releases use Node.js 24. There is no committed lockfile,
 so dependency installation uses `npm install`.
 
@@ -127,18 +127,24 @@ approval is required.
 Releases are automated with `release-please` (`release-please-config.json` and
 `.release-please-manifest.json`):
 - Merging Conventional Commits (`feat:`, `fix:`, etc.) to `main` opens or updates
-  a Release PR that bumps `package.json` and `CHANGELOG.md`.
-- Merging that Release PR creates the `vX.Y.Z` tag and GitHub Release, then
-  chains directly into the `publish` job in `release.yml` to check, test, pack,
-  and publish to npm.
-- If `RELEASE_PLEASE_TOKEN` (a PAT or GitHub App token) is not set in repository
-  secrets, `GITHUB_TOKEN` is used; in that case, close and reopen the Release PR
-  once if needed so `ci.yml` runs on it for branch protection.
-- Manual tag pushes (`vX.Y.Z`) and `gh workflow run release.yml --ref vX.Y.Z`
-  still work for recovery. The workflow accepts stable versions only, publishes
-  one version at a time, and never moves a published tag. Only a registry 404
-  means the version is absent; network, authentication, and server errors stop
-  the job.
+  a release PR that bumps `package.json` and updates `CHANGELOG.md` and
+  `.release-please-manifest.json`.
+- Squash-merging that release PR (preserving its `chore(main): release X.Y.Z`
+  title) creates the `vX.Y.Z` tag and GitHub Release, then triggers the
+  `publish` job in `release.yml` to check, test, pack, and publish to npm.
+- Enable **Allow GitHub Actions to create and approve pull requests** in
+  repository Settings → Actions → General. Without a `RELEASE_PLEASE_TOKEN` PAT
+  (with `contents: write` and `pull-requests: write`) in repository secrets,
+  `GITHUB_TOKEN` is used; in that case, close and reopen the release PR after
+  its final update to trigger `ci.yml` when branch protection requires it.
+- To recover a failed `publish` job, choose **Re-run failed jobs** on that
+  workflow run (re-running all jobs on a `main` run skips `publish` once the tag
+  exists) or run `gh workflow run release.yml --ref vX.Y.Z`. Manual tag pushes
+  (`vX.Y.Z`) also trigger `publish` but bypass `release-please`, leaving
+  `CHANGELOG.md` and `.release-please-manifest.json` out of sync.
+- The workflow accepts stable versions only, publishes one version at a time,
+  and never moves a published tag. Only a registry 404 means the version is
+  absent; network, authentication, and server errors stop the job.
 
 Configure npm [Trusted Publishing](https://docs.npmjs.com/trusted-publishers/)
 for owner `fdkevin0`, repository `pi-agy-acp`, and workflow filename `release.yml`.

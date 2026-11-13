@@ -65,6 +65,7 @@ function fixture(t, version = '1.2.3') {
           CALLS_FILE: calls,
           GITHUB_REF_TYPE: 'tag',
           GITHUB_REF_NAME: 'v1.2.3',
+          RELEASE_TAG: '',
           HTTP_STATUS: '404',
           VIEW_EXIT: '0',
           CREATE_EXIT: '0',
