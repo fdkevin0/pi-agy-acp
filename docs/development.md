@@ -116,12 +116,17 @@ npm pack --dry-run
 
 `ci.yml` checks pull requests and pushes to `main`. `release.yml` runs only for
 version-tag pushes or manual runs on an existing tag, so ordinary commits do not
-run a second test suite or trigger publication. Both use Node.js 24. There is no
-committed lockfile, so dependency installation uses `npm install`.
+run a second test suite or trigger publication. CI tests Node.js 22.19.0 and 24;
+releases use Node.js 24. There is no committed lockfile, so dependency
+installation uses `npm install`.
 
-To release, bump `package.json`, commit the change, and push its matching
-`vX.Y.Z` tag. The workflow accepts stable versions only; publish one version at
-a time and never move a published tag. It validates the tag and version, then
+All changes to `main` require a pull request, passing CI on both Node versions,
+and resolved review discussions. Squash merge after CI passes; no second-person
+approval is required.
+
+To release, bump `package.json` through a pull request, merge it, and tag the
+merged commit with its matching `vX.Y.Z` tag, then push the tag. The workflow
+accepts stable versions only; publish one version at a time and never move a published tag. It validates the tag and version, then
 checks, tests, and packs before publishing. Only a registry 404 means the version
 is absent; network, authentication, and server errors stop the job.
 

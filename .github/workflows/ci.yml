@@ -15,16 +15,20 @@ concurrency:
 
 jobs:
   check:
-    name: Check and test
+    name: Check and test (Node ${{ matrix.node }})
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["22.19.0", "24"]
     steps:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
       - uses: actions/setup-node@v6
         with:
-          node-version: 24
+          node-version: ${{ matrix.node }}
           package-manager-cache: false
       - name: Install dependencies
         run: npm install

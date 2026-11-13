@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Correct the minimum Node.js version to 22.19.0 to match Pi 1.5.x requirements.
+- Add contribution and security policies, issue templates, dependency updates, and CI coverage for Node.js 22.19.0 and 24.
+
 ## [0.1.2]
 
 - Fix model refresh self-cancellation and support forced or cancelled refreshes.
