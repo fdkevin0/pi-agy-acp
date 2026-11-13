@@ -2118,3 +2118,141 @@ test('dispose during model selection cannot start a prompt', async (t) => {
   assert.equal(prompts().length, 0)
   assert.equal(runtime.conversations.size, 0)
 })
+
+test('parked cancellation settles bridge calls and releases capacity without a follow-up', async () => {
+  const { runtime } = makeRuntime({ config: { maxLiveSessions: 1 } })
+  const controller = new AbortController()
+  const request = { model: 'gemini-4-argon', sessionId: 'park-owner', tools: [bash],
+    signal: controller.signal, messages: [sys, user('u1', 'CALL bash {"command":"long"}')] }
+  await collect(runtime.stream(request))
+  const conv = runtime.conversations.get(request.sessionId)
+  const turn = conv.turn
+  const pending = [...turn.calls.values()]
+  assert.equal(pending.length, 1)
+  controller.abort()
+  assert.equal(runtime.status().activeTurns, 0)
+  assert.equal((await pending[0].result.promise).isError, true)
+  const chunks = await collect(runtime.stream({ model: request.model, sessionId: 'second', messages: [sys, user('u2', 'hello')] }))
+  assert.equal(finishOf(chunks).reason.kind, 'stop')
+})
+
+test('already-aborted follow-up settles only its own parked session', async () => {
+  const { runtime } = makeRuntime()
+  const request = { model: 'gemini-4-argon', tools: [bash], messages: [sys, user('u1', 'CALL bash {"command":"long"}')] }
+  for (const sessionId of ['one', 'two']) await collect(runtime.stream({ ...request, sessionId }))
+  const other = runtime.conversations.get('two').turn
+  const chunks = await collect(runtime.stream({ ...request, sessionId: 'one', signal: AbortSignal.abort() }))
+  assert.equal(finishOf(chunks).reason.kind, 'aborted')
+  assert.equal(runtime.conversations.get('one').turn, undefined)
+  assert.equal(runtime.conversations.get('two').turn, other)
+  runtime.settleSession('two')
+  assert.equal(runtime.status().activeTurns, 0)
+})
+
+test('early iterator closure, including at the handoff finish, abandons every waiter', async () => {
+  for (const atFinish of [false, true]) {
+    const { runtime } = makeRuntime()
+    const stream = runtime.stream({ model: 'gemini-4-argon', sessionId: 'closed', tools: [bash],
+      messages: [sys, user('u1', 'CALL bash {"command":"long"}')] })
+    let step = await stream.next()
+    const turn = runtime.conversations.get('closed').turn
+    if (atFinish) while (step.value?.type !== 'finish') step = await stream.next()
+    await stream.return()
+    assert.equal(runtime.status().activeTurns, 0)
+    for (const call of turn.calls.values()) assert.equal((await call.result.promise).isError, true)
+  }
+})
+
+test('cancellation beats buffered text, park and done; old signals cannot cancel replacements', async () => {
+  for (const kind of ['text', 'park', 'done']) {
+    const { runtime } = makeRuntime()
+    const conv = runtime.createConversation(kind)
+    const turn = conv.turn = new AcpTurn(kind)
+    if (kind === 'park') turn.park('bash', {})
+    else turn.events.push(kind === 'text' ? { kind, text: 'buffered' } : { kind, result: { stopReason: 'end_turn' } })
+    const chunks = await collect(runtime.pump(conv, { cancel() {} }, { model: 'test', signal: AbortSignal.abort() }, 'high'))
+    assert.deepEqual(chunks.map(c => c.type), ['finish'])
+    assert.equal(finishOf(chunks).reason.kind, 'aborted')
+    assert.equal(conv.turn, undefined)
+  }
+  const { runtime } = makeRuntime()
+  const conv = runtime.createConversation('replacement')
+  const old = conv.turn = new AcpTurn('old')
+  const controller = new AbortController()
+  old.park('bash', {})
+  await collect(runtime.pump(conv, { cancel() {} }, { model: 'test', signal: controller.signal }, 'high'))
+  runtime.dropTurn(conv, 'replaced')
+  const replacement = conv.turn = new AcpTurn('new')
+  controller.abort()
+  old.events.push({ kind: 'done', result: { stopReason: 'cancelled' } })
+  assert.equal(conv.turn, replacement)
+})
+
+test('a parked tool survives sweeping regardless of elapsed idle time and resumes', async () => {
+  const { runtime, prompts } = makeRuntime({ config: { idleSessionTtlMs: 1 } })
+  const request = { model: 'gemini-4-argon', sessionId: 'long-tool', tools: [bash], messages: [sys, user('u1', 'CALL bash {"command":"long"}')] }
+  const first = await collect(runtime.stream(request))
+  const conv = runtime.conversations.get(request.sessionId)
+  conv.lastUsed = 0
+  runtime.sweep()
+  assert.equal(runtime.conversations.get(request.sessionId), conv)
+  const next = await collect(runtime.stream({ ...request, messages: [...request.messages, assistantFrom('a1', first), tool('t1', callsOf(first)[0].id, 'finished')] }))
+  assert.equal(textOf(next), 'RESULT(bash)=finished')
+  assert.equal(prompts().length, 1)
+})
+
+test('settling a session wakes a pending MCP await-result handler', async () => {
+  const { runtime } = makeRuntime()
+  const request = { model: 'gemini-4-argon', sessionId: 'mcp-waiter', tools: [bash],
+    messages: [sys, user('u1', 'CALL bash {"command":"long"}')] }
+  const chunks = await collect(runtime.stream(request))
+  const conv = runtime.conversations.get(request.sessionId)
+  const waiter = runtime.callTool({ tenantKey: conv.tenantKey, name: 'pi_await_result',
+    arguments: { call_id: callsOf(chunks)[0].id }, signal: new AbortController().signal })
+  runtime.settleSession(request.sessionId)
+  assert.equal((await waiter).isError, true)
+})
+
+test('late session callbacks and old signals cannot modify a replacement ACP session', async (t) => {
+  const { runtime } = makeRuntime()
+  const proc = await runtime.ensureReady()
+  const open = proc.newSession.bind(proc)
+  const callbacks = []
+  t.mock.method(proc, 'newSession', (params, handlers, timeout) => {
+    callbacks.push(handlers)
+    return open(params, handlers, timeout)
+  })
+  const oldSignal = new AbortController()
+  const request = { model: 'gemini-4-argon', sessionId: 'same', tools: [bash],
+    messages: [sys, user('u1', 'CALL bash {"command":"long"}')] }
+  await collect(runtime.stream({ ...request, signal: oldSignal.signal }))
+  runtime.settleSession('same')
+  await collect(runtime.stream(request))
+  const conv = runtime.conversations.get('same')
+  const replacement = conv.turn
+  const queued = replacement.events.size
+  oldSignal.abort()
+  callbacks[0].onUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'stale' } })
+  callbacks[0].onUpdate({ sessionUpdate: 'tool_call', toolCallId: 'stale', kind: 'execute' })
+  assert.equal(conv.turn, replacement)
+  assert.equal(replacement.events.size, queued)
+  assert.equal(conv.reportedToolCalls.has('stale'), false)
+  assert.deepEqual(callbacks[0].onPermission({}), { outcome: 'cancelled' })
+})
+
+test('cancellation during the parallel-tool batching boundary suppresses the handoff', async (t) => {
+  const { runtime } = makeRuntime()
+  const conv = runtime.createConversation('batch-cancel')
+  const turn = conv.turn = new AcpTurn('batch')
+  const call = turn.park('bash', {})
+  const controller = new AbortController()
+  const wait = turn.events.wait.bind(turn.events)
+  t.mock.method(turn.events, 'wait', async (...args) => {
+    if (args[1] !== undefined) controller.abort()
+    return wait(...args)
+  })
+  const chunks = await collect(runtime.pump(conv, { cancel() {} }, { model: 'test', signal: controller.signal }, 'high'))
+  assert.deepEqual(chunks.map(c => c.type), ['finish'])
+  assert.equal(finishOf(chunks).reason.kind, 'aborted')
+  assert.equal((await call.result.promise).isError, true)
+})

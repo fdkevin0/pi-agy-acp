@@ -365,3 +365,24 @@ test('fragmented tool JSON emits one start and reports malformed final arguments
     else assert.ok(r.message.content[0].argumentsError)
   }
 })
+
+test('a direct provider callback failure closes the runtime iterator and abandons its turn', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'pi-callback-'))
+  const runtime = new AntigravityRuntime({
+    config: { ...defaults, command: resolve('tests/fake-agy.mjs'), home },
+    spawnAcp, runCommand: async () => ({ code: 0, stdout: '1.5.0', stderr: '' }),
+    log: { info() {}, warn() {} }, onModelsChanged() {},
+  })
+  try {
+    const { message } = await result(runtime, context(system, user('CALL bash {"command":"pwd"}')), {
+      ...options, onProviderStreamEvent() { throw new Error('callback failed') },
+    })
+    assert.equal(message.stopReason, 'error')
+    assert.match(message.errorMessage, /callback failed/)
+    assert.equal(runtime.status().activeTurns, 0)
+    for (const conv of runtime.conversations.values()) assert.equal(conv.turn, undefined)
+  } finally {
+    await runtime.dispose()
+    rmSync(home, { recursive: true, force: true })
+  }
+})

@@ -432,6 +432,7 @@ export class AntigravityRuntime {
    */
   async *stream(options: GenerateOptions): AsyncGenerator<StreamChunk> {
     if (options.signal?.aborted === true) {
+      if (options.sessionId !== undefined) this.settleSession(options.sessionId)
       yield {
         type: 'finish',
         reason: {
@@ -459,6 +460,10 @@ export class AntigravityRuntime {
         asEffort(options.reasoningEffort) ?? this.host.config.defaultEffort,
       )
 
+      if (options.signal?.aborted) {
+        this.dropTurn(conv, 'The harness cancelled this request.')
+      }
+      options.signal?.throwIfAborted()
       if (conv.turn !== undefined && conv.turn.pendingCalls.size > 0) {
         // Resuming a parked turn is only valid while the request still starts
         // with the exact history this ACP session already owns. A compaction
@@ -746,7 +751,8 @@ export class AntigravityRuntime {
           onUpdate: (update) => {
             if (
               this.lifecycle !== 'active' ||
-              this.conversations.get(conv.key) !== conv
+              this.conversations.get(conv.key) !== conv ||
+              conv.tenantKey !== tenantKey
             ) return
             if (
               update.sessionUpdate === 'config_option_update' &&
@@ -763,7 +769,9 @@ export class AntigravityRuntime {
             }
             conv.turn?.onUpdate(update)
           },
-          onPermission: (request) => this.answerPermission(conv, request),
+          onPermission: (request) => conv.tenantKey === tenantKey
+            ? this.answerPermission(conv, request)
+            : { outcome: 'cancelled' },
         },
         120_000,
       )
@@ -1086,6 +1094,24 @@ export class AntigravityRuntime {
     const turn = conv.turn as AcpTurn
     const sessionId = conv.sessionId as string
     let finishKind: string | undefined
+    let drained = false
+    const cancel = () => {
+      if (conv.turn === turn)
+        this.dropTurn(conv, 'The harness cancelled this request.')
+    }
+    // Pi 1.5.2 pi-agent-core/dist/agent-loop.js shares this signal with tool execution.
+    if (options.signal !== undefined) {
+      const signal = options.signal
+      turn.releaseSignal?.()
+      signal.addEventListener('abort', cancel, { once: true })
+      turn.releaseSignal = () => {
+        signal.removeEventListener('abort', cancel)
+      }
+      if (signal.aborted) cancel()
+    }
+    const signal = options.signal === undefined
+      ? turn.cancellation.signal
+      : AbortSignal.any([options.signal, turn.cancellation.signal])
     const recordTurn = (
       outcome: NonNullable<RuntimeStatus['lastTurn']>['outcome'],
     ) => {
@@ -1108,38 +1134,53 @@ export class AntigravityRuntime {
           maxContinuations: this.host.config.longDecodeContinuations,
           continuePrompt: () =>
             proc.prompt(sessionId, [{ type: 'text', text: CONTINUE_PROMPT }]),
-          cancel: () => proc.cancel(sessionId),
+          cancel: () => {
+            if (conv.turn === turn) proc.cancel(sessionId)
+          },
         },
-        options.signal,
+        signal,
       )) {
+        if (signal.aborted &&
+          !(chunk.type === 'finish' && chunk.reason.kind === 'aborted')) {
+          finishKind = 'aborted'
+          yield {
+            type: 'finish',
+            reason: {
+              kind: 'aborted',
+              failure: { message: 'Request aborted', code: 'ABORTED' },
+            },
+          }
+          break
+        }
         if (chunk.type === 'block-end' && chunk.block.type === 'tool-call')
           conv.issuedIds.add(chunk.block.id)
         if (chunk.type === 'finish') finishKind = chunk.reason.kind
         yield chunk
       }
+      drained = true
     } catch (error) {
-      recordTurn('error')
-      conv.reportedToolCalls.clear()
-      conv.turn = undefined
-      conv.dirty = true
+      finishKind = 'error'
       throw mapError(error)
+    } finally {
+      // Only a fully consumed tool handoff keeps the turn and its cancellation owner.
+      if (!(drained && finishKind === 'tool-calls' && !signal.aborted && conv.turn === turn)) {
+        recordTurn(
+          signal.aborted ? 'aborted'
+            : finishKind === 'error' || !drained ? 'error' : 'completed',
+        )
+        if (conv.turn === turn) {
+          if (!drained || finishKind === 'aborted' || finishKind === 'error')
+            this.dropTurn(conv, 'The harness ended this request.')
+          else {
+            turn.abandon('The turn completed.')
+            conv.reportedToolCalls.clear()
+            conv.turn = undefined
+          }
+        }
+        if (finishKind === 'aborted' || !drained)
+          await Promise.race([turn.promptSettled, delay(5_000)])
+      }
     }
-    if (finishKind === 'tool-calls') return
-    recordTurn(
-      finishKind === 'aborted'
-        ? 'aborted'
-        : finishKind === 'error'
-          ? 'error'
-          : 'completed',
-    )
-    if (finishKind === 'aborted') {
-      // A cancelled turn leaves partial agent-side history; rebuild from Pi history next time.
-      await Promise.race([turn.promptSettled, delay(5_000)])
-      conv.dirty = true
-    }
-    // The turn is over: clear the identities it established with it.
-    conv.reportedToolCalls.clear()
-    conv.turn = undefined
   }
 
   private async deliverResults(
@@ -1175,6 +1216,7 @@ export class AntigravityRuntime {
         pending.map((call) => results.get(call.id) as RequestMessage),
       )
       // The old turn is over: its reported identities do not carry into the continuation.
+      turn.abandon('The agent ended the tool-waiting prompt.')
       conv.reportedToolCalls.clear()
       conv.turn = new AcpTurn(randomBytes(6).toString('hex'))
       this.startPrompt(conv, proc, [
@@ -1230,13 +1272,19 @@ export class AntigravityRuntime {
     return { content: items, ...(isError ? { isError: true } : {}) }
   }
 
+  /** Release residual work for the Pi run that owns this session. */
+  settleSession(sessionId: string): void {
+    const conv = this.conversations.get(sessionId)
+    if (conv !== undefined) this.dropTurn(conv, 'The owning Pi run settled.')
+  }
+
   private dropTurn(conv: Conversation, reason: string): void {
     const turn = conv.turn
     if (turn === undefined) return
     if (!turn.finished && conv.sessionId !== undefined)
       conv.process?.cancel(conv.sessionId)
-    turn.abandon(reason)
     conv.turn = undefined
+    turn.abandon(reason)
     conv.dirty = true
     conv.reportedToolCalls.clear()
   }

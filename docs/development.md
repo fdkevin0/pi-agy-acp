@@ -44,9 +44,25 @@ pi -e ./index.ts
   bridge binding before closing the listener. Late session replies roll back
   instead of registering a conversation or tenant. ACP stop closes the JSON-RPC
   peer immediately so pending initialize/session requests reject without waiting
-  for child exit. Bridge HTTP draining is a separate concern (issue #3).
-  Cancelled turns wait for prompt settlement for up to five seconds,
-  then mark the conversation for rebuilding.
+  for child exit. Bridge shutdown destroys tracked sockets, including incomplete
+  requests and SSE connections.
+  A turn owns cancellation through streaming and parked tool execution. Only a
+  fully drained `tool-calls` handoff preserves it; early iterator closure, callback
+  failure, abort, or owning-run settlement abandons all tool waiters and marks
+  partial ACP history for rebuilding. Cancellation takes priority over buffered
+  output and batched tools. Streaming cleanup waits for prompt settlement for up
+  to five seconds; releasing a parked turn is immediate. Signal callbacks check
+  turn identity, and ACP callbacks check the session's tenant identity before
+  changing conversation state. Parked tools have no inactivity deadline.
+
+  Provenance: installed Pi **1.5.2** `pi-agent-core/dist/agent-loop.js` passes
+  the run signal to both `streamAssistantResponse` and `executeToolCalls`.
+  `pi-coding-agent/dist/core/agent-session.js::_emitAgentSettled` awaits extension
+  handlers after the run finishes; `core/extensions/types.d.ts::AgentSettledEvent`
+  guarantees no automatic retry, compaction, or queued continuation remains.
+  Its context exposes `sessionManager.getSessionId()`. The settlement hook uses
+  that ID regardless of selected provider, before quota gating. Tests use local
+  scripted ACP sessions and controlled queue boundaries, not live account traffic.
 - **Quota and TUI:** Settled checks share the reader's TTL and in-flight request
   without blocking Pi. Model selection reads memory only. UI generation checks
   discard stale background results; warning keys include bucket, reset time, and

@@ -135,6 +135,8 @@ export type TurnEvent =
 
 /** One running ACP prompt turn. */
 export class AcpTurn {
+  readonly cancellation = new AbortController()
+  releaseSignal: (() => void) | undefined
   readonly startedAt = performance.now()
   readonly events = new AsyncQueue<TurnEvent>()
   /** Calls handed to Pi whose results have not arrived yet. */
@@ -244,6 +246,9 @@ export class AcpTurn {
    * @param reason - message delivered to the agent.
    */
   abandon(reason: string): void {
+    this.releaseSignal?.()
+    this.releaseSignal = undefined
+    this.cancellation.abort()
     for (const call of this.calls.values()) {
       call.result.resolve({
         content: [{ type: 'text', text: reason }],
@@ -354,7 +359,7 @@ export async function* pumpStep(
 
   for (;;) {
     const ready = await turn.events.wait(signal)
-    if (!ready) {
+    if (!ready || signal?.aborted) {
       host.cancel()
       turn.abandon('The harness cancelled this request.')
       yield* close()
@@ -394,7 +399,9 @@ export async function* pumpStep(
           turn.events.shift()
           batch.push(next.call)
         }
+        if (signal?.aborted) continue
         for (const call of batch) {
+          if (signal?.aborted) break
           const blockIndex = index++
           turn.pendingCalls.set(call.id, call)
           yield {
@@ -420,6 +427,7 @@ export async function* pumpStep(
             },
           }
         }
+        if (signal?.aborted) continue
         turn.toolSteps++
         yield { type: 'finish', reason: { kind: 'tool-calls' } }
         return

@@ -127,6 +127,8 @@ export default function (pi: ExtensionAPI) {
     updateStatus(ctx, runtime.quota.peek(), false, event.model)
   })
   pi.on('agent_settled', (_event, ctx) => {
+    // Pi 1.5.2 AgentSession._emitAgentSettled runs after tools and the run finish.
+    runtime.settleSession(ctx.sessionManager.getSessionId())
     if (
       ctx.model?.provider !== config.provider ||
       checkingQuota ||

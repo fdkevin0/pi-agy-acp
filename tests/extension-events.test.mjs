@@ -58,6 +58,7 @@ function harness(t, onRegister = () => {}) {
     },
   })
   const ctx = {
+    sessionManager: { getSessionId: () => 'events-session' },
     hasUI: true,
     model: { provider, id: 'claude-opus-5-5' },
     ui: {
@@ -271,4 +272,12 @@ test('quota TTL throttles successes and failures, while force bypasses it', asyn
   assert.equal(reader.peek(), undefined)
   await reader.read(true)
   assert.equal(calls, 3)
+})
+
+test('agent settlement releases its session even after provider selection changes', (t) => {
+  const settle = t.mock.method(AntigravityRuntime.prototype, 'settleSession', () => {})
+  const h = harness(t)
+  h.ctx.model = { provider: 'other', id: 'other' }
+  h.handlers.get('agent_settled')({}, h.ctx)
+  assert.deepEqual(settle.mock.calls[0].arguments, ['events-session'])
 })

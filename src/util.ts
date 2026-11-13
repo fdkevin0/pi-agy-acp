@@ -90,8 +90,8 @@ export class AsyncQueue<T> {
    * @returns whether an item is available.
    */
   async wait(signal?: AbortSignal, timeoutMs?: number): Promise<boolean> {
-    if (this.items.length > 0) return true
     if (signal?.aborted === true) return false
+    if (this.items.length > 0) return true
     return new Promise<boolean>((resolve) => {
       let timer: ReturnType<typeof setTimeout> | undefined
       const finish = (value: boolean): void => {
