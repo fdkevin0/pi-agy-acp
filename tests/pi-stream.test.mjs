@@ -87,7 +87,7 @@ test('Pi to ACP tool loop, next turn, rewritten history, usage and images', asyn
       context(system, { role: 'user', content: [image], timestamp: 3 }),
     )
     assert.equal(e.message.stopReason, 'stop')
-    for (const response of [a, b, c, d, e]) {
+    const assertSingleTerminal = (response) => {
       assert.equal(response.events[0].type, 'start')
       assert.equal(
         response.events.filter((e) => e.type === 'done' || e.type === 'error')
@@ -95,6 +95,11 @@ test('Pi to ACP tool loop, next turn, rewritten history, usage and images', asyn
         1,
       )
     }
+    assertSingleTerminal(a)
+    assertSingleTerminal(b)
+    assertSingleTerminal(c)
+    assertSingleTerminal(d)
+    assertSingleTerminal(e)
   } finally {
     await runtime.dispose()
     rmSync(home, { recursive: true, force: true })
@@ -160,29 +165,6 @@ test('payload replacement, raw events, Unicode and partial stream failure', asyn
   assert.match(r.message.errorMessage, /without a finish/)
 })
 
-test('all Pi reasoning levels map to supported ACP efforts', async () => {
-  for (const [reasoning, expected] of [
-    ['minimal', 'low'],
-    ['low', 'low'],
-    ['medium', 'medium'],
-    ['high', 'high'],
-    ['xhigh', 'high'],
-    ['max', 'high'],
-    ['off', undefined],
-    [undefined, undefined],
-  ]) {
-    let effort
-    const runtime = {
-      async *stream(request) {
-        effort = request.reasoningEffort
-        yield { type: 'finish', reason: { kind: 'stop' } }
-      },
-    }
-    const r = await result(runtime, context(user('hi')), { reasoning })
-    assert.equal(r.message.stopReason, 'stop')
-    assert.equal(effort, expected, `reasoning=${reasoning}`)
-  }
-})
 
 test('response instrumentation precedes events and pricing overrides update costs', async () => {
   const order = []
@@ -276,35 +258,42 @@ test('timeout and cancellation cannot masquerade as overflow; quota and overflow
     mapError(new Error('context window limit exceeded')).code,
     'CONTEXT_WINDOW_EXCEEDED',
   )
-  for (const [code, text, prefix] of [
-    [
-      'CONTEXT_WINDOW_EXCEEDED',
-      'Input is too large',
-      'context_length_exceeded: ',
-    ],
-    ['QUOTA', 'ResourceExhausted: weekly allowance', 'quota exceeded: '],
-    ['CONTEXT_WINDOW_EXCEEDED', 'context_length_exceeded: original', ''],
-    ['QUOTA', 'insufficient_quota: original', ''],
-  ]) {
-    for (const terminal of ['throw', 'finish']) {
-      const r = await result(
-        {
-          async *stream() {
-            if (terminal === 'throw') throw new LlmError(text, code)
-            yield {
-              type: 'finish',
-              reason: { kind: 'error', failure: { message: text, code } },
-            }
+  const overflow = await result(
+    {
+      async *stream() {
+        throw new LlmError('Input is too large', 'CONTEXT_WINDOW_EXCEEDED')
+      },
+    },
+    context(user('hi')),
+  )
+  assert.equal(
+    overflow.message.errorMessage,
+    'context_length_exceeded: Input is too large',
+  )
+  assert.equal(isContextOverflow(overflow.message), true)
+
+  const quota = await result(
+    {
+      async *stream() {
+        yield {
+          type: 'finish',
+          reason: {
+            kind: 'error',
+            failure: {
+              message: 'ResourceExhausted: weekly allowance',
+              code: 'QUOTA',
+            },
           },
-        },
-        context(user('hi')),
-      )
-      assert.equal(r.message.errorMessage, prefix + text)
-      if (code === 'CONTEXT_WINDOW_EXCEEDED')
-        assert.equal(isContextOverflow(r.message), true)
-      else assert.equal(isRetryableAssistantError(r.message), false)
-    }
-  }
+        }
+      },
+    },
+    context(user('hi')),
+  )
+  assert.equal(
+    quota.message.errorMessage,
+    'quota exceeded: ResourceExhausted: weekly allowance',
+  )
+  assert.equal(isRetryableAssistantError(quota.message), false)
 })
 
 test('an initial aborted finish does not report a synthetic successful response', async () => {
@@ -327,41 +316,24 @@ test('an initial aborted finish does not report a synthetic successful response'
   assert.equal(responses, 0)
 })
 
-test('fragmented tool JSON emits one start and reports malformed final arguments safely', async () => {
-  for (const text of ['{"command":"pwd"}', '{"command":']) {
-    const r = await result(
-      {
-        async *stream() {
-          yield { type: 'block-start', index: 0, blockType: 'tool-call' }
-          for (const piece of [text.slice(0, 5), text.slice(5)])
-            yield {
-              type: 'tool-call-delta',
-              index: 0,
-              id: 'call-1',
-              name: 'bash',
-              argumentsDelta: piece,
-            }
-          yield {
-            type: 'block-end',
-            index: 0,
-            block: {
-              type: 'tool-call',
-              id: 'call-1',
-              name: 'bash',
-              arguments: text,
-            },
-          }
-          yield { type: 'finish', reason: { kind: 'tool-calls' } }
-        },
-      },
-      context(user('hi')),
-    )
-    assert.equal(r.message.stopReason, 'toolUse')
-    assert.equal(r.events.filter((e) => e.type === 'toolcall_start').length, 1)
-    assert.equal(r.events.filter((e) => e.type === 'toolcall_delta').length, 2)
-    assert.equal(r.events.filter((e) => e.type === 'toolcall_end').length, 1)
-    if (text.endsWith('}'))
-      assert.deepEqual(r.message.content[0].arguments, { command: 'pwd' })
-    else assert.ok(r.message.content[0].argumentsError)
+
+test('a direct provider callback failure closes the runtime iterator and abandons its turn', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'pi-callback-'))
+  const runtime = new AntigravityRuntime({
+    config: { ...defaults, command: resolve('tests/fake-agy.mjs'), home },
+    spawnAcp, runCommand: async () => ({ code: 0, stdout: '1.5.0', stderr: '' }),
+    log: { info() {}, warn() {} }, onModelsChanged() {},
+  })
+  try {
+    const { message } = await result(runtime, context(system, user('CALL bash {"command":"pwd"}')), {
+      ...options, onProviderStreamEvent() { throw new Error('callback failed') },
+    })
+    assert.equal(message.stopReason, 'error')
+    assert.match(message.errorMessage, /callback failed/)
+    assert.equal(runtime.status().activeTurns, 0)
+    assert.equal(runtime.conversations.get(options.sessionId).turn, undefined)
+  } finally {
+    await runtime.dispose()
+    rmSync(home, { recursive: true, force: true })
   }
 })

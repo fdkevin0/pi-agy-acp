@@ -38,7 +38,6 @@ const snapshot = (remaining = 0.1, resetTime = '2030-01-01T00:00:00Z') => ({
 
 function harness(t, onRegister = () => {}) {
   const home = mkdtempSync(join(tmpdir(), 'pi-events-'))
-  const previous = process.env.PI_AGY_HOME
   process.env.PI_AGY_HOME = home
   const handlers = new Map()
   const registrations = []
@@ -58,6 +57,7 @@ function harness(t, onRegister = () => {}) {
     },
   })
   const ctx = {
+    sessionManager: { getSessionId: () => 'events-session' },
     hasUI: true,
     model: { provider, id: 'claude-opus-5-5' },
     ui: {
@@ -72,8 +72,7 @@ function harness(t, onRegister = () => {}) {
   }
   t.after(async () => {
     await handlers.get('session_shutdown')({}, ctx)
-    if (previous === undefined) delete process.env.PI_AGY_HOME
-    else process.env.PI_AGY_HOME = previous
+    delete process.env.PI_AGY_HOME
     rmSync(home, { recursive: true, force: true })
   })
   return { handlers, registrations, command, ctx, statuses, notices }
@@ -189,18 +188,17 @@ test('settled checks are nonblocking, coalesced, and warn once per bucket reset 
   assert.equal(h.notices.length, 1)
   assert.equal(h.notices[0].level, 'warning')
   assert.match(h.notices[0].text, /Claude\/GPT/)
-  for (const [fraction, cycle, warnings] of [
-    [0.1, 'cycle-1', 2],
-    [0.1, 'cycle-1', 2],
-    [0.05, 'cycle-1', 3],
-    [0.04, 'cycle-1', 3],
-    [0.05, 'cycle-2', 4],
-  ]) {
+  const checkNotice = async (fraction, cycle, warnings) => {
     value = Promise.resolve(snapshot(fraction, cycle))
     settled({}, h.ctx)
     await tick()
     assert.equal(h.notices.length, warnings)
   }
+  await checkNotice(0.1, 'cycle-1', 2)
+  await checkNotice(0.1, 'cycle-1', 2)
+  await checkNotice(0.05, 'cycle-1', 3)
+  await checkNotice(0.04, 'cycle-1', 3)
+  await checkNotice(0.05, 'cycle-2', 4)
   h.ctx.model = { provider: 'other', id: 'other' }
   const calls = read.mock.callCount()
   settled({}, h.ctx)
@@ -211,23 +209,35 @@ test('late background results after model switches, reset, or shutdown cannot re
   let pending
   t.mock.method(QuotaReader.prototype, 'read', () => pending.promise)
   const h = harness(t)
-  for (const action of ['switch', 'reset', 'shutdown', 'error', 'reject']) {
-    pending = Promise.withResolvers()
-    h.handlers.get('agent_settled')({}, h.ctx)
-    if (action === 'switch')
-      h.handlers.get('model_select')({ model: { provider: 'other' } }, h.ctx)
-    if (action === 'reset') await h.command.handler('reset', h.ctx)
-    if (action === 'shutdown')
-      await h.handlers.get('session_shutdown')({}, h.ctx)
+  const expectNoUpdate = async (settle) => {
     const before = [h.statuses.length, h.notices.length]
-    if (action === 'reject') pending.reject(new Error('offline'))
-    else
-      pending.resolve(
-        action === 'error' ? { ...snapshot(), status: 'error' } : snapshot(),
-      )
+    settle()
     await tick()
     assert.deepEqual([h.statuses.length, h.notices.length], before)
   }
+
+  pending = Promise.withResolvers()
+  h.handlers.get('agent_settled')({}, h.ctx)
+  h.handlers.get('model_select')({ model: { provider: 'other' } }, h.ctx)
+  await expectNoUpdate(() => pending.resolve(snapshot()))
+
+  pending = Promise.withResolvers()
+  h.handlers.get('agent_settled')({}, h.ctx)
+  await h.command.handler('reset', h.ctx)
+  await expectNoUpdate(() => pending.resolve(snapshot()))
+
+  pending = Promise.withResolvers()
+  h.handlers.get('agent_settled')({}, h.ctx)
+  await h.handlers.get('session_shutdown')({}, h.ctx)
+  await expectNoUpdate(() => pending.resolve(snapshot()))
+
+  pending = Promise.withResolvers()
+  h.handlers.get('agent_settled')({}, h.ctx)
+  await expectNoUpdate(() => pending.resolve({ ...snapshot(), status: 'error' }))
+
+  pending = Promise.withResolvers()
+  h.handlers.get('agent_settled')({}, h.ctx)
+  await expectNoUpdate(() => pending.reject(new Error('offline')))
 })
 
 test('quota selection uses the active family and falls back to the lowest valid bucket', () => {
@@ -240,35 +250,35 @@ test('quota selection uses the active family and falls back to the lowest valid 
 })
 
 test('quota TTL throttles successes and failures, while force bypasses it', async (t) => {
-  let now = 1000,
-    calls = 0,
-    fail = false
+  let now = 1000
   t.mock.method(Date, 'now', () => now)
-  const reader = new QuotaReader(
-    () => 'fake',
-    async () => {
-      calls++
-      if (fail) throw new Error('offline')
-      return {
-        code: 0,
-        stderr: '',
-        stdout: JSON.stringify({ command: { data: { groups: [] } } }),
-      }
-    },
-    100,
-  )
+  const ok = async () => ({
+    code: 0,
+    stderr: '',
+    stdout: JSON.stringify({ command: { data: { groups: [] } } }),
+  })
+  const run = t.mock.fn(ok)
+  const reader = new QuotaReader(() => 'fake', run, 100)
   assert.equal(reader.peek(), undefined)
   await reader.read()
   assert.equal(reader.peek().status, 'ok')
   await reader.read()
-  assert.equal(calls, 1)
+  assert.equal(run.mock.callCount(), 1)
   now += 100
   assert.equal(reader.peek(), undefined)
-  fail = true
+  run.mock.mockImplementationOnce(async () => { throw new Error('offline') })
   assert.equal((await reader.read()).status, 'error')
   await reader.read()
-  assert.equal(calls, 2)
+  assert.equal(run.mock.callCount(), 2)
   assert.equal(reader.peek(), undefined)
   await reader.read(true)
-  assert.equal(calls, 3)
+  assert.equal(run.mock.callCount(), 3)
+})
+
+test('agent settlement releases its session even after provider selection changes', (t) => {
+  const settle = t.mock.method(AntigravityRuntime.prototype, 'settleSession', () => {})
+  const h = harness(t)
+  h.ctx.model = { provider: 'other', id: 'other' }
+  h.handlers.get('agent_settled')({}, h.ctx)
+  assert.deepEqual(settle.mock.calls[0].arguments, ['events-session'])
 })

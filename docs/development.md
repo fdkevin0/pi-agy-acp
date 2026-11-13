@@ -34,11 +34,16 @@ pi -e ./index.ts
 - **Session lifecycle:** The bridge binds to `127.0.0.1`, uses per-session bearer
   credentials, and validates structured tool identity before granting permissions.
   Tree navigation and compaction close conversation sessions and their files,
-  retaining the process, bridge, and caches. Pi 1.5.0 reports completed switches
-  through `session_start` (`new`, `resume`, or `fork`), which uses the same light
-  reset if the runtime survives. `session_shutdown` and `/agy-acp reset` dispose
-  the runtime. Cancelled turns wait for prompt settlement for up to five seconds,
-  then mark the conversation for rebuilding.
+  retaining the process, bridge, and caches. `session_start` (`new`, `resume`, or
+  `fork`) uses the same light reset if the runtime survives; `session_shutdown`
+  and `/agy-acp reset` dispose the runtime.
+  Disposal is idempotent, drains in-flight startup and bridge binding, cancels
+  waiters, and rolls back late session replies from obsolete processes or
+  conversations. A turn owns cancellation through streaming and parked tool
+  execution until its step drains, `agent_settled` runs, or the process exits;
+  only a fully drained `tool-calls` handoff preserves parked tool calls.
+  First interruption wins (`abandon` vs. `fail`), cancellation takes priority
+  over buffered output, and turn/tenant identities guard all async callbacks.
 - **Quota and TUI:** Settled checks share the reader's TTL and in-flight request
   without blocking Pi. Model selection reads memory only. UI generation checks
   discard stale background results; warning keys include bucket, reset time, and
@@ -54,6 +59,20 @@ pi -e ./index.ts
   ACP supplies no HTTP response metadata. Context overflow and exhausted quota
   receive `context_length_exceeded` and `quota exceeded` markers for Pi's
   compaction and retry decisions; transport timeouts remain distinct.
+
+## MCP HTTP boundary
+
+The loopback bridge returns 400 for invalid URLs and 413 for authenticated POST
+bodies exceeding 1 MiB (1,048,576 bytes), including chunked uploads. Rejected
+oversized uploads close their connection after the error response. JSON parse
+errors retain the MCP parse-error response. Unexpected handler failures return
+500 before headers or destroy an already-started response; listener errors go to
+the diagnostic sink.
+
+Node's HTTP parser enforces a 10-second header reception deadline and a 30-second
+whole-request reception deadline, checked every second. These are reception limits
+only and do not cap completed SSE tool streams. Shutdown stops accepting
+connections and destroys all tracked sockets without waiting for tool promises.
 
 ## Source layout
 

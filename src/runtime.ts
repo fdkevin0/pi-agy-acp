@@ -26,7 +26,7 @@ import {
   type AcpSpawner,
 } from './acp-process.ts'
 import { ModelCatalog, nearestEffort } from './catalog.ts'
-import { asEffort, type Config, type Effort } from './config.ts'
+import { asEffort, defaults, type Config, type Effort } from './config.ts'
 import {
   AcpTurn,
   AWAIT_TOOL,
@@ -81,11 +81,9 @@ import {
   type AccountInfo,
   type QuotaSnapshot,
 } from './quota.ts'
-import { delay, digest, KeyedMutex, abortable } from './util.ts'
+import { digest, KeyedMutex, abortable } from './util.ts'
 import { VERSION } from './version.ts'
 
-/** Parked calls answer with a still-running notice before Gemini cache TTL expiry and agy's 180-second MCP deadline. */
-export const DEFAULT_RELAY_AFTER_MS = 85_000
 const CONTINUE_PROMPT =
   'Continue exactly where your previous output stopped. Do not repeat any earlier text.'
 
@@ -185,7 +183,9 @@ export class AntigravityRuntime {
   private readonly capacityMutex = new KeyedMutex()
   private sweeper: ReturnType<typeof setInterval> | undefined
   private lastTurn: RuntimeStatus['lastTurn']
-  private disposed = false
+  private lifecycle: 'active' | 'disposing' | 'disposed' = 'active'
+  private readonly shutdown = new AbortController()
+  private disposal: Promise<void> | undefined
   private readonly host: RuntimeHost
 
   /** @param host - host services. */
@@ -279,6 +279,7 @@ export class AntigravityRuntime {
 
   /** Fetch quota and try once per runtime to discover an uncached plan. */
   async readQuota(force = false): Promise<QuotaSnapshot> {
+    this.assertActive()
     const quota = this.quota.read(force)
     if (!this.catalog.tier()) {
       this.tierDiscovery ??= (async () => {
@@ -309,17 +310,19 @@ export class AntigravityRuntime {
    * @returns the running process.
    */
   async ensureReady(): Promise<AcpProcess> {
-    if (this.disposed)
-      throw new LlmError('Antigravity provider was disposed', 'TRANSPORT')
+    this.assertActive()
     if (this.sweeper === undefined) {
       this.sweeper = setInterval(() => this.sweep(), 60_000)
       this.sweeper.unref?.()
     }
-    if (this.process?.alive === true) return this.process
+    if (this.starting === undefined && this.process?.alive === true)
+      return this.process
     this.starting ??= this.start().finally(() => {
       this.starting = undefined
     })
-    return this.starting
+    const proc = await this.starting
+    this.assertOwner(proc)
+    return proc
   }
 
   /**
@@ -329,12 +332,14 @@ export class AntigravityRuntime {
   async warmup(
     options: { force?: boolean; signal?: AbortSignal } = {},
   ): Promise<void> {
+    this.assertActive()
     options.signal?.throwIfAborted()
     if (this.warmupPromise !== undefined)
       return abortable(this.warmupPromise, options.signal)
     if (!options.force && this.catalog.observed) return
     this.warmupPromise = (async () => {
       const proc = await this.ensureReady()
+      this.assertOwner(proc)
       const result = await proc.newSession(
         {
           cwd: this.preflight?.workspace ?? this.home,
@@ -344,6 +349,7 @@ export class AntigravityRuntime {
         120_000,
       )
       try {
+        this.assertOwner(proc)
         if (
           this.catalog.observe(
             result.configOptions,
@@ -353,11 +359,7 @@ export class AntigravityRuntime {
         )
           this.host.onModelsChanged()
       } finally {
-        try {
-          await proc.closeSession(result.sessionId)
-        } finally {
-          removeSessionArtifacts(this.home, result.sessionId)
-        }
+        await this.closeAndCleanSession(proc, result.sessionId)
       }
     })().finally(() => {
       this.warmupPromise = undefined
@@ -367,12 +369,13 @@ export class AntigravityRuntime {
 
   /** Close conversation sessions while retaining the process and discovery/quota caches. */
   async resetConversations(): Promise<void> {
+    this.assertActive()
     const conversations = [...this.conversations.values()]
     for (const conv of conversations)
       this.dropTurn(conv, 'The Pi session changed.')
     await Promise.all(
       conversations.map(async (conv) => {
-        const release = await this.mutex.acquire(conv.key)
+        const release = await this.mutex.acquire(conv.key, this.shutdown.signal)
         try {
           if (this.conversations.get(conv.key) !== conv) return
           await this.resetSession(conv)
@@ -385,16 +388,50 @@ export class AntigravityRuntime {
   }
 
   /** Stop every session, the process, and the bridge. */
-  async dispose(): Promise<void> {
-    this.disposed = true
+  dispose(): Promise<void> {
+    if (this.disposal !== undefined) return this.disposal
+    this.lifecycle = 'disposing'
+    this.shutdown.abort(
+      new LlmError('Antigravity provider was disposed', 'TRANSPORT'),
+    )
     if (this.sweeper !== undefined) clearInterval(this.sweeper)
-    for (const conv of this.conversations.values())
+    this.sweeper = undefined
+    for (const conv of this.conversations.values()) {
       conv.turn?.abandon('The harness provider was unloaded.')
+      this.clearSession(conv)
+    }
     this.conversations.clear()
     this.tenants.clear()
     this.process?.stop()
     this.process = undefined
-    await this.bridge.close()
+    this.disposal = (async () => {
+      // Preflight waits are cancellable; binding must finish before closing its listener.
+      await this.starting?.catch(() => undefined)
+      await this.warmupPromise?.catch(() => undefined)
+      await this.bridge.close()
+      this.state = 'idle'
+      this.lifecycle = 'disposed'
+    })()
+    return this.disposal
+  }
+
+  private assertActive(): void {
+    if (this.lifecycle !== 'active') throw this.shutdown.signal.reason
+  }
+
+  /** A captured owner remains usable only while every enclosing owner is current. */
+  private owns(proc: AcpProcess, conv?: Conversation, sessionId?: string): boolean {
+    return this.lifecycle === 'active' && this.process === proc && proc.alive &&
+      (conv === undefined || (
+        this.conversations.get(conv.key) === conv &&
+        (sessionId === undefined || (conv.process === proc && conv.sessionId === sessionId))
+      ))
+  }
+
+  private assertOwner(proc: AcpProcess, conv?: Conversation, sessionId?: string): void {
+    this.assertActive()
+    if (!this.owns(proc, conv, sessionId))
+      throw new LlmError('Conversation ownership changed', 'TRANSPORT')
   }
 
   /**
@@ -404,6 +441,7 @@ export class AntigravityRuntime {
    */
   async *stream(options: GenerateOptions): AsyncGenerator<StreamChunk> {
     if (options.signal?.aborted === true) {
+      if (options.sessionId !== undefined) this.settleSession(options.sessionId)
       yield {
         type: 'finish',
         reason: {
@@ -414,12 +452,13 @@ export class AntigravityRuntime {
       return
     }
     const proc = await this.ensureReady()
-    const scope = options.sessionId ?? `anon-${randomBytes(6).toString('hex')}`
-    const key = scope
-    const release = await this.mutex.acquire(key)
+    const key = options.sessionId ?? `anon-${randomBytes(6).toString('hex')}`
+    const release = await this.mutex.acquire(key, this.shutdown.signal)
     let conv: Conversation | undefined
     try {
+      this.assertActive()
       conv = await this.acquireConversation(key)
+      this.assertOwner(proc, conv)
       conv.lastUsed = Date.now()
       const split = splitSystem(options)
       const tools = toBridgeTools(options.tools)
@@ -429,6 +468,17 @@ export class AntigravityRuntime {
         asEffort(options.reasoningEffort) ?? this.host.config.defaultEffort,
       )
 
+      if (options.signal?.aborted) {
+        this.dropTurn(conv, 'The harness cancelled this request.')
+        yield {
+          type: 'finish',
+          reason: {
+            kind: 'aborted',
+            failure: { message: 'Request aborted', code: 'ABORTED' },
+          },
+        }
+        return
+      }
       if (conv.turn !== undefined && conv.turn.pendingCalls.size > 0) {
         // Resuming a parked turn is only valid while the request still starts
         // with the exact history this ACP session already owns. A compaction
@@ -442,15 +492,17 @@ export class AntigravityRuntime {
             'The conversation history was compacted or rewritten; rebuilding the session from the harness history.',
           )
         } else {
-          const resumed = await this.deliverResults(
+          // Tool waiters can abort in their result microtask; hand off the exact turn synchronously.
+          const resumed = this.deliverResults(
             conv,
             split.messages,
             proc,
             tools,
           )
-          if (resumed) {
+          this.assertActive()
+          if (resumed !== undefined) {
             conv.knownIds = messageIds(split.messages)
-            yield* this.pump(conv, proc, options, effort)
+            yield* this.pump(conv, resumed, proc, options, effort)
             return
           }
           this.dropTurn(
@@ -464,11 +516,14 @@ export class AntigravityRuntime {
 
       const plan = this.plan(conv, split.system, split.messages)
       if (plan.rebuild) await this.resetSession(conv)
+      this.assertOwner(proc, conv)
       if (conv.sessionId === undefined) {
         conv.systemHash = digest(split.system)
         await this.openSession(conv, split.system, tools, proc)
       }
+      this.assertOwner(proc, conv, conv.sessionId)
       await this.select(conv, proc, options.model, effort)
+      this.assertOwner(proc, conv, conv.sessionId)
       let blocks: AcpPromptBlock[]
       if (plan.rebuild) {
         blocks = replayPrompt(plan.history, plan.input)
@@ -478,18 +533,32 @@ export class AntigravityRuntime {
         if (toolDelta.length > 0)
           blocks.unshift({ type: 'text', text: `${toolDelta}\n\n` })
       }
+      if (options.signal?.aborted) {
+        this.dropTurn(conv, 'The harness cancelled this request.')
+        yield {
+          type: 'finish',
+          reason: {
+            kind: 'aborted',
+            failure: { message: 'Request aborted', code: 'ABORTED' },
+          },
+        }
+        return
+      }
       conv.knownIds = messageIds(split.messages)
       // A new turn starts with an empty reported-identity space: ids from past
       // turns must never back a fresh permission request.
       conv.reportedToolCalls.clear()
-      conv.turn = new AcpTurn(randomBytes(6).toString('hex'))
-      this.startPrompt(conv, proc, blocks)
-      yield* this.pump(conv, proc, options, effort)
+      const turn = conv.turn = new AcpTurn(randomBytes(6).toString('hex'))
+      this.startPrompt(conv, turn, proc, blocks)
+      yield* this.pump(conv, turn, proc, options, effort)
     } finally {
-      release()
-      if (conv !== undefined) {
-        conv.opening = false
-        await this.afterStep(conv)
+      try {
+        if (conv !== undefined) {
+          conv.opening = false
+          await this.afterStep(conv)
+        }
+      } finally {
+        release()
       }
     }
   }
@@ -502,13 +571,18 @@ export class AntigravityRuntime {
    * deadlock.
    */
   private async acquireConversation(key: string): Promise<Conversation> {
+    this.assertActive()
     const existing = this.conversations.get(key)
     if (existing !== undefined) {
       existing.opening = true
       return existing
     }
-    const unlock = await this.capacityMutex.acquire('capacity')
+    const unlock = await this.capacityMutex.acquire(
+      'capacity',
+      this.shutdown.signal,
+    )
     try {
+      this.assertActive()
       const again = this.conversations.get(key)
       if (again !== undefined) {
         again.opening = true
@@ -523,6 +597,7 @@ export class AntigravityRuntime {
           const victim = idle.shift() as Conversation
           this.conversations.delete(victim.key)
           await this.resetSession(victim)
+          this.assertActive()
         }
       }
       if (this.conversations.size >= max) {
@@ -570,8 +645,10 @@ export class AntigravityRuntime {
     this.state = 'starting'
     let proc: AcpProcess | undefined
     try {
-      const preflight = await this.runPreflight()
+      const preflight = await abortable(this.runPreflight(), this.shutdown.signal)
+      this.assertActive()
       await this.bridge.start()
+      this.assertActive()
       const argv = [
         preflight.binary,
         'acp',
@@ -594,16 +671,20 @@ export class AntigravityRuntime {
         clientVersion: VERSION,
         log: (message) => this.host.log.warn(message),
       })
+      this.process = proc
       const started = proc
       proc.onExit((error) => this.onProcessExit(started, error))
       await proc.start(120_000)
-      this.process = proc
+      this.assertOwner(proc)
       this.state = 'ready'
       this.lastError = undefined
       return proc
     } catch (error) {
       proc?.stop()
+      if (this.process === proc) this.process = undefined
+      if (this.lifecycle !== 'active') throw this.shutdown.signal.reason
       await this.bridge.close()
+      this.assertActive()
       if (this.sweeper !== undefined) clearInterval(this.sweeper)
       this.sweeper = undefined
       this.state = 'error'
@@ -621,6 +702,7 @@ export class AntigravityRuntime {
       const config = this.host.config
       const binary = resolveAgyBinary(config.command)
       const version = await readVersion(binary, this.host.runCommand)
+      this.assertActive()
       assertSupportedAgyVersion(version, binary)
       const workspace = prepareHome(this.home)
       const result: PreflightResult = {
@@ -639,21 +721,20 @@ export class AntigravityRuntime {
   }
 
   private onProcessExit(proc: AcpProcess, error: Error): void {
-    if (this.process === proc) this.process = undefined
-    if (!this.disposed) {
+    const current = this.process === proc
+    if (current) this.process = undefined
+    if (current && this.lifecycle === 'active') {
       this.state = 'error'
       this.lastError = error.message
       this.host.log.warn(`antigravity-acp: ${error.message}`)
     }
     for (const conv of this.conversations.values()) {
       if (conv.process !== proc) continue
-      conv.turn?.events.push({
-        kind: 'error',
-        error: new LlmError(
-          `Antigravity ACP process exited: ${error.message}`,
-          'TRANSPORT',
-        ),
-      })
+      conv.turn?.fail(new LlmError(
+        `Antigravity ACP process exited: ${error.message}`,
+        'TRANSPORT',
+      ))
+      conv.turn = undefined
       this.clearSession(conv)
       conv.dirty = true
     }
@@ -665,6 +746,7 @@ export class AntigravityRuntime {
     tools: readonly BridgeTool[],
     proc: AcpProcess,
   ): Promise<void> {
+    this.assertOwner(proc, conv)
     syncOAuthToken(this.home)
     conv.reportedToolCalls.clear()
     conv.advertisedTools = [...tools]
@@ -697,6 +779,10 @@ export class AntigravityRuntime {
         {
           onUpdate: (update) => {
             if (
+              !this.owns(proc, conv) ||
+              conv.tenantKey !== tenantKey
+            ) return
+            if (
               update.sessionUpdate === 'config_option_update' &&
               Array.isArray(update.configOptions)
             ) {
@@ -711,10 +797,18 @@ export class AntigravityRuntime {
             }
             conv.turn?.onUpdate(update)
           },
-          onPermission: (request) => this.answerPermission(conv, request),
+          onPermission: (request) => this.owns(proc, conv) && conv.tenantKey === tenantKey
+            ? this.answerPermission(conv, request)
+            : { outcome: 'cancelled' },
         },
         120_000,
       )
+      // A buffered session/new reply can resolve after its process has exited.
+      if (!this.owns(proc, conv)) {
+        await this.closeAndCleanSession(proc, result.sessionId)
+        this.assertActive()
+        throw new LlmError('Conversation ownership changed', 'TRANSPORT')
+      }
       conv.sessionId = result.sessionId
       conv.process = proc
       conv.configOptions = result.configOptions ?? []
@@ -832,15 +926,12 @@ export class AntigravityRuntime {
       return reject('tool name conflict')
     if (reported.serverName !== MCP_SERVER_NAME)
       return reject(`unknown MCP server ${reported.serverName ?? '(none)'}`)
-    const allowedTools = new Set([
-      ...conv.advertisedToolNames,
-      AWAIT_TOOL_NAME,
-      CALL_TOOL_NAME,
-    ])
-    if (
-      reported.toolName === undefined ||
-      !allowedTools.has(reported.toolName)
-    ) {
+    const isAllowedTool =
+      reported.toolName !== undefined &&
+      (conv.advertisedToolNames.has(reported.toolName) ||
+        reported.toolName === AWAIT_TOOL_NAME ||
+        reported.toolName === CALL_TOOL_NAME)
+    if (!isAllowedTool) {
       return reject(
         `tool is not offered to this session: ${reported.toolName ?? '(none)'}`,
       )
@@ -855,6 +946,7 @@ export class AntigravityRuntime {
     effort: Effort,
   ): Promise<void> {
     const sessionId = conv.sessionId as string
+    this.assertOwner(proc, conv, sessionId)
     const modelOption = conv.configOptions.find(
       (o) => o.id === 'model' || o.category === 'model',
     )
@@ -868,11 +960,13 @@ export class AntigravityRuntime {
       )
     }
     if (conv.model !== model && modelOption?.currentValue !== model) {
-      conv.configOptions = await proc
-        .setConfigOption(sessionId, modelOption?.id ?? 'model', model)
-        .catch((error: unknown) => {
-          throw mapError(error)
-        })
+      await this.applyConfigOption(
+        conv,
+        proc,
+        sessionId,
+        modelOption?.id ?? 'model',
+        model,
+      )
     }
     conv.model = model
     const levelOption = conv.configOptions.find(
@@ -887,13 +981,25 @@ export class AntigravityRuntime {
       conv.effort !== effort &&
       levelOption.currentValue !== effort
     ) {
-      conv.configOptions = await proc
-        .setConfigOption(sessionId, levelOption.id, effort)
-        .catch((error: unknown) => {
-          throw mapError(error)
-        })
+      await this.applyConfigOption(conv, proc, sessionId, levelOption.id, effort)
     }
     conv.effort = effort
+  }
+
+  private async applyConfigOption(
+    conv: Conversation,
+    proc: AcpProcess,
+    sessionId: string,
+    optionId: string,
+    value: string,
+  ): Promise<void> {
+    const configOptions = await proc
+      .setConfigOption(sessionId, optionId, value)
+      .catch((error: unknown) => {
+        throw mapError(error)
+      })
+    this.assertOwner(proc, conv, sessionId)
+    conv.configOptions = configOptions
   }
 
   private plan(
@@ -972,13 +1078,21 @@ export class AntigravityRuntime {
     return false
   }
 
+  private async closeAndCleanSession(
+    proc: AcpProcess,
+    sessionId: string,
+  ): Promise<void> {
+    try {
+      await proc.closeSession(sessionId)
+    } finally {
+      removeSessionArtifacts(this.home, sessionId)
+    }
+  }
+
   private async resetSession(conv: Conversation): Promise<void> {
     let closing: Promise<void> | undefined
     if (conv.sessionId !== undefined && conv.process !== undefined) {
-      const sessionId = conv.sessionId
-      closing = conv.process
-        .closeSession(sessionId)
-        .finally(() => removeSessionArtifacts(this.home, sessionId))
+      closing = this.closeAndCleanSession(conv.process, conv.sessionId)
     }
     this.clearSession(conv)
     conv.knownIds = undefined
@@ -1000,26 +1114,51 @@ export class AntigravityRuntime {
 
   private startPrompt(
     conv: Conversation,
+    turn: AcpTurn,
     proc: AcpProcess,
     blocks: AcpPromptBlock[],
   ): void {
-    const turn = conv.turn as AcpTurn
-    turn.promptSettled = proc.prompt(conv.sessionId as string, blocks).then(
-      (result) => turn.events.push({ kind: 'done', result }),
-      (error: unknown) =>
-        turn.events.push({ kind: 'error', error: mapError(error) }),
-    )
+    // AcpProcess.prompt's link() can throw before returning a promise (buffered reply + exit).
+    // Queue that failure too, so every allocated turn reaches the pump's cleanup owner.
+    try {
+      this.assertOwner(proc, conv, conv.sessionId)
+      turn.promptSettled = proc.prompt(conv.sessionId as string, blocks).then(
+        (result) => turn.events.push({ kind: 'done', result }),
+        (error: unknown) => turn.fail(mapError(error)),
+      )
+    } catch (error) {
+      turn.fail(mapError(error))
+    }
   }
 
   private async *pump(
     conv: Conversation,
+    turn: AcpTurn,
     proc: AcpProcess,
     options: GenerateOptions,
     effort: Effort,
   ): AsyncGenerator<StreamChunk> {
-    const turn = conv.turn as AcpTurn
     const sessionId = conv.sessionId as string
     let finishKind: string | undefined
+    let drained = false
+    const cancel = () => {
+      if (conv.turn === turn)
+        this.dropTurn(conv, 'The harness cancelled this request.')
+    }
+    // Pi 1.5.2 pi-agent-core/dist/agent-loop.js shares this signal with tool execution.
+    turn.releaseSignal?.()
+    turn.releaseSignal = undefined
+    if (options.signal !== undefined) {
+      const signal = options.signal
+      signal.addEventListener('abort', cancel, { once: true })
+      turn.releaseSignal = () => {
+        signal.removeEventListener('abort', cancel)
+      }
+      if (signal.aborted) cancel()
+    }
+    const signal = options.signal === undefined
+      ? turn.cancellation.signal
+      : AbortSignal.any([options.signal, turn.cancellation.signal])
     const recordTurn = (
       outcome: NonNullable<RuntimeStatus['lastTurn']>['outcome'],
     ) => {
@@ -1035,53 +1174,76 @@ export class AntigravityRuntime {
       }
     }
     try {
-      for await (const chunk of pumpStep(
+      for await (const emitted of pumpStep(
         turn,
         {
           parkSettleMs: this.host.config.parkSettleMs,
           maxContinuations: this.host.config.longDecodeContinuations,
           continuePrompt: () =>
             proc.prompt(sessionId, [{ type: 'text', text: CONTINUE_PROMPT }]),
-          cancel: () => proc.cancel(sessionId),
+          cancel: () => {
+            if (conv.turn === turn) proc.cancel(sessionId)
+          },
         },
-        options.signal,
+        signal,
       )) {
+        // for-await adds a microtask boundary after pumpStep's own emission guard.
+        const chunk = turn.guard(emitted, signal) as StreamChunk
         if (chunk.type === 'block-end' && chunk.block.type === 'tool-call')
           conv.issuedIds.add(chunk.block.id)
         if (chunk.type === 'finish') finishKind = chunk.reason.kind
         yield chunk
+        if (chunk.type === 'finish' && chunk.reason.kind === 'aborted') break
       }
+      const interrupted = turn.guard(undefined, signal)
+      if (interrupted !== undefined && finishKind !== 'aborted') {
+        finishKind = 'aborted'
+        yield interrupted
+      }
+      drained = true
     } catch (error) {
-      recordTurn('error')
-      conv.reportedToolCalls.clear()
-      conv.turn = undefined
-      conv.dirty = true
+      finishKind = 'error'
       throw mapError(error)
+    } finally {
+      // Only a fully consumed tool handoff keeps the turn and its cancellation owner.
+      if (!(drained && finishKind === 'tool-calls' && !signal.aborted && conv.turn === turn)) {
+        recordTurn(
+          finishKind === 'error' ? 'error' : signal.aborted ? 'aborted'
+            : !drained ? 'error' : 'completed',
+        )
+        if (conv.turn === turn) {
+          if (!drained || finishKind === 'aborted' || finishKind === 'error')
+            this.dropTurn(conv, 'The harness ended this request.')
+          else {
+            turn.abandon('The turn completed.')
+            conv.reportedToolCalls.clear()
+            conv.turn = undefined
+          }
+        }
+        if (finishKind === 'aborted' || !drained) {
+          let timer: ReturnType<typeof setTimeout> | undefined
+          try {
+            await Promise.race([
+              turn.promptSettled,
+              new Promise<void>((resolve) => {
+                timer = setTimeout(resolve, 5_000)
+              }),
+            ])
+          } finally {
+            clearTimeout(timer)
+          }
+        }
+      }
     }
-    if (finishKind === 'tool-calls') return
-    recordTurn(
-      finishKind === 'aborted'
-        ? 'aborted'
-        : finishKind === 'error'
-          ? 'error'
-          : 'completed',
-    )
-    if (finishKind === 'aborted') {
-      // A cancelled turn leaves partial agent-side history; rebuild from Pi history next time.
-      await Promise.race([turn.promptSettled, delay(5_000)])
-      conv.dirty = true
-    }
-    // The turn is over: clear the identities it established with it.
-    conv.reportedToolCalls.clear()
-    conv.turn = undefined
   }
 
-  private async deliverResults(
+  private deliverResults(
     conv: Conversation,
     messages: readonly RequestMessage[],
     proc: AcpProcess,
     tools: readonly BridgeTool[],
-  ): Promise<boolean> {
+  ): AcpTurn | undefined {
+    this.assertOwner(proc, conv, conv.sessionId)
     const turn = conv.turn as AcpTurn
     const results = new Map<string, Extract<RequestMessage, { role: 'tool' }>>()
     let last = -1
@@ -1094,10 +1256,10 @@ export class AntigravityRuntime {
         last = Math.max(last, index)
       }
     })
-    if (results.size !== turn.pendingCalls.size) return false
+    if (results.size !== turn.pendingCalls.size) return undefined
     const extras = messages.slice(last + 1)
     if (extras.some((m) => m.role === 'assistant' || m.role === 'tool'))
-      return false
+      return undefined
     const extraText = extras.length > 0 ? renderTranscript(extras) : ''
     const toolDelta = consumeToolDelta(conv, tools)
     const suffix = [toolDelta, extraText].filter(Boolean).join('\n\n')
@@ -1109,15 +1271,16 @@ export class AntigravityRuntime {
         pending.map((call) => results.get(call.id) as RequestMessage),
       )
       // The old turn is over: its reported identities do not carry into the continuation.
+      turn.abandon('The agent ended the tool-waiting prompt.')
       conv.reportedToolCalls.clear()
-      conv.turn = new AcpTurn(randomBytes(6).toString('hex'))
-      this.startPrompt(conv, proc, [
+      const next = conv.turn = new AcpTurn(randomBytes(6).toString('hex'))
+      this.startPrompt(conv, next, proc, [
         {
           type: 'text',
           text: `${transcript}${suffix ? `\n\n${suffix}` : ''}\n\nContinue the task with these tool results.`,
         },
       ])
-      return true
+      return next
     }
     for (const [index, call] of pending.entries()) {
       const message = results.get(call.id) as Extract<
@@ -1132,7 +1295,7 @@ export class AntigravityRuntime {
         result.content.push({ type: 'text', text: `\n\n${suffix}` })
       call.result.resolve(result)
     }
-    return true
+    return turn
   }
 
   private isTurnLive(turn: AcpTurn): boolean {
@@ -1164,13 +1327,19 @@ export class AntigravityRuntime {
     return { content: items, ...(isError ? { isError: true } : {}) }
   }
 
+  /** Release residual work for the Pi run that owns this session. */
+  settleSession(sessionId: string): void {
+    const conv = this.conversations.get(sessionId)
+    if (conv !== undefined) this.dropTurn(conv, 'The owning Pi run settled.')
+  }
+
   private dropTurn(conv: Conversation, reason: string): void {
     const turn = conv.turn
     if (turn === undefined) return
     if (!turn.finished && conv.sessionId !== undefined)
       conv.process?.cancel(conv.sessionId)
-    turn.abandon(reason)
     conv.turn = undefined
+    turn.abandon(reason)
     conv.dirty = true
     conv.reportedToolCalls.clear()
   }
@@ -1268,16 +1437,17 @@ export class AntigravityRuntime {
     const relayAfterMs =
       this.host.relayAfterMs ??
       this.host.config.relayAfterMs ??
-      DEFAULT_RELAY_AFTER_MS
+      defaults.relayAfterMs
     const relay = new Promise<'relay'>((resolve) => {
       timer = setTimeout(() => resolve('relay'), relayAfterMs)
     })
+    let onAbort: (() => void) | undefined
     const aborted = new Promise<'aborted'>((resolve) => {
       if (signal.aborted) resolve('aborted')
-      else
-        signal.addEventListener('abort', () => resolve('aborted'), {
-          once: true,
-        })
+      else {
+        onAbort = () => resolve('aborted')
+        signal.addEventListener('abort', onAbort, { once: true })
+      }
     })
     try {
       const outcome = await Promise.race([call.result.promise, relay, aborted])
@@ -1290,6 +1460,7 @@ export class AntigravityRuntime {
       return outcome
     } finally {
       if (timer !== undefined) clearTimeout(timer)
+      if (onAbort !== undefined) signal.removeEventListener('abort', onAbort)
     }
   }
 
@@ -1298,7 +1469,11 @@ export class AntigravityRuntime {
     const now = Date.now()
     for (const conv of [...this.conversations.values()]) {
       if (this.isIdle(conv) && now - conv.lastUsed > ttl) {
-        void this.resetSession(conv)
+        void this.resetSession(conv).catch((error: unknown) => {
+          this.host.log.warn(
+            `session sweep cleanup failed: ${error instanceof Error ? error.message : String(error)}`,
+          )
+        })
         this.conversations.delete(conv.key)
       }
     }

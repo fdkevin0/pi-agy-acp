@@ -90,8 +90,8 @@ export class AsyncQueue<T> {
    * @returns whether an item is available.
    */
   async wait(signal?: AbortSignal, timeoutMs?: number): Promise<boolean> {
-    if (this.items.length > 0) return true
     if (signal?.aborted === true) return false
+    if (this.items.length > 0) return true
     return new Promise<boolean>((resolve) => {
       let timer: ReturnType<typeof setTimeout> | undefined
       const finish = (value: boolean): void => {
@@ -117,9 +117,10 @@ export class KeyedMutex {
   /**
    * Acquire the lock for one key.
    * @param key - lock key.
+   * @param signal - cancels waiting without bypassing earlier lock holders.
    * @returns the release function.
    */
-  async acquire(key: string): Promise<() => void> {
+  async acquire(key: string, signal?: AbortSignal): Promise<() => void> {
     const previous = this.tails.get(key) ?? Promise.resolve()
     let release!: () => void
     const current = new Promise<void>((resolve) => {
@@ -127,10 +128,16 @@ export class KeyedMutex {
     })
     const tail = previous.then(() => current)
     this.tails.set(key, tail)
-    await previous
-    return () => {
-      release()
+    void tail.then(() => {
       if (this.tails.get(key) === tail) this.tails.delete(key)
+    })
+    try {
+      await abortable(previous, signal)
+      signal?.throwIfAborted()
+      return release
+    } catch (error) {
+      release()
+      throw error
     }
   }
 }
