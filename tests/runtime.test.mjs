@@ -21,6 +21,7 @@ import {
 } from '../src/mcp-bridge.ts'
 import { defaults } from '../src/config.ts'
 import { VERSION } from '../src/version.ts'
+import { AcpProcess } from '../src/acp-process.ts'
 import { AcpTurn, toTokenUsage } from '../src/conversation.ts'
 import { deferred } from '../src/util.ts'
 import {
@@ -2047,19 +2048,126 @@ test('dispose stops a child blocked in the ACP initialize RPC', async () => {
     stdin: new Writable({ write(_data, _encoding, done) { entered.resolve(); done() } }),
     stdout: new PassThrough(),
     exited: exited.promise,
-    terminate: () => { terminated++; exited.resolve({ code: 0, signal: null }) },
+    terminate: () => { terminated++ },
     stderrTail: () => '',
   }) } })
   const startup = assert.rejects(runtime.ensureReady(), /disposed/)
   await entered.promise
   const initializing = runtime.process
   assert.ok(initializing)
-  await runtime.dispose()
-  await startup
-  assert.ok(terminated >= 1)
-  assert.equal(initializing.alive, false)
-  assert.equal(runtime.process, undefined)
-  assert.equal(runtime.bridge.server, undefined)
+  let deadline
+  try {
+    await Promise.race([
+      Promise.all([runtime.dispose(), startup]),
+      new Promise((_, reject) => {
+        deadline = setTimeout(() => reject(new Error('Disposal waited for child exit')), 1_500)
+      }),
+    ])
+    assert.equal(exited.settled, false)
+    assert.equal(initializing.peer.pending.size, 0)
+    assert.equal(initializing.listeners.size, 0)
+    assert.ok(terminated >= 1)
+    assert.equal(initializing.alive, false)
+    assert.equal(runtime.process, undefined)
+    assert.equal(runtime.bridge.server, undefined)
+  } finally {
+    clearTimeout(deadline)
+    exited.resolve({ code: 0, signal: null })
+    await runtime.dispose()
+  }
+})
+
+test('a buffered session/new reply cannot register a listener after stop', async () => {
+  const { PassThrough, Writable } = await import('node:stream')
+  const stdout = new PassThrough()
+  const exited = deferred()
+  const proc = new AcpProcess({ argv: [], cwd: tmpdir(), clientName: 'test', clientVersion: '1',
+    spawn: () => ({ stdout, exited: exited.promise, terminate() {}, stderrTail: () => '',
+      stdin: new Writable({ write(data, _encoding, done) {
+        const request = JSON.parse(data)
+        const result = request.method === 'session/new' ? { sessionId: 'buffered' } : {}
+        stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result }) + '\n')
+        if (request.method === 'session/new') proc.stop()
+        done()
+      } }),
+    }),
+  })
+  try {
+    await proc.start(1_500)
+    assert.deepEqual(await proc.newSession({}, { onUpdate() {} }, 1_500), { sessionId: 'buffered' })
+    assert.equal(proc.alive, false)
+    assert.equal(proc.listeners.size, 0)
+    assert.equal(proc.peer.pending.size, 0)
+  } finally {
+    proc.stop()
+    exited.resolve({ code: 0, signal: null })
+  }
+})
+
+test('session installation rejects process loss around a buffered reply', async (t) => {
+  const { PassThrough, Writable } = await import('node:stream')
+  for (const ordering of ['exit-first', 'reply-first']) {
+    await t.test(ordering, async () => {
+      let spawns = 0
+      const { runtime, home } = makeRuntime({ host: { spawnAcp: () => {
+        const generation = ++spawns
+        const stdout = new PassThrough(), exited = deferred()
+        return { stdout, exited: exited.promise, stderrTail: () => '',
+          terminate: () => exited.resolve({ code: 0, signal: null }),
+          stdin: new Writable({ write(data, _encoding, done) {
+            const request = JSON.parse(data)
+            let result = {}
+            if (request.method === 'session/new') {
+              result = { sessionId: `late-${generation}`, configOptions: [],
+                models: { availableModels: [{ modelId: 'obsolete-model', name: 'Obsolete' }] },
+                _meta: { antigravity: { tier: { name: 'Obsolete' } } } }
+              mkdirSync(join(home, 'agy', 'conversations'), { recursive: true })
+              writeFileSync(join(home, 'agy', 'conversations', `late-${generation}.db`), 'session')
+            }
+            if (request.method === 'session/prompt') {
+              stdout.write(JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: {
+                sessionId: request.params.sessionId, update: { sessionUpdate: 'agent_message_chunk',
+                  content: { type: 'text', text: 'recovered' } },
+              } }) + '\n')
+              result = { stopReason: 'end_turn' }
+            }
+            // Real wire replies and exit promises compete before newSession's continuation.
+            const losesProcess = generation === 1 && request.method === 'session/new'
+            if (losesProcess && ordering === 'exit-first') exited.resolve({ code: 1, signal: null })
+            if (request.id !== undefined)
+              stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result }) + '\n')
+            if (losesProcess && ordering === 'reply-first') exited.resolve({ code: 1, signal: null })
+            done()
+          } }),
+        }
+      } } })
+      const old = await runtime.ensureReady()
+      const request = { model: 'gemini-4-argon', sessionId: 'owner', messages: [sys, user('u1', 'hello')] }
+      // The request must fail, and every registration from its late reply must roll back.
+      await assert.rejects(collect(runtime.stream(request)), { code: 'TRANSPORT' })
+      assert.equal(runtime.process, undefined)
+      assert.equal(old.alive, false)
+      assert.equal(old.listeners.size, 0)
+      assert.equal(old.peer.pending.size, 0)
+      assert.equal(runtime.conversations.size, 0)
+      assert.equal(runtime.tenants.size, 0)
+      assert.equal(runtime.status().liveSessions, 0)
+      assert.equal(existsSync(join(home, 'agy', 'conversations', 'late-1.db')), false)
+      assert.equal(runtime.catalog.observed, false)
+      assert.equal(runtime.catalog.tier(), undefined)
+      assert.equal(existsSync(join(home, 'catalog.json')), false)
+      const next = await collect(runtime.stream(request))
+      assert.equal(textOf(next), 'recovered')
+      assert.equal(finishOf(next).reason.kind, 'stop')
+      assert.equal(spawns, 2)
+      const replacement = runtime.conversations.get('owner')
+      assert.equal(replacement.process, runtime.process)
+      assert.equal(replacement.process.alive, true)
+      assert.equal(replacement.sessionId, 'late-2')
+      assert.equal(runtime.tenants.size, 1)
+      assert.equal(replacement.process.listeners.size, 1)
+    })
+  }
 })
 
 test('dispose rolls back a session/new reply that was already received', async (t) => {
@@ -2087,6 +2195,7 @@ test('dispose rolls back a session/new reply that was already received', async (
   assert.equal(runtime.conversations.size, 0)
   assert.equal(runtime.tenants.size, 0)
   assert.equal(proc.alive, false)
+  assert.equal(proc.listeners.size, 0)
   assert.equal(existsSync(join(home, 'agy', 'conversations', `${id}.db`)), false)
 })
 

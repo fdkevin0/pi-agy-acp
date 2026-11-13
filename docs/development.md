@@ -41,9 +41,10 @@ pi -e ./index.ts
   disposal is shared by concurrent callers and rejects new work immediately.
   Preflight and lock waiters cancel without waiting for the underlying operation.
   Startup tracks the child before ACP initialize, stops it on disposal, and drains
-  bridge binding before closing the listener. Late session replies roll back
-  instead of registering a conversation or tenant. ACP stop closes the JSON-RPC
-  peer immediately so pending initialize/session requests reject without waiting
+  bridge binding before closing the listener. Late session replies from a dead or
+  replaced process, disposed runtime, or replaced conversation roll back their
+  session artifacts instead of registering a conversation or tenant. ACP stop
+  closes the JSON-RPC peer immediately so pending initialize/session requests reject without waiting
   for child exit. Bridge shutdown destroys tracked sockets, including incomplete
   requests and SSE connections.
   A turn owns cancellation through streaming and parked tool execution. Only a

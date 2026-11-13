@@ -783,9 +783,11 @@ export class AntigravityRuntime {
         },
         120_000,
       )
+      // A buffered session/new reply can resolve after its process has exited.
       if (
         this.lifecycle !== 'active' ||
-        this.conversations.get(conv.key) !== conv
+        this.conversations.get(conv.key) !== conv ||
+        proc !== this.process || !proc.alive
       ) {
         try {
           await proc.closeSession(result.sessionId)
