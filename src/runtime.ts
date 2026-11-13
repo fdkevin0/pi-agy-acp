@@ -717,8 +717,9 @@ export class AntigravityRuntime {
   }
 
   private onProcessExit(proc: AcpProcess, error: Error): void {
-    if (this.process === proc) this.process = undefined
-    if (this.lifecycle === 'active') {
+    const current = this.process === proc
+    if (current) this.process = undefined
+    if (current && this.lifecycle === 'active') {
       this.state = 'error'
       this.lastError = error.message
       this.host.log.warn(`antigravity-acp: ${error.message}`)
@@ -1108,10 +1109,10 @@ export class AntigravityRuntime {
       this.assertOwner(proc, conv, conv.sessionId)
       turn.promptSettled = proc.prompt(conv.sessionId as string, blocks).then(
         (result) => turn.events.push({ kind: 'done', result }),
-        (error: unknown) => turn.events.push({ kind: 'error', error: mapError(error) }),
+        (error: unknown) => turn.fail(mapError(error)),
       )
     } catch (error) {
-      turn.events.push({ kind: 'error', error: mapError(error) })
+      turn.fail(mapError(error))
     }
   }
 
@@ -1157,7 +1158,7 @@ export class AntigravityRuntime {
       }
     }
     try {
-      for await (const chunk of pumpStep(
+      for await (const emitted of pumpStep(
         turn,
         {
           parkSettleMs: this.host.config.parkSettleMs,
@@ -1170,22 +1171,18 @@ export class AntigravityRuntime {
         },
         signal,
       )) {
-        if (signal.aborted &&
-          !(chunk.type === 'finish' && chunk.reason.kind === 'aborted')) {
-          finishKind = 'aborted'
-          yield {
-            type: 'finish',
-            reason: {
-              kind: 'aborted',
-              failure: { message: 'Request aborted', code: 'ABORTED' },
-            },
-          }
-          break
-        }
+        // for-await adds a microtask boundary after pumpStep's own emission guard.
+        const chunk = turn.guard(emitted, signal) as StreamChunk
         if (chunk.type === 'block-end' && chunk.block.type === 'tool-call')
           conv.issuedIds.add(chunk.block.id)
         if (chunk.type === 'finish') finishKind = chunk.reason.kind
         yield chunk
+        if (chunk.type === 'finish' && chunk.reason.kind === 'aborted') break
+      }
+      const interrupted = turn.guard(undefined, signal)
+      if (interrupted !== undefined && finishKind !== 'aborted') {
+        finishKind = 'aborted'
+        yield interrupted
       }
       drained = true
     } catch (error) {
@@ -1195,8 +1192,8 @@ export class AntigravityRuntime {
       // Only a fully consumed tool handoff keeps the turn and its cancellation owner.
       if (!(drained && finishKind === 'tool-calls' && !signal.aborted && conv.turn === turn)) {
         recordTurn(
-          signal.aborted ? 'aborted'
-            : finishKind === 'error' || !drained ? 'error' : 'completed',
+          finishKind === 'error' ? 'error' : signal.aborted ? 'aborted'
+            : !drained ? 'error' : 'completed',
         )
         if (conv.turn === turn) {
           if (!drained || finishKind === 'aborted' || finishKind === 'error')

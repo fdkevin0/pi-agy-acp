@@ -22,7 +22,7 @@ import {
 import { defaults } from '../src/config.ts'
 import { VERSION } from '../src/version.ts'
 import { AcpProcess } from '../src/acp-process.ts'
-import { AcpTurn, toTokenUsage } from '../src/conversation.ts'
+import { AcpTurn, toTokenUsage, pumpStep } from '../src/conversation.ts'
 import { deferred } from '../src/util.ts'
 import {
   EMPTY_INPUT_CONTINUATION,
@@ -2648,4 +2648,224 @@ test('conversation ownership lasts through asynchronous step cleanup', async (t)
   const second = await collect(runtime.stream({ ...request, sessionId: 'second' }))
   assert.equal(finishOf(second).reason.kind, 'stop')
   assert.equal(runtime.conversations.get('second').process, runtime.process)
+})
+
+test('process exit during tool block-start rejects the handoff and recovers capacity', async () => {
+  const { runtime } = makeRuntime({ config: { maxLiveSessions: 1 } })
+  const stream = runtime.stream({ model: 'gemini-4-argon', sessionId: 'exit-handoff', tools: [bash],
+    messages: [sys, user('u1', 'CALL bash {"command":"long"}')] })
+  for (;;) {
+    const item = await stream.next()
+    assert.equal(item.done, false)
+    if (item.value.type === 'block-start' && item.value.blockType === 'tool-call') break
+  }
+  const conv = runtime.conversations.get('exit-handoff')
+  const turn = conv.turn
+  const proc = conv.process
+  const exited = new Promise(resolve => proc.onExit(resolve))
+  proc.child.terminate()
+  await exited
+  assert.equal(conv.turn, undefined)
+  const rest = []
+  await assert.rejects(async () => { for await (const chunk of stream) rest.push(chunk) },
+    error => error.code === 'TRANSPORT' && /process exited/.test(error.message))
+  assert.deepEqual(rest, [])
+  assert.equal(turn.toolSteps, 0)
+  assert.equal(turn.pendingCalls.size, 0)
+  assert.equal(turn.releaseSignal, undefined)
+  for (const call of turn.calls.values()) assert.equal((await call.result.promise).isError, true)
+  assert.equal(runtime.status().lastTurn.outcome, 'error')
+  assert.equal(runtime.status().activeTurns, 0)
+  const second = await collect(runtime.stream({ model: 'gemini-4-argon', sessionId: 'second',
+    messages: [sys, user('u2', 'hello')] }))
+  assert.equal(finishOf(second).reason.kind, 'stop')
+})
+
+test('process exit during tool batching rejects before emission and recovers capacity', async (t) => {
+  const { runtime } = makeRuntime({ config: { maxLiveSessions: 1 } })
+  const proc = await runtime.ensureReady()
+  const conv = runtime.createConversation('exit-batch')
+  conv.process = proc
+  conv.sessionId = 'exit-batch'
+  const turn = conv.turn = new AcpTurn('batch')
+  const call = turn.park('bash', {})
+  const wait = turn.events.wait.bind(turn.events)
+  t.mock.method(turn.events, 'wait', async (...args) => {
+    if (args[1] !== undefined) proc.stop()
+    return wait(...args)
+  })
+  const chunks = []
+  await assert.rejects(async () => {
+    for await (const chunk of runtime.pump(conv, turn, proc, { model: 'test' }, 'high')) chunks.push(chunk)
+  }, { code: 'TRANSPORT' })
+  assert.deepEqual(chunks, [])
+  assert.equal(turn.toolSteps, 0)
+  assert.equal(turn.pendingCalls.size, 0)
+  assert.equal((await call.result.promise).isError, true)
+  assert.equal(runtime.status().lastTurn.outcome, 'error')
+  const second = await collect(runtime.stream({ model: 'gemini-4-argon', sessionId: 'second',
+    messages: [sys, user('u2', 'hello')] }))
+  assert.equal(finishOf(second).reason.kind, 'stop')
+})
+
+test('terminal failure guards every tool, text, reasoning, usage and finish yield', async (t) => {
+  const cases = [
+    ['park', 4], // start, arguments, end, finish
+    ['parallel', 7], // two calls, then finish
+    ['text', 5], // start, delta, end, usage, finish
+    ['thought', 5],
+  ]
+  for (const [kind, count] of cases) for (let boundary = 0; boundary < count; boundary++) {
+    await t.test(`${kind} yield ${boundary}`, async () => {
+      const { runtime } = makeRuntime()
+      const proc = await runtime.ensureReady()
+      const conv = runtime.createConversation('boundary')
+      conv.process = proc
+      conv.sessionId = 'boundary'
+      const turn = conv.turn = new AcpTurn('boundary')
+      if (kind === 'park' || kind === 'parallel') {
+        turn.park('bash', {})
+        if (kind === 'parallel') turn.park('bash', {})
+      } else {
+        turn.produced = true
+        turn.events.push({ kind, text: 'output' })
+        turn.events.push({ kind: 'done', result: { stopReason: 'end_turn', usage: { outputTokens: 1 } } })
+      }
+      const stream = runtime.pump(conv, turn, proc, { model: 'test' }, 'high')
+      for (let i = 0; i <= boundary; i++) assert.equal((await stream.next()).done, false)
+      proc.stop()
+      const rest = []
+      await assert.rejects(async () => { for await (const chunk of stream) rest.push(chunk) }, { code: 'TRANSPORT' })
+      assert.deepEqual(rest, [])
+      assert.equal(runtime.status().lastTurn.outcome, 'error')
+      assert.equal(turn.pendingCalls.size, 0)
+      assert.equal(conv.turn, undefined)
+      for (const call of turn.calls.values()) assert.equal((await call.result.promise).isError, true)
+      assert.equal(turn.toolSteps, (kind === 'park' || kind === 'parallel') && boundary === count - 1 ? 1 : 0)
+    })
+  }
+})
+
+test('first interruption wins over queued output and later terminal callbacks', async () => {
+  for (const first of ['failure', 'cancellation']) for (const kind of ['text', 'park', 'done']) {
+    const turn = new AcpTurn('precedence')
+    if (kind === 'park') turn.park('bash', {})
+    else turn.events.push(kind === 'text' ? { kind, text: 'queued' } : { kind, result: { stopReason: 'end_turn' } })
+    const error = new Error('original failure')
+    const controller = new AbortController()
+    const host = { parkSettleMs: 0, maxContinuations: 0, cancel() {}, continuePrompt() { assert.fail('no continuation') } }
+    const stream = pumpStep(turn, host, controller.signal)
+    if (first === 'failure') {
+      turn.fail(error)
+      turn.fail(new Error('later failure'))
+      controller.abort()
+      await assert.rejects(collect(stream), value => value === error)
+      assert.equal(turn.cancellation.signal.aborted, false)
+    } else {
+      turn.abandon('cancelled first')
+      turn.fail(error)
+      const chunks = await collect(stream)
+      assert.deepEqual(chunks.map(chunk => chunk.type), ['finish'])
+      assert.equal(finishOf(chunks).reason.kind, 'aborted')
+    }
+    assert.equal(turn.pendingCalls.size, 0)
+    for (const call of turn.calls.values()) assert.equal((await call.result.promise).isError, true)
+  }
+})
+
+
+test('terminal failure in the generator delivery microtask precedes runtime accounting', async (t) => {
+  const { runtime } = makeRuntime()
+  const proc = await runtime.ensureReady()
+  const conv = runtime.createConversation('delivery-gap')
+  conv.process = proc
+  conv.sessionId = 'delivery-gap'
+  const turn = conv.turn = new AcpTurn('delivery-gap')
+  turn.park('bash', {})
+  const guard = turn.guard.bind(turn)
+  let injected = false
+  t.mock.method(turn, 'guard', (chunk, signal) => {
+    const result = guard(chunk, signal)
+    if (chunk?.type === 'block-end' && !injected) {
+      injected = true
+      queueMicrotask(() => proc.stop())
+    }
+    return result
+  })
+  const chunks = []
+  await assert.rejects(async () => {
+    for await (const chunk of runtime.pump(conv, turn, proc, { model: 'test' }, 'high')) chunks.push(chunk)
+  }, { code: 'TRANSPORT' })
+  assert.equal(injected, true)
+  assert.deepEqual(chunks.map(chunk => chunk.type), ['block-start', 'tool-call-delta'])
+  assert.equal(conv.issuedIds.size, 0)
+  assert.equal(turn.toolSteps, 0)
+  assert.equal(runtime.status().lastTurn.outcome, 'error')
+})
+
+test('obsolete process and prompt callbacks cannot poison a replacement turn', async () => {
+  const { runtime } = makeRuntime()
+  const oldProc = await runtime.ensureReady()
+  oldProc.stop()
+  const proc = await runtime.ensureReady()
+  const conv = runtime.createConversation('replacement-terminal')
+  conv.process = proc
+  conv.sessionId = 'replacement-terminal'
+  const old = conv.turn = new AcpTurn('old')
+  runtime.dropTurn(conv, 'replaced')
+  const replacement = conv.turn = new AcpTurn('new')
+  old.fail(new Error('late prompt rejection'))
+  runtime.onProcessExit(oldProc, new Error('late child exit'))
+  assert.equal(runtime.process, proc)
+  assert.equal(runtime.status().state, 'ready')
+  assert.equal(conv.turn, replacement)
+  replacement.events.push({ kind: 'text', text: 'replacement output' })
+  replacement.events.push({ kind: 'done', result: { stopReason: 'end_turn' } })
+  const chunks = await collect(runtime.pump(conv, replacement, proc, { model: 'test' }, 'high'))
+  assert.equal(textOf(chunks), 'replacement output')
+  assert.equal(finishOf(chunks).reason.kind, 'stop')
+})
+
+
+test('terminal failure prevents a queued long-decode continuation and retains its original rejection', async () => {
+  const turn = new AcpTurn('continuation')
+  const result = deferred()
+  const stream = pumpStep(turn, { parkSettleMs: 0, maxContinuations: 1, cancel() {},
+    continuePrompt: () => result.promise }, undefined)
+  turn.events.push({ kind: 'done', result: { stopReason: 'max_tokens' } })
+  const next = stream.next()
+  // Wait for the actual continuation dispatch rather than relying on a timer.
+  while (turn.continuations === 0) await Promise.resolve()
+  const call = turn.park('bash', {})
+  const error = new Error('original continuation failure')
+  result.reject(error)
+  await turn.promptSettled
+  await assert.rejects(next, value => value === error)
+  assert.equal(turn.toolSteps, 0)
+  assert.equal(turn.pendingCalls.size, 0)
+  assert.equal((await call.result.promise).isError, true)
+  assert.equal(turn.cancellation.signal.aborted, false)
+})
+
+
+test('synchronous continuation throws preserve the first terminal event', async () => {
+  for (const first of ['failure', 'cancellation', 'throw']) {
+    const turn = new AcpTurn('continuation-throw')
+    const original = new Error('original transport failure')
+    const later = new Error('later synchronous throw')
+    const call = turn.park('bash', {})
+    turn.events.shift() // Keep a waiter without a tool handoff ahead of the continuation.
+    turn.events.push({ kind: 'done', result: { stopReason: 'max_tokens' } })
+    const stream = pumpStep(turn, { parkSettleMs: 0, maxContinuations: 1, cancel() {},
+      continuePrompt() {
+        if (first === 'failure') turn.fail(original)
+        if (first === 'cancellation') turn.abandon('cancelled before throw')
+        throw later
+      } }, undefined)
+    if (first === 'cancellation') assert.equal(finishOf(await collect(stream)).reason.kind, 'aborted')
+    else await assert.rejects(collect(stream), error => error === (first === 'failure' ? original : later))
+    assert.equal((await call.result.promise).isError, true)
+    assert.equal(turn.pendingCalls.size, 0)
+    assert.equal(turn.toolSteps, 0)
+  }
 })

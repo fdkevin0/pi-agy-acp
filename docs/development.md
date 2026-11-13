@@ -60,8 +60,20 @@ pi -e ./index.ts
   as asynchronous rejections, including replacement turns after tool completion.
   The conversation lock remains held through asynchronous step cleanup, so an old
   close cannot delete a session acquired by its successor.
-  Process exit detaches running and parked turns and settles their tool waiters;
-  a running pump retains the transport failure rather than an aborted outcome.
+  Process exit detaches running and parked turns and settles their tool waiters.
+  Each turn retains its first interruption independently of the event queue:
+  cancellation first stays aborted; failure first retains the original error even
+  if cancellation or another failure follows. Prompt rejection and process exit
+  use the same failure path. A queued `done` is not a committed step completion:
+  it may follow parked tools or request a long-decode continuation. Success is
+  committed only after the consumer drains the step; loss after a yielded finish
+  but before drain still fails settlement.
+  One turn guard gates emission and settlement in both async generators, including
+  their delivery microtask, before tool identity accounting. The step generator
+  also checks before resuming production and after queue/batching waits, preventing
+  new tool emission, continuations, or tool-step accounting after known failure.
+  Partial blocks are abandoned on failure rather than completed into executable
+  tool calls. Old process callbacks cannot change a replacement runtime's status.
   Tool-result delivery hands the exact resumed turn to the pump synchronously;
   result-waiter microtasks may cancel and detach it before output resumes.
   Cancellation takes priority over buffered output and batched tools. Streaming cleanup waits for prompt settlement for up
@@ -77,6 +89,12 @@ pi -e ./index.ts
   Its context exposes `sessionManager.getSessionId()`. The settlement hook uses
   that ID regardless of selected provider, before quota gating. Tests use local
   scripted ACP sessions and controlled queue boundaries, not live account traffic.
+  The terminal-boundary regressions reproduce real fake-ACP child exit after
+  `block-start(tool-call)` and synchronous ACP stop during batching, then cover
+  every tool/text/reasoning/usage/finish yield and the generator delivery microtask.
+  Continuation rejection and synchronous throws preserve the first interruption.
+  These reproduce the queue-ordering quirk against `AcpProcess`/`JsonRpcPeer`,
+  rather than assuming that process failure aborts the Pi request signal.
 - **Quota and TUI:** Settled checks share the reader's TTL and in-flight request
   without blocking Pi. Model selection reads memory only. UI generation checks
   discard stale background results; warning keys include bucket, reset time, and

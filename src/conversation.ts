@@ -136,6 +136,8 @@ export type TurnEvent =
 /** One running ACP prompt turn. */
 export class AcpTurn {
   readonly cancellation = new AbortController()
+  /** First interruption wins; prompt completion is committed only after the step drains. */
+  private terminal: { kind: 'cancelled' } | { kind: 'failed'; error: Error } | undefined
   releaseSignal: (() => void) | undefined
   readonly startedAt = performance.now()
   readonly events = new AsyncQueue<TurnEvent>()
@@ -246,14 +248,30 @@ export class AcpTurn {
    * @param reason - message delivered to the agent.
    */
   abandon(reason: string): void {
-    this.cancellation.abort()
+    this.terminal ??= { kind: 'cancelled' }
+    if (this.terminal.kind === 'cancelled') this.cancellation.abort()
     this.settleCalls(reason)
   }
 
   /** End transport ownership without misreporting a process failure as cancellation. */
   fail(error: Error): void {
+    this.terminal ??= { kind: 'failed', error }
     this.events.push({ kind: 'error', error })
     this.settleCalls(error.message)
+  }
+
+  /** Guard both async-generator boundaries before emission, accounting, or drain. */
+  guard(chunk: StreamChunk | undefined, signal?: AbortSignal): StreamChunk | undefined {
+    if (signal?.aborted) this.abandon('The harness cancelled this request.')
+    if (this.terminal?.kind === 'failed') throw this.terminal.error
+    if (this.terminal?.kind === 'cancelled') return {
+      type: 'finish',
+      reason: {
+        kind: 'aborted',
+        failure: { message: 'Request aborted', code: 'ABORTED' },
+      },
+    }
+    return chunk
   }
 
   private settleCalls(reason: string): void {
@@ -340,6 +358,45 @@ export async function* pumpStep(
   host: PumpHost,
   signal: AbortSignal | undefined,
 ): AsyncGenerator<StreamChunk> {
+  const cancel = () => turn.abandon('The harness cancelled this request.')
+  signal?.addEventListener('abort', cancel, { once: true })
+  if (signal?.aborted) cancel()
+  const chunks = stepChunks(turn, host, signal)
+  try {
+    // Real ACP exit can land behind a queued park, or while a consumer holds block-start.
+    for (;;) {
+      const interrupted = turn.guard(undefined, signal)
+      if (interrupted !== undefined) {
+        host.cancel()
+        yield interrupted
+        return
+      }
+      const next = await chunks.next()
+      const chunk = turn.guard(next.value, signal)
+      const aborted = chunk?.type === 'finish' && chunk.reason.kind === 'aborted'
+      if (aborted) host.cancel()
+      if (chunk !== undefined) yield chunk
+      if (aborted) return
+      if (next.done) return
+    }
+  } catch (error) {
+    turn.fail(error instanceof Error ? error : new Error(String(error)))
+    const interrupted = turn.guard(undefined, signal)
+    if (interrupted !== undefined) {
+      host.cancel()
+      yield interrupted
+    }
+  } finally {
+    signal?.removeEventListener('abort', cancel)
+    await chunks.return(undefined)
+  }
+}
+
+async function* stepChunks(
+  turn: AcpTurn,
+  host: PumpHost,
+  signal: AbortSignal | undefined,
+): AsyncGenerator<StreamChunk> {
   let index = 0
   let open:
     { index: number; type: 'text' | 'reasoning'; text: string } | undefined
@@ -368,20 +425,8 @@ export async function* pumpStep(
   }
 
   for (;;) {
-    const ready = await turn.events.wait(signal)
-    if (!ready || signal?.aborted) {
-      host.cancel()
-      turn.abandon('The harness cancelled this request.')
-      yield* close()
-      yield {
-        type: 'finish',
-        reason: {
-          kind: 'aborted',
-          failure: { message: 'Request aborted', code: 'ABORTED' },
-        },
-      }
-      return
-    }
+    await turn.events.wait(signal)
+    if (turn.guard(undefined, signal) !== undefined) return
     if (turn.events.peek()?.kind !== 'text') {
       const held = turn.recoverNoticeHold()
       if (held.length > 0) {
@@ -409,9 +454,8 @@ export async function* pumpStep(
           turn.events.shift()
           batch.push(next.call)
         }
-        if (signal?.aborted) continue
+        if (turn.guard(undefined, signal) !== undefined) return
         for (const call of batch) {
-          if (signal?.aborted) break
           const blockIndex = index++
           turn.pendingCalls.set(call.id, call)
           yield {
@@ -437,7 +481,6 @@ export async function* pumpStep(
             },
           }
         }
-        if (signal?.aborted) continue
         turn.toolSteps++
         yield { type: 'finish', reason: { kind: 'tool-calls' } }
         return
@@ -452,11 +495,7 @@ export async function* pumpStep(
           turn.promptSettled = host.continuePrompt().then(
             (result) => turn.events.push({ kind: 'done', result }),
             (error: unknown) =>
-              turn.events.push({
-                kind: 'error',
-                error:
-                  error instanceof Error ? error : new Error(String(error)),
-              }),
+              turn.fail(error instanceof Error ? error : new Error(String(error))),
           )
           break
         }
@@ -519,8 +558,8 @@ export async function* pumpStep(
       }
       case 'error':
         turn.finished = true
-        yield* close()
-        throw event.error
+        turn.fail(event.error)
+        turn.guard(undefined, signal)
     }
   }
 }
