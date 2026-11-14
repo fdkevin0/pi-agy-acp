@@ -438,6 +438,118 @@ test('quota selection matches specific groups, explicit members, and display nam
     formatQuotaStatus(slashSeparated, 'gemini-3.8-flash', 'remaining'),
     'AGY 50%',
   )
+
+  const realisticUsage = {
+    status: 'ok',
+    updatedAt: new Date().toISOString(),
+    groups: [
+      {
+        name: 'Gemini Models',
+        description: 'Models within this group: Gemini 4 Argon, Gemini 3.8 Flash',
+        buckets: [{ id: 'gm', window: '5h', remainingFraction: 0.7 }],
+      },
+      {
+        name: 'Claude and GPT models',
+        description:
+          'Models within this group: Claude Opus 5.5, Claude Sonnet 5.5, GPT-OSS 120B',
+        buckets: [{ id: 'cg', window: '5h', remainingFraction: 0.9 }],
+      },
+      {
+        name: 'Gemini 4 Argon',
+        description: '',
+        buckets: [{ id: 'ga', window: '5h', remainingFraction: 0 }],
+      },
+    ],
+  }
+  assert.equal(
+    formatQuotaStatus(realisticUsage, 'claude-opus-5-5', 'remaining'),
+    'AGY 90%',
+  )
+  assert.equal(
+    formatQuotaStatus(
+      realisticUsage,
+      { id: 'opaque-id', name: 'GPT-OSS 120B (Medium)' },
+      'remaining',
+    ),
+    'AGY 90%',
+  )
+  assert.equal(
+    formatQuotaStatus(
+      realisticUsage,
+      { id: 'gemini-4-argon', name: 'Gemini 4 Argon' },
+      'remaining',
+    ),
+    'AGY 0%',
+  )
+  assert.equal(
+    formatQuotaStatus(
+      realisticUsage,
+      { id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash' },
+      'remaining',
+    ),
+    'AGY 70%',
+  )
+
+  const slashGroupName = {
+    status: 'ok',
+    updatedAt: new Date().toISOString(),
+    groups: [
+      {
+        name: 'Gemini 3.8 Flash / Gemini 3.8 Pro',
+        description: '',
+        buckets: [{ id: 'sg', window: '5h', remainingFraction: 0.5 }],
+      },
+    ],
+  }
+  assert.equal(
+    formatQuotaStatus(slashGroupName, 'gemini-3.8-flash', 'remaining'),
+    'AGY 50%',
+  )
+
+  const proseGeneric = {
+    status: 'ok',
+    updatedAt: new Date().toISOString(),
+    groups: [
+      {
+        name: 'Gemini Models',
+        description: 'Shared limit across Gemini models',
+        buckets: [{ id: 'pg', window: '5h', remainingFraction: 0.7 }],
+      },
+    ],
+  }
+  assert.equal(
+    formatQuotaStatus(proseGeneric, 'gemini-3.8-flash', 'remaining'),
+    'AGY 70%',
+  )
+})
+
+test('agent_settled during reset dispose does not block quota checks on replacement runtime', async (t) => {
+  const disposing = Promise.withResolvers()
+  const staleRead = Promise.withResolvers()
+  const dispose = t.mock.method(
+    AntigravityRuntime.prototype,
+    'dispose',
+    async () => {},
+  )
+  dispose.mock.mockImplementationOnce(() => disposing.promise)
+  const read = t.mock.method(QuotaReader.prototype, 'read', async () =>
+    snapshot(),
+  )
+  read.mock.mockImplementationOnce(() => staleRead.promise)
+  const h = harness(t)
+  const resetDone = h.command.handler('reset', h.ctx)
+  h.handlers.get('agent_settled')({}, h.ctx)
+  disposing.resolve()
+  await resetDone
+  h.handlers.get('agent_settled')({}, h.ctx)
+  await tick()
+  assert.equal(h.statuses.at(-1), 'AGY 90%')
+  assert.equal(h.notices.length, 2)
+  assert.equal(h.notices.at(-1).level, 'warning')
+  staleRead.resolve(snapshot(0.01))
+  await tick()
+  assert.equal(h.statuses.at(-1), 'AGY 90%')
+  assert.equal(h.notices.length, 2)
 })
 
 test('ambiguous quota ownership does not emit a misleading low-quota warning on settle', async (t) => {

@@ -98,7 +98,7 @@ export default function (pi: ExtensionAPI) {
     })
   register()
   let uiEpoch = 0
-  let checkingQuota = false
+  let checkingRuntime: AntigravityRuntime | undefined
   const warned = new Set<string>()
   const clearStatus = (ctx?: ExtensionContext) => {
     uiEpoch++
@@ -120,7 +120,6 @@ export default function (pi: ExtensionAPI) {
   }
   const reset = async () => {
     uiEpoch++
-    checkingQuota = false
     warned.clear()
     await runtime.dispose()
     runtime = createRuntime()
@@ -149,13 +148,12 @@ export default function (pi: ExtensionAPI) {
     runtime.settleSession(ctx.sessionManager.getSessionId())
     if (
       ctx.model?.provider !== config.provider ||
-      checkingQuota ||
+      checkingRuntime === runtime ||
       runtime.quota.pending
     )
       return
-    const current = runtime
+    const current = (checkingRuntime = runtime)
     const epoch = uiEpoch
-    checkingQuota = true
     void current.quota
       .read(false)
       .then((snapshot) => {
@@ -184,7 +182,7 @@ export default function (pi: ExtensionAPI) {
       })
       .catch(() => {})
       .finally(() => {
-        if (current === runtime) checkingQuota = false
+        if (checkingRuntime === current) checkingRuntime = undefined
       })
   })
   pi.registerCommand('agy-acp', {

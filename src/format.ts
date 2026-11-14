@@ -24,6 +24,8 @@ function formatAccount(account?: AccountInfo): string {
 
 export type QuotaModelRef = string | { id: string; name?: string }
 
+const EXPLICIT_MEMBERS_PREFIX = /^models within this group:\s*/i
+
 const GENERIC_GROUP_TOKENS = new Set([
   'gemini',
   'claude',
@@ -45,25 +47,30 @@ function normalizeTokens(text: string): string[] {
 }
 
 function modelCandidates(id: string, name?: string): string[][] {
-  const raw = [id, id.replace(/-(?:low|medium|high)$/i, '')]
-  if (name) raw.push(name)
+  const base = [id, id.replace(/-(?:low|medium|high)$/i, '')]
+  if (name) {
+    base.push(name, name.replace(/\s*\((?:low|medium|high)\)\s*$/i, ''))
+  }
   const seen = new Set<string>()
   const out: string[][] = []
-  for (const item of raw) {
-    const tokens = normalizeTokens(item)
-    const key = tokens.join(' ')
-    if (tokens.length > 0 && !seen.has(key)) {
-      seen.add(key)
-      out.push(tokens)
+  for (const item of base) {
+    for (const variant of [item, item.replace(/(?<=\d)-(?=\d)/g, '.')]) {
+      const tokens = normalizeTokens(variant)
+      const key = tokens.join(' ')
+      if (tokens.length > 0 && !seen.has(key)) {
+        seen.add(key)
+        out.push(tokens)
+      }
     }
   }
   return out
 }
 
-function groupPhrases(group: QuotaGroup): string[][] {
-  const rawDesc = group.description.replace(/^models within this group:\s*/i, '')
-  const parts = [group.name, ...rawDesc.split(/[,;\n/|&]+/)]
-  return parts.map(normalizeTokens).filter((tokens) => tokens.length > 0)
+function splitPhrases(text: string): string[][] {
+  return text
+    .split(/[,;\n/|&]+/)
+    .map(normalizeTokens)
+    .filter((tokens) => tokens.length > 0)
 }
 
 function isSubsetMatch(target: string[], candidate: string[]): boolean {
@@ -81,15 +88,21 @@ function isSubsetMatch(target: string[], candidate: string[]): boolean {
 }
 
 function isGenericFamilyGroup(group: QuotaGroup, family: string): boolean {
+  if (EXPLICIT_MEMBERS_PREFIX.test(group.description)) return false
   const nameTokens = normalizeTokens(group.name)
-  if (
-    !nameTokens.includes(family) ||
-    !nameTokens.every((t) => GENERIC_GROUP_TOKENS.has(t))
+  return (
+    nameTokens.includes(family) &&
+    nameTokens.every((t) => GENERIC_GROUP_TOKENS.has(t))
   )
-    return false
-  return groupPhrases(group).every((tokens) =>
-    tokens.every((t) => GENERIC_GROUP_TOKENS.has(t)),
-  )
+}
+
+function uniqueMatch(
+  groups: readonly QuotaGroup[],
+  match: (group: QuotaGroup) => boolean,
+): QuotaGroup[] | undefined {
+  const matched = groups.filter(match)
+  if (matched.length === 0) return undefined
+  return matched.length === 1 ? matched : []
 }
 
 function selectQuotaGroups(
@@ -103,27 +116,31 @@ function selectQuotaGroups(
   if (candidates.length === 0) return []
   const candPhrases = candidates.map((c) => c.join(' '))
 
-  const exact = snapshot.groups.filter((group) =>
-    groupPhrases(group).some((p) => candPhrases.includes(p.join(' '))),
-  )
-  if (exact.length > 0) return exact.length === 1 ? exact : []
+  const exactMatch = (phrases: string[][]) =>
+    phrases.some((p) => candPhrases.includes(p.join(' ')))
+  const variantMatch = (phrases: string[][]) =>
+    phrases.some((p) => candidates.some((c) => isSubsetMatch(p, c)))
 
-  const variant = snapshot.groups.filter((group) =>
-    groupPhrases(group).some((p) =>
-      candidates.some((c) => isSubsetMatch(p, c)),
-    ),
-  )
-  if (variant.length > 0) return variant.length === 1 ? variant : []
+  const descText = (g: QuotaGroup) =>
+    g.description.replace(EXPLICIT_MEMBERS_PREFIX, '')
+
+  const resolved =
+    uniqueMatch(snapshot.groups, (g) => exactMatch(splitPhrases(g.name))) ??
+    uniqueMatch(snapshot.groups, (g) => exactMatch(splitPhrases(descText(g)))) ??
+    uniqueMatch(snapshot.groups, (g) => variantMatch(splitPhrases(g.name))) ??
+    uniqueMatch(snapshot.groups, (g) =>
+      variantMatch(splitPhrases(descText(g))),
+    )
+  if (resolved) return resolved
 
   const family =
     /^(gemini|claude|gpt)(?:-|$)/i.exec(id)?.[1]?.toLowerCase() ??
     /^(gemini|claude|gpt)(?:\s|$)/i.exec(name ?? '')?.[1]?.toLowerCase()
   if (!family) return []
 
-  const generic = snapshot.groups.filter((group) =>
-    isGenericFamilyGroup(group, family),
+  return (
+    uniqueMatch(snapshot.groups, (g) => isGenericFamilyGroup(g, family)) ?? []
   )
-  return generic.length === 1 ? generic : []
 }
 
 /** Lowest known window for the model's matching quota group; returns undefined when unknown or ambiguous. */
@@ -195,7 +212,7 @@ export function formatQuota(
     lines.push('', `  ${group.name || 'Unnamed model group'}`)
     if (group.description) {
       lines.push(
-        `    ${group.description.replace(/^Models within this group:\s*/i, '')}`,
+        `    ${group.description.replace(EXPLICIT_MEMBERS_PREFIX, '')}`,
       )
     }
     if (group.buckets.length === 0)
