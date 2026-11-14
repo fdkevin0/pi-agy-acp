@@ -20,7 +20,11 @@ import type {
   AcpToolCallMeta,
 } from './acp-process.ts'
 import type { BridgeTool, BridgeToolResult } from './mcp-bridge.ts'
-import { AGENT_TOOL_PREFIX, CALL_TOOL_NAME } from './history.ts'
+import {
+  AGENT_TOOL_PREFIX,
+  CALL_TOOL_NAME,
+  MCP_SERVER_NAME,
+} from './history.ts'
 import { AsyncQueue, deferred, type Deferred } from './util.ts'
 
 /** Agent-side transport retry notice streamed as message text, e.g. `⚠ API error (attempt 1): …`. */
@@ -663,7 +667,8 @@ function nonEmpty(value: unknown): string | undefined {
 
 /**
  * Extract the structured `(serverName, toolName)` an agent claimed in one
- * permission request: top-level `mcpServerName`/`mcpToolName` or `_meta`.
+ * permission request: top-level `mcpServerName`/`mcpToolName` or `_meta`,
+ * else the flat `name` of a Pi bridge tool (`mcp_pi_<tool>`).
  * `title` and `rawInput` are deliberately not consulted.
  */
 export function structuredToolMeta(
@@ -683,6 +688,16 @@ export function structuredToolMeta(
     nonEmpty(meta?.mcpToolName) ??
     nonEmpty(meta?.toolName) ??
     nonEmpty(meta?.tool)
+  // agy 1.5.8 sends neither field: it reports an MCP call only as the
+  // structured `name` "mcp_<server>_<tool>". Accept that form for the Pi
+  // bridge alone; `title` and `rawInput` stay unconsulted.
+  if (serverName === undefined && toolName === undefined) {
+    const flat = nonEmpty((toolCall as { name?: unknown } | undefined)?.name)
+    if (flat !== undefined && flat.startsWith(AGENT_TOOL_PREFIX)) {
+      const tool = flat.slice(AGENT_TOOL_PREFIX.length)
+      if (tool.length > 0) return { serverName: MCP_SERVER_NAME, toolName: tool }
+    }
+  }
   return {
     ...(serverName !== undefined ? { serverName } : {}),
     ...(toolName !== undefined ? { toolName } : {}),
