@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.2.0](https://github.com/fdkevin0/pi-agy-acp/compare/pi-agy-acp-v0.1.3...pi-agy-acp-v0.2.0) (2026-11-14)
+
+
+### Features
+
+* default quota display to used and remember mode selection ([#17](https://github.com/fdkevin0/pi-agy-acp/issues/17)) ([8f74297](https://github.com/fdkevin0/pi-agy-acp/commit/8f74297e21abfdc15cecadeb51f5f734effbeb1d))
+* initial release of pi-agy-acp ([2fd8cba](https://github.com/fdkevin0/pi-agy-acp/commit/2fd8cbaa6e0638190bcc6f4fc7ffc30500b69842))
+
+
+### Bug Fixes
+
+* Batch 2 execution correctness ([#6](https://github.com/fdkevin0/pi-agy-acp/issues/6), [#7](https://github.com/fdkevin0/pi-agy-acp/issues/7), [#8](https://github.com/fdkevin0/pi-agy-acp/issues/8)) ([#18](https://github.com/fdkevin0/pi-agy-acp/issues/18)) ([d64a548](https://github.com/fdkevin0/pi-agy-acp/commit/d64a548c1d45abcd57440578328afaea17fb0684))
+* harden MCP HTTP boundary, runtime disposal, and turn ownership ([#3](https://github.com/fdkevin0/pi-agy-acp/issues/3), [#4](https://github.com/fdkevin0/pi-agy-acp/issues/4), [#5](https://github.com/fdkevin0/pi-agy-acp/issues/5)) ([#11](https://github.com/fdkevin0/pi-agy-acp/issues/11)) ([dedeeb7](https://github.com/fdkevin0/pi-agy-acp/commit/dedeeb788d34cb0433b7717b67ee876dcf138409))
+
+
+### Performance Improvements
+
+* deduplicate warmup sessions and clean closed ACP session artifacts ([54893a7](https://github.com/fdkevin0/pi-agy-acp/commit/54893a733392d5347846046c56f43acaa01202c3))
+
 ## [0.1.3]
 
 - Default quota display to `used` across the status bar, quota panel, and warnings, with `/agy-acp quota [used|remaining]` persistence in `settings.json` and `PI_AGY_QUOTA_DISPLAY` startup override.
