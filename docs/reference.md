@@ -78,11 +78,11 @@ isolated. Cached plans and login logs can be stale after an account change.
 
 When a run using `antigravity-acp` fully settles, the extension checks `/usage`
 in the background and shows a compact status such as `AGY 20%` (or `AGY 80%`
-in `remaining` mode). It uses the lowest remaining window in the selected model
-family's group, falling back to the lowest remaining quota across groups when
-the family cannot be matched. Failed checks stay silent. Successful results and
-failures both respect the two-minute quota TTL, and overlapping background
-checks are skipped.
+in `remaining` mode). It uses the lowest remaining window in the selected
+model's matching quota group (or an unambiguous generic family group), and
+omits the status and low-quota warning when group ownership is unknown or
+ambiguous. Failed checks stay silent. Successful results and failures both
+respect the two-minute quota TTL, and overlapping background checks are skipped.
 
 At 20% and 5% remaining (80% and 95% used), a warning appears once per bucket,
 reset time, and threshold. `/agy-acp quota` explicitly refreshes quota and updates
@@ -91,8 +91,9 @@ nor model selection launches a quota command. Selecting another provider hides t
 status; returning to Antigravity uses only a fresh in-memory snapshot. Reset and
 shutdown clear the status.
 
-While loaded, this extension vetoes Pi's automatic prompt-cache warming to avoid
-idle requests consuming quota. It does not alter explicit model requests.
+When the active model belongs to `antigravity-acp`, this extension vetoes Pi's
+automatic prompt-cache warming to avoid idle requests consuming quota. Other
+providers' warming decisions and explicit model requests are left unchanged.
 
 ## Configuration
 

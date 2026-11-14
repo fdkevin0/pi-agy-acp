@@ -98,7 +98,7 @@ export default function (pi: ExtensionAPI) {
     })
   register()
   let uiEpoch = 0
-  let checkingQuota = false
+  let checkingRuntime: AntigravityRuntime | undefined
   const warned = new Set<string>()
   const clearStatus = (ctx?: ExtensionContext) => {
     uiEpoch++
@@ -114,7 +114,7 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.setStatus(
         config.provider,
         snapshot
-          ? formatQuotaStatus(snapshot, model?.id, quotaDisplay)
+          ? formatQuotaStatus(snapshot, model, quotaDisplay)
           : undefined,
       )
   }
@@ -136,7 +136,9 @@ export default function (pi: ExtensionAPI) {
     clearStatus(ctx)
     await runtime.dispose()
   })
-  pi.on('cache_warming_decision', () => ({ action: 'stop' }))
+  pi.on('cache_warming_decision', (_event, ctx) =>
+    ctx.model?.provider === config.provider ? { action: 'stop' } : undefined,
+  )
   pi.on('model_select', (event, ctx) => {
     clearStatus(ctx)
     updateStatus(ctx, runtime.quota.peek(), false, event.model)
@@ -146,13 +148,12 @@ export default function (pi: ExtensionAPI) {
     runtime.settleSession(ctx.sessionManager.getSessionId())
     if (
       ctx.model?.provider !== config.provider ||
-      checkingQuota ||
+      checkingRuntime === runtime ||
       runtime.quota.pending
     )
       return
-    const current = runtime
+    const current = (checkingRuntime = runtime)
     const epoch = uiEpoch
-    checkingQuota = true
     void current.quota
       .read(false)
       .then((snapshot) => {
@@ -164,7 +165,7 @@ export default function (pi: ExtensionAPI) {
           return
         updateStatus(ctx, snapshot)
         if (!ctx.hasUI || ctx.model?.provider !== config.provider) return
-        const quota = quotaForModel(snapshot, ctx.model.id)
+        const quota = quotaForModel(snapshot, ctx.model)
         if (!quota || quota.fraction > 0.2) return
         const threshold = quota.fraction <= 0.05 ? 5 : 20
         const key = `${quota.group.name}:${quota.bucket.id}:${quota.bucket.window}:${quota.bucket.resetTime || 'none'}:${threshold}`
@@ -181,7 +182,7 @@ export default function (pi: ExtensionAPI) {
       })
       .catch(() => {})
       .finally(() => {
-        checkingQuota = false
+        if (checkingRuntime === current) checkingRuntime = undefined
       })
   })
   pi.registerCommand('agy-acp', {

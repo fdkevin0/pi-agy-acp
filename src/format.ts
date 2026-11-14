@@ -22,21 +22,134 @@ function formatAccount(account?: AccountInfo): string {
   return [account?.email, account?.plan].filter(Boolean).join(' · ')
 }
 
-/** Lowest known window for the model family; unknown groups fall back conservatively. */
+export type QuotaModelRef = string | { id: string; name?: string }
+
+const EXPLICIT_MEMBERS_PREFIX = /^models within this group:\s*/i
+
+const GENERIC_GROUP_TOKENS = new Set([
+  'gemini',
+  'claude',
+  'gpt',
+  'and',
+  'or',
+  'model',
+  'models',
+  'group',
+  'groups',
+  'all',
+  'other',
+  'default',
+  'general',
+])
+
+function normalizeTokens(text: string): string[] {
+  return text.toLowerCase().match(/[a-z0-9]+(?:\.[0-9]+)*/g) ?? []
+}
+
+function modelCandidates(id: string, name?: string): string[][] {
+  const base = [id, id.replace(/-(?:low|medium|high)$/i, '')]
+  if (name) {
+    base.push(name, name.replace(/\s*\((?:low|medium|high)\)\s*$/i, ''))
+  }
+  const seen = new Set<string>()
+  const out: string[][] = []
+  for (const item of base) {
+    for (const variant of [item, item.replace(/(?<=\d)-(?=\d)/g, '.')]) {
+      const tokens = normalizeTokens(variant)
+      const key = tokens.join(' ')
+      if (tokens.length > 0 && !seen.has(key)) {
+        seen.add(key)
+        out.push(tokens)
+      }
+    }
+  }
+  return out
+}
+
+function splitPhrases(text: string): string[][] {
+  return text
+    .split(/[,;\n/|&]+/)
+    .map(normalizeTokens)
+    .filter((tokens) => tokens.length > 0)
+}
+
+function isSubsetMatch(target: string[], candidate: string[]): boolean {
+  const specific = target.filter(
+    (t) => t !== 'model' && t !== 'models' && t !== 'group' && t !== 'groups',
+  )
+  if (specific.length < 2 || specific[0] !== candidate[0]) return false
+  let pos = 1
+  for (let i = 1; i < specific.length; i++) {
+    const found = candidate.indexOf(specific[i]!, pos)
+    if (found === -1) return false
+    pos = found + 1
+  }
+  return true
+}
+
+function isGenericFamilyGroup(group: QuotaGroup, family: string): boolean {
+  if (EXPLICIT_MEMBERS_PREFIX.test(group.description)) return false
+  const nameTokens = normalizeTokens(group.name)
+  return (
+    nameTokens.includes(family) &&
+    nameTokens.every((t) => GENERIC_GROUP_TOKENS.has(t))
+  )
+}
+
+function uniqueMatch(
+  groups: readonly QuotaGroup[],
+  match: (group: QuotaGroup) => boolean,
+): QuotaGroup[] | undefined {
+  const matched = groups.filter(match)
+  if (matched.length === 0) return undefined
+  return matched.length === 1 ? matched : []
+}
+
+function selectQuotaGroups(
+  snapshot: QuotaSnapshot,
+  model?: QuotaModelRef,
+): QuotaGroup[] {
+  if (!model) return []
+  const id = typeof model === 'string' ? model : model.id
+  const name = typeof model === 'string' ? undefined : model.name
+  const candidates = modelCandidates(id, name)
+  if (candidates.length === 0) return []
+  const candPhrases = candidates.map((c) => c.join(' '))
+
+  const exactMatch = (phrases: string[][]) =>
+    phrases.some((p) => candPhrases.includes(p.join(' ')))
+  const variantMatch = (phrases: string[][]) =>
+    phrases.some((p) => candidates.some((c) => isSubsetMatch(p, c)))
+
+  const descText = (g: QuotaGroup) =>
+    g.description.replace(EXPLICIT_MEMBERS_PREFIX, '')
+
+  const resolved =
+    uniqueMatch(snapshot.groups, (g) => exactMatch(splitPhrases(g.name))) ??
+    uniqueMatch(snapshot.groups, (g) => exactMatch(splitPhrases(descText(g)))) ??
+    uniqueMatch(snapshot.groups, (g) => variantMatch(splitPhrases(g.name))) ??
+    uniqueMatch(snapshot.groups, (g) =>
+      variantMatch(splitPhrases(descText(g))),
+    )
+  if (resolved) return resolved
+
+  const family =
+    /^(gemini|claude|gpt)(?:-|$)/i.exec(id)?.[1]?.toLowerCase() ??
+    /^(gemini|claude|gpt)(?:\s|$)/i.exec(name ?? '')?.[1]?.toLowerCase()
+  if (!family) return []
+
+  return (
+    uniqueMatch(snapshot.groups, (g) => isGenericFamilyGroup(g, family)) ?? []
+  )
+}
+
+/** Lowest known window for the model's matching quota group; returns undefined when unknown or ambiguous. */
 export function quotaForModel(
   snapshot: QuotaSnapshot,
-  model?: string,
+  model?: QuotaModelRef,
 ): { group: QuotaGroup; bucket: QuotaBucket; fraction: number } | undefined {
   if (snapshot.status !== 'ok') return undefined
-  const family = /^(gemini|claude|gpt)(?:-|$)/i.exec(model ?? '')?.[1]
-  const matched = family
-    ? snapshot.groups.filter((group) =>
-        new RegExp(`\\b${family}\\b`, 'i').test(
-          `${group.name} ${group.description}`,
-        ),
-      )
-    : []
-  const groups = matched.length > 0 ? matched : snapshot.groups
+  const groups = selectQuotaGroups(snapshot, model)
   let lowest: ReturnType<typeof quotaForModel>
   for (const group of groups) {
     for (const bucket of group.buckets) {
@@ -59,7 +172,7 @@ export function displayFraction(
 
 export function formatQuotaStatus(
   snapshot: QuotaSnapshot,
-  model?: string,
+  model?: QuotaModelRef,
   display: QuotaDisplay = 'used',
 ): string | undefined {
   const quota = quotaForModel(snapshot, model)
@@ -99,7 +212,7 @@ export function formatQuota(
     lines.push('', `  ${group.name || 'Unnamed model group'}`)
     if (group.description) {
       lines.push(
-        `    ${group.description.replace(/^Models within this group:\s*/i, '')}`,
+        `    ${group.description.replace(EXPLICIT_MEMBERS_PREFIX, '')}`,
       )
     }
     if (group.buckets.length === 0)
