@@ -17,6 +17,10 @@ import {
   type ServerResponse,
 } from 'node:http'
 import type { AddressInfo } from 'node:net'
+import type { ToolSchema } from './protocol.ts'
+import { AGENT_TOOL_PREFIX, CALL_TOOL_NAME } from './history.ts'
+import { digest } from './util.ts'
+import { VERSION } from './version.ts'
 
 /** One tool schema advertised over MCP. */
 export interface BridgeTool {
@@ -84,6 +88,8 @@ export interface McpBridgeOptions {
   log?: (message: string) => void
 }
 
+const MAX_BODY_BYTES = 1_048_576
+
 const MCP_PROTOCOL_VERSION = '2025-06-18'
 const CONVERSATION_META_KEY = 'antigravity.google/conversation_id'
 
@@ -106,11 +112,6 @@ export class McpBridge {
     this.options = options
   }
 
-  /** Whether the HTTP listener is bound. */
-  get listening(): boolean {
-    return this.server !== undefined
-  }
-
   /**
    * Base URL of the endpoint; append `/<tenant>` for a tenant-scoped endpoint.
    * @returns the loopback MCP URL.
@@ -122,12 +123,37 @@ export class McpBridge {
   /** Bind the loopback listener on an ephemeral port. */
   async start(): Promise<void> {
     if (this.server !== undefined) return
-    const server = createServer((req, res) => {
-      void this.handle(req, res)
-    })
-    server.keepAliveTimeout = 0
-    server.requestTimeout = 0
-    server.headersTimeout = 0
+    const server = createServer(
+      {
+        headersTimeout: 10_000,
+        requestTimeout: 30_000,
+        connectionsCheckingInterval: 1_000,
+      },
+      (req, res) => {
+        req.on('error', (error) => {
+          this.log(`mcp: request stream error: ${error.message}`)
+          res.destroy()
+        })
+        res.on('error', (error) => {
+          this.log(`mcp: response stream error: ${error.message}`)
+          res.destroy()
+        })
+        void this.handle(req, res).catch((error: unknown) => {
+          this.log(`mcp: request failed: ${error instanceof Error ? error.message : 'unknown error'}`)
+          if (res.headersSent || res.destroyed) {
+            res.destroy()
+            return
+          }
+          // Close after flushing the error, including clients still uploading a body.
+          res.writeHead(error instanceof HttpError ? error.status : 500, {
+            connection: 'close',
+          })
+          res.end(() => res.destroy())
+        })
+      },
+    )
+    // Node's _http_server.checkConnections bounds reception, not completed SSE requests.
+    server.on('error', (error) => this.log(`mcp: server error: ${error.message}`))
     await new Promise<void>((resolve, reject) => {
       server.once('error', reject)
       server.listen(0, '127.0.0.1', () => {
@@ -147,7 +173,11 @@ export class McpBridge {
     this.openResponses.clear()
     this.handshakes.clear()
     if (server !== undefined)
-      await new Promise<void>((resolve) => server.close(() => resolve()))
+      await new Promise<void>((resolve) => {
+        server.close(() => resolve())
+        // Node's closeAllConnections includes parsers with incomplete headers/bodies.
+        server.closeAllConnections()
+      })
   }
 
   /**
@@ -164,11 +194,24 @@ export class McpBridge {
     if (tenantKey !== undefined) this.handshakes.delete(tenantKey)
   }
 
+  private log(message: string): void {
+    try {
+      this.options.log?.(message)
+    } catch {
+      // A diagnostic sink must not escape the HTTP error boundary.
+    }
+  }
+
   private async handle(
     req: IncomingMessage,
     res: ServerResponse,
   ): Promise<void> {
-    const url = new URL(req.url ?? '/', 'http://127.0.0.1')
+    let url: URL
+    try {
+      url = new URL(req.url ?? '/', 'http://127.0.0.1')
+    } catch {
+      throw new HttpError(400)
+    }
     const segments = url.pathname.split('/').filter(Boolean)
     if (segments[0] !== 'mcp' || segments.length > 2) {
       res.writeHead(404).end()
@@ -197,9 +240,10 @@ export class McpBridge {
       res.writeHead(405, { allow: 'POST, DELETE' }).end()
       return
     }
+    const text = await readBody(req)
     let body: unknown
     try {
-      body = JSON.parse(await readBody(req))
+      body = JSON.parse(text)
     } catch (_invalidJson) {
       // An unparsable body cannot be answered with a request id.
       writeJson(res, 400, {
@@ -254,7 +298,7 @@ export class McpBridge {
         return reply({
           protocolVersion: version,
           capabilities: { tools: { listChanged: false } },
-          serverInfo: { name: 'pi', version: '0.1.0' },
+          serverInfo: { name: 'pi', version: VERSION },
           instructions:
             'Tools of the Pi session. Every call is executed by the harness under its own permission policy.',
         })
@@ -302,6 +346,7 @@ export class McpBridge {
         ? (meta[CONVERSATION_META_KEY] as string)
         : undefined
 
+    if (res.destroyed || res.closed) return
     res.writeHead(200, {
       'content-type': 'text/event-stream',
       'cache-control': 'no-cache, no-transform',
@@ -313,28 +358,36 @@ export class McpBridge {
     let settled = false
     const onClose = (): void => {
       this.openResponses.delete(res)
+      clearInterval(keepAlive)
       if (!settled)
         controller.abort(new Error('MCP client closed the tool call'))
     }
     res.on('close', onClose)
     let ticks = 0
     const keepAlive = setInterval(() => {
-      if (res.writableEnded) return
+      if (res.writableEnded || res.destroyed) return
       ticks++
-      res.write(': keepalive\n\n')
-      if (
-        typeof progressToken === 'string' ||
-        typeof progressToken === 'number'
-      ) {
-        writeEvent(res, {
-          jsonrpc: '2.0',
-          method: 'notifications/progress',
-          params: {
-            progressToken,
-            progress: ticks,
-            message: 'Pi is running the tool',
-          },
-        })
+      try {
+        res.write(': keepalive\n\n')
+        if (
+          typeof progressToken === 'string' ||
+          typeof progressToken === 'number'
+        ) {
+          writeEvent(res, {
+            jsonrpc: '2.0',
+            method: 'notifications/progress',
+            params: {
+              progressToken,
+              progress: ticks,
+              message: 'Pi is running the tool',
+            },
+          })
+        }
+      } catch (error) {
+        clearInterval(keepAlive)
+        this.log(
+          `mcp: keepalive write failed: ${error instanceof Error ? error.message : 'unknown error'}`,
+        )
       }
     }, this.options.keepAliveMs)
 
@@ -368,7 +421,7 @@ export class McpBridge {
     this.openResponses.delete(res)
     res.off('close', onClose)
     if (controller.signal.aborted)
-      this.options.log?.(
+      this.log(
         `mcp: call ${name} finished after the agent disconnected`,
       )
   }
@@ -385,9 +438,26 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
 }
 
+class HttpError extends Error {
+  readonly status: number
+
+  constructor(status: number) {
+    super(`HTTP ${status}`)
+    this.status = status
+  }
+}
+
 async function readBody(req: IncomingMessage): Promise<string> {
+  if (Number(req.headers['content-length']) > MAX_BODY_BYTES)
+    throw new HttpError(413)
   const chunks: Buffer[] = []
-  for await (const chunk of req) chunks.push(chunk as Buffer)
+  let bytes = 0
+  // Readable.iterator otherwise destroys the socket on early exit, losing the 413.
+  for await (const chunk of req.iterator({ destroyOnReturn: false })) {
+    bytes += chunk.length
+    if (bytes > MAX_BODY_BYTES) throw new HttpError(413)
+    chunks.push(chunk as Buffer)
+  }
   return Buffer.concat(chunks).toString('utf8')
 }
 
@@ -402,4 +472,129 @@ function writeJson(res: ServerResponse, status: number, value: unknown): void {
 
 function writeEvent(res: ServerResponse, value: unknown): void {
   res.write(`event: message\ndata: ${JSON.stringify(value)}\n\n`)
+}
+
+/**
+ * Diff active tools against the session's known tool set and render a compact
+ * `<harness_tool_update>` block for newly added, modified, restored, or disabled tools.
+ * @param conv - conversation tool state (`advertisedToolDigests` and `knownTools`).
+ * @param tools - active uncompacted tools for the current step.
+ * @returns `<harness_tool_update>` text block, or `''` when unchanged.
+ */
+export function consumeToolDelta(
+  conv: {
+    readonly advertisedToolDigests: ReadonlyMap<string, string>
+    readonly knownTools: Map<string, string>
+  },
+  tools: readonly BridgeTool[],
+): string {
+  const lines: string[] = []
+  const active = new Set<string>()
+  for (const tool of tools) {
+    active.add(tool.name)
+    const hash = digest(tool)
+    if (conv.knownTools.get(tool.name) === hash) continue
+    conv.knownTools.set(tool.name, hash)
+    const advertisedHash = conv.advertisedToolDigests.get(tool.name)
+    if (advertisedHash === hash) {
+      lines.push(`[tool restored: ${AGENT_TOOL_PREFIX}${tool.name}]`)
+    } else {
+      const spec = JSON.stringify({
+        name: tool.name,
+        description: tool.description,
+        parameters: tool.inputSchema,
+      })
+      lines.push(
+        advertisedHash !== undefined
+          ? `[tool updated — direct ${AGENT_TOOL_PREFIX}${tool.name} is stale; invoke via ${AGENT_TOOL_PREFIX}${CALL_TOOL_NAME} with {"name":"${tool.name}","arguments":{...}}]: ${spec}`
+          : `[tool available via ${AGENT_TOOL_PREFIX}${CALL_TOOL_NAME} with {"name":"${tool.name}","arguments":{...}}]: ${spec}`,
+      )
+    }
+  }
+  for (const name of [...conv.knownTools.keys()]) {
+    if (!active.has(name)) {
+      conv.knownTools.delete(name)
+      lines.push(`[tool disabled: ${name}]`)
+    }
+  }
+  return lines.length > 0
+    ? `<harness_tool_update>\n${lines.join('\n')}\n</harness_tool_update>`
+    : ''
+}
+
+/** Byte ceiling keeping advertised MCP tool schemas below agy's ~1,500B lazy cutoff. */
+export const MAX_EAGER_BRIDGE_TOOL_BYTES = 1_350
+
+function shortenText(text: string, maxChars: number): string {
+  const clean = text.replace(/\s+/gu, ' ').trim()
+  if (clean.length <= maxChars) return clean
+  const sentenceEnd = clean.indexOf('. ')
+  if (sentenceEnd >= 32 && sentenceEnd + 1 <= maxChars)
+    return clean.slice(0, sentenceEnd + 1)
+  return `${clean.slice(0, Math.max(1, maxChars - 1)).trimEnd()}…`
+}
+
+function compactSchemaNode(value: unknown, maxDescChars: number): unknown {
+  if (Array.isArray(value))
+    return value.map((item) => compactSchemaNode(item, maxDescChars))
+  if (value === null || typeof value !== 'object') return value
+  const record = value as Record<string, unknown>
+  const out: Record<string, unknown> = {}
+  for (const [key, entry] of Object.entries(record)) {
+    if (key === 'description' && typeof entry === 'string') {
+      if (maxDescChars > 0) out[key] = shortenText(entry, maxDescChars)
+      continue
+    }
+    out[key] = compactSchemaNode(entry, maxDescChars)
+  }
+  return out
+}
+
+/**
+ * Keep each MCP-advertised tool schema under `agy`'s eager size threshold while
+ * preserving every parameter name, type, required list, and enum constraint.
+ * Full prose instructions for compacted tools are appended to the session system prompt.
+ * @param tool - raw bridge tool descriptor.
+ * @returns compacted descriptor when oversized, otherwise the original descriptor.
+ */
+export function compactBridgeTool(tool: BridgeTool): BridgeTool {
+  if (
+    Buffer.byteLength(JSON.stringify(tool), 'utf8') <=
+    MAX_EAGER_BRIDGE_TOOL_BYTES
+  )
+    return tool
+  const pass1: BridgeTool = {
+    name: tool.name,
+    description: shortenText(tool.description, 220),
+    inputSchema: compactSchemaNode(tool.inputSchema, 90) as Record<
+      string,
+      unknown
+    >,
+  }
+  if (
+    Buffer.byteLength(JSON.stringify(pass1), 'utf8') <=
+    MAX_EAGER_BRIDGE_TOOL_BYTES
+  )
+    return pass1
+  return {
+    name: tool.name,
+    description: shortenText(tool.description, 140),
+    inputSchema: compactSchemaNode(tool.inputSchema, 0) as Record<
+      string,
+      unknown
+    >,
+  }
+}
+
+export function toBridgeTools(
+  tools: readonly ToolSchema[] | undefined,
+): BridgeTool[] {
+  return (tools ?? []).map((t) => ({
+    name: t.name,
+    description: t.description,
+    inputSchema:
+      t.parameters.type === undefined
+        ? { type: 'object', ...t.parameters }
+        : t.parameters,
+  }))
 }

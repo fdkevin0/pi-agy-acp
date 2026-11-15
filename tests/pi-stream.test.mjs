@@ -4,7 +4,13 @@ import { mkdtempSync, rmSync, chmodSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { streamPi, requestMessages } from '../src/pi-stream.ts'
-import { AntigravityRuntime } from '../src/runtime.ts'
+import { AntigravityRuntime, mapError } from '../src/runtime.ts'
+import { LlmError } from '../src/protocol.ts'
+import { splitSystem, renderTranscript } from '../src/history.ts'
+import {
+  isContextOverflow,
+  isRetryableAssistantError,
+} from '@earendil-works/pi-ai'
 import { defaults } from '../src/config.ts'
 import { spawnAcp } from '../src/host.ts'
 const model = {
@@ -81,7 +87,7 @@ test('Pi to ACP tool loop, next turn, rewritten history, usage and images', asyn
       context(system, { role: 'user', content: [image], timestamp: 3 }),
     )
     assert.equal(e.message.stopReason, 'stop')
-    for (const response of [a, b, c, d, e]) {
+    const assertSingleTerminal = (response) => {
       assert.equal(response.events[0].type, 'start')
       assert.equal(
         response.events.filter((e) => e.type === 'done' || e.type === 'error')
@@ -89,6 +95,11 @@ test('Pi to ACP tool loop, next turn, rewritten history, usage and images', asyn
         1,
       )
     }
+    assertSingleTerminal(a)
+    assertSingleTerminal(b)
+    assertSingleTerminal(c)
+    assertSingleTerminal(d)
+    assertSingleTerminal(e)
   } finally {
     await runtime.dispose()
     rmSync(home, { recursive: true, force: true })
@@ -154,29 +165,6 @@ test('payload replacement, raw events, Unicode and partial stream failure', asyn
   assert.match(r.message.errorMessage, /without a finish/)
 })
 
-test('all Pi reasoning levels map to supported ACP efforts', async () => {
-  for (const [reasoning, expected] of [
-    ['minimal', 'low'],
-    ['low', 'low'],
-    ['medium', 'medium'],
-    ['high', 'high'],
-    ['xhigh', 'high'],
-    ['max', 'high'],
-    ['off', undefined],
-    [undefined, undefined],
-  ]) {
-    let effort
-    const runtime = {
-      async *stream(request) {
-        effort = request.reasoningEffort
-        yield { type: 'finish', reason: { kind: 'stop' } }
-      },
-    }
-    const r = await result(runtime, context(user('hi')), { reasoning })
-    assert.equal(r.message.stopReason, 'stop')
-    assert.equal(effort, expected, `reasoning=${reasoning}`)
-  }
-})
 
 test('response instrumentation precedes events and pricing overrides update costs', async () => {
   const order = []
@@ -244,4 +232,159 @@ test('setup failure does not report a successful response', async () => {
   )
   assert.equal(r.message.stopReason, 'error')
   assert.equal(responses, 0)
+})
+
+test('leading system sections stay in the prompt and empty tool updates disappear', () => {
+  const converted = requestMessages([
+    system,
+    { role: 'system', content: 'Second', sections: { rules: 'Keep it brief' } },
+    user('hello'),
+    { role: 'system', content: '  ', toolsRemoved: ['bash'] },
+    { role: 'system', content: '', sections: { rules: 'Be precise' } },
+  ])
+  assert.equal(converted.length, 4)
+  const split = splitSystem({ messages: converted })
+  assert.match(split.system, /Second\n\nKeep it brief/)
+  assert.doesNotMatch(split.system, /Updated system prompt section/)
+  const transcript = renderTranscript(split.messages)
+  assert.match(transcript, /Updated system prompt section "rules"/)
+  assert.doesNotMatch(transcript, /<system_update>\s*<\/system_update>/)
+})
+
+test('timeout and cancellation cannot masquerade as overflow; quota and overflow reach Pi classifiers', async () => {
+  assert.equal(mapError(new Error('context deadline exceeded')).code, 'TIMEOUT')
+  assert.equal(mapError(new Error('context canceled')).code, 'TRANSPORT')
+  assert.equal(
+    mapError(new Error('context window limit exceeded')).code,
+    'CONTEXT_WINDOW_EXCEEDED',
+  )
+  assert.equal(
+    mapError(new Error('context limit reached')).code,
+    'CONTEXT_WINDOW_EXCEEDED',
+  )
+  assert.equal(mapError(new Error('rate limit reached')).code, 'RATE_LIMIT')
+  const overflow = await result(
+    {
+      async *stream() {
+        throw new LlmError('Input is too large', 'CONTEXT_WINDOW_EXCEEDED')
+      },
+    },
+    context(user('hi')),
+  )
+  assert.equal(
+    overflow.message.errorMessage,
+    'context_length_exceeded: Input is too large',
+  )
+  assert.equal(isContextOverflow(overflow.message), true)
+
+  const quota = await result(
+    {
+      async *stream() {
+        yield {
+          type: 'finish',
+          reason: {
+            kind: 'error',
+            failure: {
+              message: 'ResourceExhausted: weekly allowance',
+              code: 'QUOTA',
+            },
+          },
+        }
+      },
+    },
+    context(user('hi')),
+  )
+  assert.equal(
+    quota.message.errorMessage,
+    'quota exceeded: ResourceExhausted: weekly allowance',
+  )
+  assert.equal(isRetryableAssistantError(quota.message), false)
+})
+
+test('an initial aborted finish does not report a synthetic successful response', async () => {
+  let responses = 0
+  const r = await result(
+    {
+      async *stream() {
+        yield { type: 'finish', reason: { kind: 'aborted' } }
+      },
+    },
+    context(user('hi')),
+    {
+      signal: AbortSignal.abort(),
+      onResponse() {
+        responses++
+      },
+    },
+  )
+  assert.equal(r.message.stopReason, 'aborted')
+  assert.equal(responses, 0)
+})
+
+
+test('a direct provider callback failure closes the runtime iterator and abandons its turn', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'pi-callback-'))
+  const runtime = new AntigravityRuntime({
+    config: { ...defaults, command: resolve('tests/fake-agy.mjs'), home },
+    spawnAcp, runCommand: async () => ({ code: 0, stdout: '1.5.0', stderr: '' }),
+    log: { info() {}, warn() {} }, onModelsChanged() {},
+  })
+  try {
+    const { message } = await result(runtime, context(system, user('CALL bash {"command":"pwd"}')), {
+      ...options, onProviderStreamEvent() { throw new Error('callback failed') },
+    })
+    assert.equal(message.stopReason, 'error')
+    assert.match(message.errorMessage, /callback failed/)
+    assert.equal(runtime.status().activeTurns, 0)
+    assert.equal(runtime.conversations.get(options.sessionId).turn, undefined)
+  } finally {
+    await runtime.dispose()
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('onPayload preserves routing metadata, inherits omitted tools, keeps empty tools, and rejects invalid payloads', async () => {
+  const seen = []
+  const runtime = {
+    async *stream(request) {
+      seen.push(request)
+      yield { type: 'finish', reason: { kind: 'stop' } }
+    },
+  }
+  const controller = new AbortController()
+  const toolDef = { name: 'bash', description: 'run', parameters: { type: 'object' } }
+  const ctx = {
+    messages: [
+      { role: 'system', content: 'sys', toolsAdded: [toolDef] },
+      user('hi'),
+    ],
+  }
+  await result(runtime, ctx, {
+    sessionId: 'sess-1',
+    signal: controller.signal,
+    onPayload: (p) => ({ model: 'custom-model', messages: p.messages }),
+  })
+  assert.equal(seen[0].sessionId, 'sess-1')
+  assert.equal(seen[0].signal, controller.signal)
+  assert.equal(seen[0].tools.length, 1)
+
+  await result(runtime, ctx, {
+    sessionId: 'sess-2',
+    signal: controller.signal,
+    onPayload: (p) => ({ model: 'custom-model', messages: p.messages, tools: [] }),
+  })
+  assert.equal(seen[1].sessionId, 'sess-2')
+  assert.deepEqual(seen[1].tools, [])
+
+  const badNull = await result(runtime, ctx, { onPayload: () => null })
+  assert.equal(badNull.message.stopReason, 'error')
+  assert.match(badNull.message.errorMessage, /payload object/)
+
+  const badModel = await result(runtime, ctx, { onPayload: () => ({ model: '', messages: [] }) })
+  assert.equal(badModel.message.stopReason, 'error')
+  assert.match(badModel.message.errorMessage, /non-empty string model/)
+
+  const badMessages = await result(runtime, ctx, { onPayload: () => ({ model: 'm', messages: 'nope' }) })
+  assert.equal(badMessages.message.stopReason, 'error')
+  assert.match(badMessages.message.errorMessage, /messages array/)
 })

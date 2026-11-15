@@ -6,12 +6,16 @@ import {
   writeFileSync,
   readFileSync,
   rmSync,
+  existsSync,
+  symlinkSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, delimiter } from 'node:path'
 import {
   resolveAgyBinary,
   assertSupportedAgyVersion,
+  prepareHome,
+  removeSessionArtifacts,
 } from '../src/preflight.ts'
 import { defaults } from '../src/config.ts'
 import { AntigravityRuntime } from '../src/runtime.ts'
@@ -23,14 +27,102 @@ import { parseUsage, QuotaReader, readLoggedEmail } from '../src/quota.ts'
 function isolateHome(t) {
   const root = mkdtempSync(join(tmpdir(), 'pi-account-'))
   const previous = process.env.PI_AGY_HOME
+  const prevDisplay = process.env.PI_AGY_QUOTA_DISPLAY
   process.env.PI_AGY_HOME = root
+  delete process.env.PI_AGY_QUOTA_DISPLAY
   t.after(() => {
     if (previous === undefined) delete process.env.PI_AGY_HOME
     else process.env.PI_AGY_HOME = previous
+    if (prevDisplay === undefined) delete process.env.PI_AGY_QUOTA_DISPLAY
+    else process.env.PI_AGY_QUOTA_DISPLAY = prevDisplay
     rmSync(root, { recursive: true, force: true })
   })
   return root
 }
+
+test('startup removes stale ACP data and numeric log backups while preserving persistent files', (t) => {
+  const home = isolateHome(t)
+  const stale = [
+    'agy/conversations/session.db',
+    'agy/conversations/session.db-wal',
+    'agy/conversations/session.db-shm',
+    'agy/brain/session/note.md',
+    'agy/conversation_summaries.db',
+    'agy/conversation_summaries.db-wal',
+    'agy/conversation_summaries.db-shm',
+    'agy/jetbox_summaries_proto.pb',
+    'acp.log.123',
+    'acp.log.456',
+  ]
+  const retained = [
+    'acp.log',
+    'catalog.json',
+    'agy/antigravity-oauth-token',
+    'agy/other-data',
+    'acp.log.backup',
+    'acp.log.123.old',
+  ]
+  for (const name of [...stale, ...retained]) {
+    const path = join(home, name)
+    mkdirSync(join(path, '..'), { recursive: true })
+    writeFileSync(path, name)
+  }
+  const workspace = prepareHome(home, join(home, 'no-user-auth'))
+  assert.equal(existsSync(workspace), true)
+  for (const name of stale)
+    assert.equal(existsSync(join(home, name)), false, name)
+  for (const name of retained)
+    assert.equal(readFileSync(join(home, name), 'utf8'), name)
+  assert.doesNotThrow(() => prepareHome(home, join(home, 'no-user-auth')))
+})
+
+test('session cleanup is scoped, idempotent, and refuses path traversal or linked parents', (t) => {
+  const home = isolateHome(t)
+  const target = 'session-1_abc.2'
+  const paths = (id) => [
+    `agy/conversations/${id}.db`,
+    `agy/conversations/${id}.db-wal`,
+    `agy/conversations/${id}.db-shm`,
+    `agy/brain/${id}/note.md`,
+  ]
+  for (const name of [...paths(target), ...paths('other')]) {
+    const path = join(home, name)
+    mkdirSync(join(path, '..'), { recursive: true })
+    writeFileSync(path, 'keep until closed')
+  }
+  for (const invalid of [
+    '',
+    '.',
+    '..',
+    '../other',
+    'a..b',
+    '/other',
+    'a/b',
+    'a\\b',
+    's\n',
+    null,
+  ]) {
+    assert.doesNotThrow(() => removeSessionArtifacts(home, invalid))
+    for (const name of [...paths(target), ...paths('other')])
+      assert.equal(existsSync(join(home, name)), true)
+  }
+  removeSessionArtifacts(home, target)
+  for (const name of paths(target))
+    assert.equal(existsSync(join(home, name)), false)
+  for (const name of paths('other'))
+    assert.equal(existsSync(join(home, name)), true)
+  assert.doesNotThrow(() => removeSessionArtifacts(home, target))
+
+  const outside = join(home, 'outside')
+  mkdirSync(outside)
+  writeFileSync(join(outside, 'linked.db'), 'untouched')
+  rmSync(join(home, 'agy', 'conversations'), { recursive: true })
+  symlinkSync(outside, join(home, 'agy', 'conversations'), 'junction')
+  removeSessionArtifacts(home, 'linked')
+  assert.equal(readFileSync(join(outside, 'linked.db'), 'utf8'), 'untouched')
+  prepareHome(home, join(home, 'no-user-auth'))
+  assert.equal(readFileSync(join(outside, 'linked.db'), 'utf8'), 'untouched')
+})
 
 test('tier-only metadata is validated and persisted without model changes', (t) => {
   const root = isolateHome(t)
@@ -432,14 +524,14 @@ test('provider registration is lazy, refresh respects context, and catalog chang
       signal: AbortSignal.abort(),
     })
     assert.equal(warmups, 0)
-    await provider.refreshModels({
+    const refreshed = await provider.refreshModels({
       allowNetwork: true,
       signal: new AbortController().signal,
     })
     await Promise.all(offlineRefreshes)
     assert.equal(warmups, 1)
-    assert.equal(registrations.length, 2)
-    assert.equal(registrations.at(-1).models[0].thinkingLevelMap.medium, null)
+    assert.equal(registrations.length, 1)
+    assert.equal(refreshed[0].thinkingLevelMap.medium, null)
     assert.equal(
       runtime.catalog.observe([
         { id: 'thought_level', options: [{ value: 'high' }] },
@@ -448,7 +540,7 @@ test('provider registration is lazy, refresh respects context, and catalog chang
     )
     runtime.host.onModelsChanged()
     assert.equal(registrations.at(-1).models[0].thinkingLevelMap.low, null)
-    assert.equal(registrations.length, 3)
+    assert.equal(registrations.length, 2)
     await provider.refreshModels()
     assert.equal(warmups, 2)
     assert.equal(handlers.has('session_before_switch'), false)
@@ -458,17 +550,29 @@ test('provider registration is lazy, refresh respects context, and catalog chang
       'dispose',
       async () => {},
     )
+    const lightReset = t.mock.method(
+      runtime,
+      'resetConversations',
+      async () => {},
+    )
     await handlers.get('session_tree')()
     await handlers.get('session_compact')()
     await handlers.get('session_shutdown')()
-    assert.equal(disposed.mock.callCount(), 3)
+    assert.equal(disposed.mock.callCount(), 1)
+    assert.equal(lightReset.mock.callCount(), 2)
     assert.deepEqual(
       command.getArgumentCompletions(''),
-      ['status', 'quota', 'reset'].map((value) => ({ value, label: value })),
+      ['status', 'quota', 'quota used', 'quota remaining', 'reset'].map(
+        (value) => ({ value, label: value }),
+      ),
     )
-    assert.deepEqual(command.getArgumentCompletions(' q'), [
-      { value: 'quota', label: 'quota' },
-    ])
+    assert.deepEqual(
+      command.getArgumentCompletions(' q'),
+      ['quota', 'quota used', 'quota remaining'].map((value) => ({
+        value,
+        label: value,
+      })),
+    )
     assert.equal(command.getArgumentCompletions('missing'), null)
   } finally {
     timer.mock.restore()
@@ -511,10 +615,22 @@ test('quota panel renders aligned bars, rounded percentages and relative reset t
   const notice = formatQuota(snapshot, quotaNow)
   assert.equal(notice.level, 'info')
   assert.match(notice.text, /Gemini Models\n    Gemini Flash, Gemini Pro/)
-  assert.match(notice.text, /5h\s+\[████████████\] 100% · resets in 4h 59m/)
-  assert.match(notice.text, /weekly\s+\[███████████░\]  91% · resets in 6d 7h/)
-  assert.match(notice.text, /\[█████████░░░\]  75% · resets in 45m/)
+  assert.match(notice.text, /5h\s+\[░░░░░░░░░░░░\]   0% · resets in 4h 59m/)
+  assert.match(notice.text, /weekly\s+\[█░░░░░░░░░░░\]   9% · resets in 6d 7h/)
+  assert.match(notice.text, /\[███░░░░░░░░░\]  25% · resets in 45m/)
   assert.match(notice.text, /Five hours\s+\[░░░░░░░░░░░░\]  n\/a/)
+
+  const remainingNotice = formatQuota(snapshot, quotaNow, 'remaining')
+  assert.equal(remainingNotice.level, 'info')
+  assert.match(
+    remainingNotice.text,
+    /5h\s+\[████████████\] 100% · resets in 4h 59m/,
+  )
+  assert.match(
+    remainingNotice.text,
+    /weekly\s+\[███████████░\]  91% · resets in 6d 7h/,
+  )
+  assert.match(remainingNotice.text, /\[█████████░░░\]  75% · resets in 45m/)
 })
 
 test('quota severity uses exact thresholds and keeps errors above later healthy windows', () => {
@@ -543,7 +659,7 @@ test('quota severity uses exact thresholds and keeps errors above later healthy 
   assert.equal(stale.level, 'error')
   assert.match(stale.text, /Antigravity Quota \(stale\)/)
   assert.match(stale.text, /✖ Error: Sign in required/)
-  assert.match(stale.text, /100%/)
+  assert.match(stale.text, /0%/)
   const empty = formatQuota(quotaSnapshot([], { groups: [] }), quotaNow)
   assert.match(empty.text, /No quota data available\./)
   assert.equal(empty.level, 'info')
@@ -583,11 +699,11 @@ test('quota reset formatting handles expired, imminent and malformed times', () 
   )
   assert.match(
     formatQuota(quotaSnapshot([-1, 2]), quotaNow).text,
-    /\[░░░░░░░░░░░░\]   0%/,
+    /\[████████████\] 100%/,
   )
   assert.match(
     formatQuota(quotaSnapshot([2]), quotaNow).text,
-    /\[████████████\] 100%/,
+    /\[░░░░░░░░░░░░\]   0%/,
   )
 })
 
@@ -596,7 +712,6 @@ const statusSnapshot = {
   home: '/tmp/pi-home',
   contextWindow: 256000,
   defaultEffort: 'high',
-  longDecodeContinuations: 3,
   efforts: ['low', 'medium', 'high'],
   liveSessions: 0,
   activeTurns: 0,
@@ -715,12 +830,12 @@ test('commands route formatted notices and reject unknown arguments without quer
     assert.equal(notice.level, 'info')
     await command.handler('unknown', ctx)
     assert.deepEqual(notice, {
-      text: 'Usage: /agy-acp [status|quota|reset]',
+      text: 'Usage: /agy-acp [status|quota [used|remaining]|reset]',
       level: 'warning',
     })
     assert.equal(read.mock.callCount(), 0)
     await command.handler('quota', ctx)
-    assert.match(notice.text, /20%/)
+    assert.match(notice.text, /80%/)
     assert.equal(notice.level, 'warning')
     snapshot = quotaSnapshot([0.05])
     await command.handler('quota', ctx)
@@ -859,7 +974,7 @@ test('TUI quota loader closes on completion or Escape and suppresses late result
         assert.equal(notices[0].level, scenario === 'error' ? 'error' : 'info')
         if (scenario === 'error')
           assert.match(notices[0].text, /Network unavailable/)
-        else assert.match(notices[0].text, /75%/)
+        else assert.match(notices[0].text, /25%/)
       }
       assert.equal(completions, 1)
       assert.equal(dispose.mock.callCount(), 1)
@@ -898,6 +1013,6 @@ test('quota queries directly outside TUI or when custom UI is unavailable', asyn
       }
     await command.handler('quota', { mode, ui })
     assert.equal(notice.level, 'info')
-    assert.match(notice.text, /75%/)
+    assert.match(notice.text, /25%/)
   }
 })

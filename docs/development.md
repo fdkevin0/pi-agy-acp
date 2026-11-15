@@ -3,9 +3,11 @@
 Start with the [installation guide](../README.md#install) to use the extension.
 For settings and user-visible limits, see the [reference](reference.md).
 
-For development, run these commands from your clone:
+Clone the repository and install its dependencies:
 
 ```sh
+git clone https://github.com/fdkevin0/pi-agy-acp.git
+cd pi-agy-acp
 npm install
 pi -e ./index.ts
 ```
@@ -24,13 +26,53 @@ pi -e ./index.ts
 5. The adapter drains the runtime's generator before publishing completion, so
    session cleanup finishes before Pi can start its next step.
 
-Provider registration and cache-only refresh do not start processes, sockets, or
-timers. Successful session replacement is cleaned up through `session_shutdown`;
-pre-switch and pre-fork interception hooks do not reset the runtime.
+- **Model discovery:** Registration and cache-only refresh start no processes,
+  sockets, or timers. Concurrent refreshes share a discovery session; after a live
+  catalog is observed, later refreshes reuse it unless forced. Refresh suppresses
+  provider re-registration so it cannot cancel itself. Cancellation ends the
+  caller's wait; shared discovery still closes its session and cleans its files.
+- **Session lifecycle:** The bridge binds to `127.0.0.1`, uses per-session bearer
+  credentials, and validates structured tool identity before granting permissions.
+  Tree navigation and compaction close conversation sessions and their files,
+  retaining the process, bridge, and caches. `session_start` (`new`, `resume`, or
+  `fork`) uses the same light reset if the runtime survives; `session_shutdown`
+  and `/agy-acp reset` dispose the runtime.
+  Disposal is idempotent, drains in-flight startup and bridge binding, cancels
+  waiters, and rolls back late session replies from obsolete processes or
+  conversations. A turn owns cancellation through streaming and parked tool
+  execution until its step drains, `agent_settled` runs, or the process exits;
+  only a fully drained `tool-calls` handoff preserves parked tool calls.
+  First interruption wins (`abandon` vs. `fail`), cancellation takes priority
+  over buffered output, and turn/tenant identities guard all async callbacks.
+- **Quota and TUI:** Settled checks share the reader's TTL and in-flight request
+  without blocking Pi. Model selection reads memory only. UI generation checks
+  discard stale background results; warning keys include group, bucket, reset
+  time, and threshold. An explicit quota query can discover uncached account tiers through
+  one tool-less ACP session per runtime, persisting the tier in `catalog.json`.
+  Email lookup reads at most the last 64 KiB of each candidate login log and uses
+  the last match in the first matching file. Runtime warnings stay off stderr to
+  preserve TUI rendering; diagnostics use status and agy's logs.
+- **Pi stream and error contracts:** `onPayload` can replace the request, and
+  `onProviderStreamEvent` observes events before conversion. At the first stream
+  event, `onResponse` receives synthetic status `200` and empty headers before
+  normalization; startup failures and an initial aborted finish emit no response.
+  ACP supplies no HTTP response metadata. Context overflow and exhausted quota
+  receive `context_length_exceeded` and `quota exceeded` markers for Pi's
+  compaction and retry decisions; transport timeouts remain distinct.
 
-The bridge binds to `127.0.0.1`, uses per-session bearer credentials, and checks
-structured tool identity before granting permissions. Session changes and
-compaction trigger cleanup and rebuilding; shutdown closes processes and the bridge.
+## MCP HTTP boundary
+
+The loopback bridge returns 400 for invalid URLs and 413 for authenticated POST
+bodies exceeding 1 MiB (1,048,576 bytes), including chunked uploads. Rejected
+oversized uploads close their connection after the error response. JSON parse
+errors retain the MCP parse-error response. Unexpected handler failures return
+500 before headers or destroy an already-started response; listener errors go to
+the diagnostic sink.
+
+Node's HTTP parser enforces a 10-second header reception deadline and a 30-second
+whole-request reception deadline, checked every second. These are reception limits
+only and do not cap completed SSE tool streams. Shutdown stops accepting
+connections and destroys all tracked sockets without waiting for tool promises.
 
 ## Source layout
 
@@ -38,10 +80,11 @@ compaction trigger cleanup and rebuilding; shutdown closes processes and the bri
 | --- | --- |
 | `index.ts` | Provider registration, commands, and Pi lifecycle hooks. |
 | `src/pi-stream.ts`, `src/protocol.ts` | Pi message conversion and bridge event contracts. |
-| `src/runtime.ts`, `src/conversation.ts`, `src/history.ts` | Sessions, pending tool calls, streaming, and history replay. |
-| `src/acp-process.ts`, `src/jsonrpc.ts`, `src/mcp-bridge.ts` | ACP transport and local MCP server. |
+| `src/runtime.ts`, `src/conversation.ts`, `src/history.ts` | Session orchestration, pending calls, tool identity metadata, streaming, and history replay. |
+| `src/acp-process.ts`, `src/jsonrpc.ts`, `src/mcp-bridge.ts` | ACP transport, local MCP server, tool schema compression, and tool deltas. |
 | `src/host.ts`, `src/preflight.ts`, `src/config.ts` | Process execution, executable discovery, and isolated home setup. |
 | `src/catalog.ts`, `src/quota.ts`, `src/format.ts`, `src/util.ts` | Model catalog, quota queries, TUI notice formatting, and shared utilities. |
+| `src/version.ts` | ACP/MCP version read from `package.json`. |
 | `tests/` | Scripted agy fixture, runtime tests, and Pi integration tests. |
 
 Upstream provenance and licensing are recorded in [NOTICE](../NOTICE) and
@@ -59,9 +102,8 @@ Tests run directly with Node's native TypeScript support; `tsx` is not required.
 Automated tests use a scripted local `agy` substitute so `npm test` runs offline
 without consuming account quota. They need permission to listen on `127.0.0.1`.
 
-Coverage includes tool suspension and resumption, parallel calls, permission
-checks, cancellation, history rewrites, images, quota errors, model discovery,
-account metadata caching, bounded login-log reads, and Pi stream completion.
+Tests cover ACP transport and sessions, tool routing and permissions, model and
+account discovery, Pi streaming and cancellation, and quota UI behavior.
 Listing models verifies extension loading, not access to the real service.
 
 To inspect the package contents without publishing:
@@ -69,6 +111,51 @@ To inspect the package contents without publishing:
 ```sh
 npm pack --dry-run
 ```
+
+## CI and releases
+
+`ci.yml` checks pull requests and pushes to `main`. `release.yml` runs on pushes
+to `main` (to run `release-please`), version-tag pushes, or manual runs on an
+existing tag, so ordinary commits do not trigger the `publish` job. CI tests
+Node.js 22.19.0 and 24; releases use Node.js 24. There is no committed lockfile,
+so dependency installation uses `npm install`.
+
+All changes to `main` require a pull request, passing CI on both Node versions,
+and resolved review discussions. Squash merge after CI passes; no second-person
+approval is required.
+
+Releases are automated with `release-please` (`release-please-config.json` and
+`.release-please-manifest.json`):
+- Merging Conventional Commits (`feat:`, `fix:`, etc.) to `main` opens or updates
+  a release PR that bumps `package.json` and updates `CHANGELOG.md` and
+  `.release-please-manifest.json`.
+- Squash-merging that release PR (preserving its `chore(main): release X.Y.Z`
+  title) creates the `vX.Y.Z` tag and GitHub Release, then triggers the
+  `publish` job in `release.yml` to check, test, pack, and publish to npm.
+- Enable **Allow GitHub Actions to create and approve pull requests** in
+  repository Settings → Actions → General. Without a `RELEASE_PLEASE_TOKEN` PAT
+  (with `contents: write` and `pull-requests: write`) in repository secrets,
+  `GITHUB_TOKEN` is used; in that case, close and reopen the release PR after
+  its final update to trigger `ci.yml` when branch protection requires it.
+- To recover a failed `publish` job, choose **Re-run failed jobs** on that
+  workflow run (re-running all jobs on a `main` run skips `publish` once the tag
+  exists) or run `gh workflow run release.yml --ref vX.Y.Z`. Manual tag pushes
+  (`vX.Y.Z`) also trigger `publish` but bypass `release-please`, leaving
+  `CHANGELOG.md` and `.release-please-manifest.json` out of sync.
+- The workflow accepts stable versions only, publishes one version at a time,
+  and never moves a published tag. Only a registry 404 means the version is
+  absent; network, authentication, and server errors stop the job.
+
+Configure npm [Trusted Publishing](https://docs.npmjs.com/trusted-publishers/)
+for owner `fdkevin0`, repository `pi-agy-acp`, and workflow filename `release.yml`.
+The workflow grants OIDC permission to the publish job and uses npm >= 11.5.1.
+An optional `NPM_TOKEN` repository secret supports token authentication through
+`NODE_AUTH_TOKEN`; use a granular write token with the required 2FA bypass.
+
+If npm publication succeeds but GitHub Release creation fails, rerun that tagged
+workflow, or use `gh workflow run release.yml --ref vX.Y.Z`. Branch-based manual
+runs are rejected. Existing npm versions are not republished, and GitHub Releases
+are created only for existing tags with `gh release create --verify-tag`.
 
 ## Documentation conventions
 

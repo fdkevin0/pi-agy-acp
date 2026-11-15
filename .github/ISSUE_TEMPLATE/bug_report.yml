@@ -1,0 +1,31 @@
+name: Bug report
+description: Report a reproducible problem.
+body:
+  - type: markdown
+    attributes:
+      value: "Remove credentials, account details, and private conversations. Report vulnerabilities through the Security tab."
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Extension, Pi, agy, and Node.js versions, plus your operating system.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Include a minimal example when possible.
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs or screenshots
+      description: Optional. Check for secrets and private content before submitting.

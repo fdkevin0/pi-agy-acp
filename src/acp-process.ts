@@ -36,6 +36,7 @@ export interface AcpSessionUpdate {
   sessionUpdate: string
   content?: { type: string; text?: string }
   toolCallId?: string
+  name?: string
   title?: string
   status?: string
   kind?: string
@@ -74,6 +75,7 @@ export interface AcpPermissionRequest {
   sessionId: string
   toolCall?: {
     toolCallId?: string
+    name?: string
     title?: string
     kind?: string
     rawInput?: unknown
@@ -136,8 +138,6 @@ export class AcpProcess {
   private child: AcpChild | undefined
   private peer: JsonRpcPeer | undefined
   private exitError: Error | undefined
-  /** Agent `initialize` result. */
-  initializeResult: Record<string, unknown> | undefined
   private readonly exitListeners = new Set<(error: Error) => void>()
   private readonly options: AcpProcessOptions
 
@@ -188,7 +188,7 @@ export class AcpProcess {
       peer.close(error)
       this.fail(error)
     })
-    this.initializeResult = await peer.request<Record<string, unknown>>(
+    await peer.request(
       'initialize',
       {
         protocolVersion: 1,
@@ -204,7 +204,9 @@ export class AcpProcess {
 
   /** Terminate the process. */
   stop(): void {
-    this.fail(new Error('ACP process stopped'))
+    const error = new Error('ACP process stopped')
+    this.fail(error)
+    this.peer?.close(error)
     this.child?.terminate()
   }
 
@@ -225,7 +227,8 @@ export class AcpProcess {
       params,
       { timeoutMs },
     )
-    this.listeners.set(result.sessionId, listener)
+    // JsonRpcPeer can resolve a buffered reply before stop; leave its rollback to the owner.
+    if (this.alive) this.listeners.set(result.sessionId, listener)
     return result
   }
 
@@ -309,6 +312,7 @@ export class AcpProcess {
   private fail(error: Error): void {
     if (this.exitError !== undefined) return
     this.exitError = error
+    this.listeners.clear()
     for (const listener of this.exitListeners) listener(error)
   }
 

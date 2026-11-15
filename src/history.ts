@@ -90,15 +90,38 @@ export function textOf(content: readonly ContentBlock[]): string {
 /**
  * The bridge instructions appended to the agent's system prompt.
  * @param system - the Pi system prompt.
+ * @param supplementalTools - initially advertised tools whose MCP schemas were compacted, preserving their full instructions.
  * @returns the complete appended system text.
  */
-export function bridgeSystemPrompt(system: string): string {
-  const preamble = [
-    'You are the primary model of a Pi coding agent session. The harness owns the conversation, the tools, and their permissions.',
-    `Every harness tool is available to you under the prefix \`${AGENT_TOOL_PREFIX}\`: a tool named \`X\` in the instructions below is the tool \`${AGENT_TOOL_PREFIX}X\`. If \`${AGENT_TOOL_PREFIX}X\` is absent from your direct tool declarations, invoke it via \`${AGENT_TOOL_PREFIX}${CALL_TOOL_NAME}\` with \`{"name":"X","arguments":{...}}\`. Use only these tools; pass arguments exactly as their schemas define.`,
-    'When the first user message contains a <pi_history> block, it reproduces the earlier part of this conversation; continue from the newest input after it without repeating completed actions.',
-  ].join('\n')
-  return system.length > 0 ? `${preamble}\n\n${system}` : preamble
+export function bridgeSystemPrompt(
+  system: string,
+  supplementalTools: readonly {
+    name: string
+    description: string
+    inputSchema: Record<string, unknown>
+  }[] = [],
+): string {
+  const sections = [
+    [
+      'You are the primary model of a Pi coding agent session. The harness owns the conversation, the tools, and their permissions.',
+      `Every harness tool is available to you under the prefix \`${AGENT_TOOL_PREFIX}\`: a tool named \`X\` in the instructions below is the tool \`${AGENT_TOOL_PREFIX}X\`. If \`${AGENT_TOOL_PREFIX}X\` is absent from your direct tool declarations, invoke it via \`${AGENT_TOOL_PREFIX}${CALL_TOOL_NAME}\` with \`{"name":"X","arguments":{...}}\`. Use only these tools; pass arguments exactly as their schemas define.`,
+      'When the first user message contains a <pi_history> block, it reproduces the earlier part of this conversation; continue from the newest input after it without repeating completed actions.',
+    ].join('\n'),
+  ]
+  if (supplementalTools.length > 0) {
+    const entries = supplementalTools.map((t) =>
+      JSON.stringify({
+        name: t.name,
+        description: t.description,
+        parameters: t.inputSchema,
+      }),
+    )
+    sections.push(
+      `<harness_tool_instructions>\n${entries.join('\n')}\n</harness_tool_instructions>`,
+    )
+  }
+  if (system.length > 0) sections.push(system)
+  return sections.join('\n\n')
 }
 
 /**

@@ -13,12 +13,19 @@
 
 import { LlmError } from './protocol.ts'
 import type { ContentBlock, StreamChunk, TokenUsage } from './protocol.ts'
-import type { AcpPromptResult, AcpSessionUpdate } from './acp-process.ts'
+import type {
+  AcpPromptResult,
+  AcpSessionUpdate,
+  AcpPermissionRequest,
+  AcpToolCallMeta,
+} from './acp-process.ts'
 import type { BridgeTool, BridgeToolResult } from './mcp-bridge.ts'
-import { AGENT_TOOL_PREFIX, CALL_TOOL_NAME } from './history.ts'
+import {
+  AGENT_TOOL_PREFIX,
+  CALL_TOOL_NAME,
+  MCP_SERVER_NAME,
+} from './history.ts'
 import { AsyncQueue, deferred, type Deferred } from './util.ts'
-
-export { CALL_TOOL_NAME }
 
 /** Agent-side transport retry notice streamed as message text, e.g. `⚠ API error (attempt 1): …`. */
 const AGENT_RETRY_NOTICE = /^\s*⚠\s*API error \(attempt \d+\)/
@@ -130,8 +137,15 @@ export type TurnEvent =
   | { kind: 'done'; result: AcpPromptResult }
   | { kind: 'error'; error: Error }
 
+/** Bound on buffered text/thought chars accumulated while a tool call is relayed. */
+const MAX_RELAY_BUFFER_CHARS = 65_536
+
 /** One running ACP prompt turn. */
 export class AcpTurn {
+  readonly cancellation = new AbortController()
+  /** First interruption wins; prompt completion is committed only after the step drains. */
+  private terminal: { kind: 'cancelled' } | { kind: 'failed'; error: Error } | undefined
+  releaseSignal: (() => void) | undefined
   readonly startedAt = performance.now()
   readonly events = new AsyncQueue<TurnEvent>()
   /** Calls handed to Pi whose results have not arrived yet. */
@@ -144,8 +158,14 @@ export class AcpTurn {
   continuations = 0
   /** The agent ended the prompt. */
   finished = false
-  /** A parked call was answered with a still-running notice and the agent has not resumed waiting yet. */
-  relaying = false
+  /** Settles after the current prompt's result or error has been queued. */
+  promptSettled: Promise<void> = Promise.resolve()
+  usage?: AcpPromptResult['usage']
+  /** Relayed call ids whose results the agent has not yet re-awaited via `pi_await_result`. */
+  readonly relayedCalls = new Set<string>()
+  /** Bounded output buffered while one or more calls are relayed. */
+  private relayBuffer: Array<Extract<TurnEvent, { kind: 'text' | 'thought' }>> = []
+  private relayBufferChars = 0
   /** The turn produced visible text or a tool call. */
   produced = false
   /** Agent-side transport retry notices dropped from the output. */
@@ -178,6 +198,56 @@ export class AcpTurn {
     return call
   }
 
+  get isRelaying(): boolean {
+    return this.relayedCalls.size > 0
+  }
+
+  /** Record that `callId` timed out into a relay notice and awaits `pi_await_result`. */
+  markRelayed(callId: string): void {
+    this.relayedCalls.add(callId)
+  }
+
+  /** Clear one relayed call when `pi_await_result` resumes it, flushing buffered output once all relays clear. */
+  resumeRelay(callId: string): void {
+    if (this.relayedCalls.delete(callId) && this.relayedCalls.size === 0) {
+      for (const event of this.relayBuffer) this.events.push(event)
+      this.clearRelayBuffer()
+      const held = this.recoverNoticeHold()
+      if (held.length > 0) this.events.push({ kind: 'text', text: held })
+    }
+  }
+
+  /** Release all relay tracking and buffered output. */
+  clearRelay(): void {
+    this.relayedCalls.clear()
+    this.clearRelayBuffer()
+  }
+
+  private clearRelayBuffer(): void {
+    this.relayBuffer.length = 0
+    this.relayBufferChars = 0
+  }
+
+  private emitOrBuffer(
+    event: Extract<TurnEvent, { kind: 'text' | 'thought' }>,
+  ): void {
+    if (!this.isRelaying) {
+      this.events.push(event)
+      return
+    }
+    const remaining = MAX_RELAY_BUFFER_CHARS - this.relayBufferChars
+    if (remaining <= 0) return
+    const text =
+      event.text.length <= remaining ? event.text : event.text.slice(0, remaining)
+    this.relayBufferChars += text.length
+    const tail = this.relayBuffer[this.relayBuffer.length - 1]
+    if (tail !== undefined && tail.kind === event.kind) {
+      tail.text += text
+    } else {
+      this.relayBuffer.push({ kind: event.kind, text })
+    }
+  }
+
   /**
    * Route one ACP session update into the event queue.
    * @param update - the agent notification.
@@ -191,10 +261,8 @@ export class AcpTurn {
     }
     if (update.sessionUpdate === 'agent_thought_chunk') {
       const held = this.recoverNoticeHold()
-      if (held.length > 0 && !this.relaying)
-        this.events.push({ kind: 'text', text: held })
-      if (text.length > 0 && !this.relaying)
-        this.events.push({ kind: 'thought', text })
+      if (held.length > 0) this.emitOrBuffer({ kind: 'text', text: held })
+      if (text.length > 0) this.emitOrBuffer({ kind: 'thought', text })
     }
   }
 
@@ -214,7 +282,7 @@ export class AcpTurn {
       this.retryNotices++
       return
     }
-    if (!this.relaying) this.events.push({ kind: 'text', text: combined })
+    this.emitOrBuffer({ kind: 'text', text: combined })
   }
 
   /**
@@ -230,7 +298,7 @@ export class AcpTurn {
       this.retryNotices++
       return ''
     }
-    return this.relaying ? '' : held
+    return held
   }
 
   /**
@@ -238,6 +306,37 @@ export class AcpTurn {
    * @param reason - message delivered to the agent.
    */
   abandon(reason: string): void {
+    this.terminal ??= { kind: 'cancelled' }
+    if (this.terminal.kind === 'cancelled') this.cancellation.abort()
+    this.clearRelay()
+    this.settleCalls(reason)
+  }
+
+  /** End transport ownership without misreporting a process failure as cancellation. */
+  fail(error: Error): void {
+    this.terminal ??= { kind: 'failed', error }
+    this.clearRelay()
+    this.events.push({ kind: 'error', error })
+    this.settleCalls(error.message)
+  }
+
+  /** Guard both async-generator boundaries before emission, accounting, or drain. */
+  guard(chunk: StreamChunk | undefined, signal?: AbortSignal): StreamChunk | undefined {
+    if (signal?.aborted) this.abandon('The harness cancelled this request.')
+    if (this.terminal?.kind === 'failed') throw this.terminal.error
+    if (this.terminal?.kind === 'cancelled') return {
+      type: 'finish',
+      reason: {
+        kind: 'aborted',
+        failure: { message: 'Request aborted', code: 'ABORTED' },
+      },
+    }
+    return chunk
+  }
+
+  private settleCalls(reason: string): void {
+    this.releaseSignal?.()
+    this.releaseSignal = undefined
     for (const call of this.calls.values()) {
       call.result.resolve({
         content: [{ type: 'text', text: reason }],
@@ -258,8 +357,6 @@ export interface PumpHost {
   continuePrompt(): Promise<AcpPromptResult>
   /** Request cancellation of the running turn. */
   cancel(): void
-  /** Observe the final usage of a prompt turn. */
-  recordUsage(usage: AcpPromptResult['usage'], steps: number): void
 }
 
 /**
@@ -321,6 +418,45 @@ export async function* pumpStep(
   host: PumpHost,
   signal: AbortSignal | undefined,
 ): AsyncGenerator<StreamChunk> {
+  const cancel = () => turn.abandon('The harness cancelled this request.')
+  signal?.addEventListener('abort', cancel, { once: true })
+  if (signal?.aborted) cancel()
+  const chunks = stepChunks(turn, host, signal)
+  try {
+    // Real ACP exit can land behind a queued park, or while a consumer holds block-start.
+    for (;;) {
+      const interrupted = turn.guard(undefined, signal)
+      if (interrupted !== undefined) {
+        host.cancel()
+        yield interrupted
+        return
+      }
+      const next = await chunks.next()
+      const chunk = turn.guard(next.value, signal)
+      const aborted = chunk?.type === 'finish' && chunk.reason.kind === 'aborted'
+      if (aborted) host.cancel()
+      if (chunk !== undefined) yield chunk
+      if (aborted) return
+      if (next.done) return
+    }
+  } catch (error) {
+    turn.fail(error instanceof Error ? error : new Error(String(error)))
+    const interrupted = turn.guard(undefined, signal)
+    if (interrupted !== undefined) {
+      host.cancel()
+      yield interrupted
+    }
+  } finally {
+    signal?.removeEventListener('abort', cancel)
+    await chunks.return(undefined)
+  }
+}
+
+async function* stepChunks(
+  turn: AcpTurn,
+  host: PumpHost,
+  signal: AbortSignal | undefined,
+): AsyncGenerator<StreamChunk> {
   let index = 0
   let open:
     { index: number; type: 'text' | 'reasoning'; text: string } | undefined
@@ -349,21 +485,9 @@ export async function* pumpStep(
   }
 
   for (;;) {
-    const ready = await turn.events.wait(signal)
-    if (!ready) {
-      host.cancel()
-      turn.abandon('The harness cancelled this request.')
-      yield* close()
-      yield {
-        type: 'finish',
-        reason: {
-          kind: 'aborted',
-          failure: { message: 'Request aborted', code: 'ABORTED' },
-        },
-      }
-      return
-    }
-    if (turn.events.peek()?.kind !== 'text') {
+    await turn.events.wait(signal)
+    if (turn.guard(undefined, signal) !== undefined) return
+    if (!turn.isRelaying && turn.events.peek()?.kind !== 'text') {
       const held = turn.recoverNoticeHold()
       if (held.length > 0) {
         turn.produced = true
@@ -390,6 +514,7 @@ export async function* pumpStep(
           turn.events.shift()
           batch.push(next.call)
         }
+        if (turn.guard(undefined, signal) !== undefined) return
         for (const call of batch) {
           const blockIndex = index++
           turn.pendingCalls.set(call.id, call)
@@ -427,23 +552,29 @@ export async function* pumpStep(
           turn.continuations < host.maxContinuations
         ) {
           turn.continuations++
-          void host.continuePrompt().then(
+          turn.promptSettled = host.continuePrompt().then(
             (result) => turn.events.push({ kind: 'done', result }),
             (error: unknown) =>
-              turn.events.push({
-                kind: 'error',
-                error:
-                  error instanceof Error ? error : new Error(String(error)),
-              }),
+              turn.fail(error instanceof Error ? error : new Error(String(error))),
           )
           break
         }
         turn.finished = true
         yield* close()
         const calls = turn.toolSteps + turn.continuations + 1
-        host.recordUsage(event.result.usage, calls)
+        turn.usage = event.result.usage
         const usage = toTokenUsage(event.result.usage, calls)
         if (usage !== undefined) yield { type: 'usage', usage }
+        if (
+          turn.isRelaying &&
+          (stop === 'end_turn' || stop === 'max_tokens')
+        ) {
+          turn.clearRelay()
+          throw new LlmError(
+            'Antigravity ended the turn before retrieving relayed tool result(s)',
+            'PROVIDER_ERROR',
+          )
+        }
         if (stop === 'end_turn' && !turn.produced) {
           throw new LlmError(
             'Antigravity ended the turn without visible output',
@@ -497,8 +628,9 @@ export async function* pumpStep(
       }
       case 'error':
         turn.finished = true
-        yield* close()
-        throw event.error
+        turn.fail(event.error)
+        turn.guard(undefined, signal)
+        return
     }
   }
 }
@@ -517,4 +649,155 @@ export function relayNotice(call: ParkedCall): BridgeToolResult {
       },
     ],
   }
+}
+
+/** Structured MCP metadata the agent reported for one tool call. */
+export interface ReportedToolCall {
+  kind?: string
+  serverName?: string
+  toolName?: string
+  /** Set when later updates contradicted an already established field. */
+  conflict?: boolean
+}
+
+/** Read a non-empty string field. */
+function nonEmpty(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined
+}
+
+/**
+ * Resolve one explicit metadata field across candidate aliases, flagging when
+ * any two non-empty candidates disagree.
+ */
+function reconcileCandidates(values: readonly unknown[]): {
+  value?: string
+  conflict: boolean
+} {
+  let value: string | undefined
+  let conflict = false
+  for (const raw of values) {
+    const candidate = nonEmpty(raw)
+    if (candidate === undefined) continue
+    if (value === undefined) value = candidate
+    else if (value !== candidate) conflict = true
+  }
+  return { ...(value !== undefined ? { value } : {}), conflict }
+}
+
+/**
+ * Extract tool identity `(serverName, toolName)` from `session/update`
+ * (`recordReportedToolCall`) or `session/request_permission` (`answerPermission`).
+ * Reads top-level `mcpServerName`/`mcpToolName` or `_meta`, and reconciles flat
+ * `name` (`mcp_<server>_<tool>`). Non-Pi flat names map to a `non-pi:<name>`
+ * server sentinel, and contradictions across explicit fields or `name` set
+ * `conflict: true`. Returns `{}` only when no identity fields are present.
+ * `title` and `rawInput` are deliberately not consulted.
+ */
+export function structuredToolMeta(
+  toolCall: AcpPermissionRequest['toolCall'],
+): {
+  serverName?: string
+  toolName?: string
+  conflict?: boolean
+} {
+  const meta: AcpToolCallMeta | undefined = toolCall?._meta
+  const server = reconcileCandidates([
+    toolCall?.mcpServerName,
+    meta?.mcpServerName,
+    meta?.serverName,
+    meta?.server,
+  ])
+  const tool = reconcileCandidates([
+    toolCall?.mcpToolName,
+    meta?.mcpToolName,
+    meta?.toolName,
+    meta?.tool,
+  ])
+  const explicitServer = server.value
+  const explicitTool = tool.value
+  const flat = nonEmpty(toolCall?.name)
+  if (flat === undefined) {
+    const conflict = server.conflict || tool.conflict
+    return {
+      ...(explicitServer !== undefined ? { serverName: explicitServer } : {}),
+      ...(explicitTool !== undefined ? { toolName: explicitTool } : {}),
+      ...(conflict ? { conflict: true } : {}),
+    }
+  }
+  const candidateServer = explicitServer ?? MCP_SERVER_NAME
+  const prefix = `mcp_${candidateServer}_`
+  const hasPrefixedTool =
+    flat.startsWith(prefix) && flat.length > prefix.length
+  const flatServer = hasPrefixedTool ? candidateServer : `non-pi:${flat}`
+  const flatTool = hasPrefixedTool ? flat.slice(prefix.length) : flat
+  const hasExplicit = explicitServer !== undefined || explicitTool !== undefined
+  const conflict =
+    server.conflict ||
+    tool.conflict ||
+    (hasExplicit &&
+      (!hasPrefixedTool ||
+        (explicitTool !== undefined && explicitTool !== flatTool)))
+  return {
+    serverName: explicitServer ?? flatServer,
+    toolName: explicitTool ?? flatTool,
+    ...(conflict ? { conflict: true } : {}),
+  }
+}
+
+/**
+ * Record the structured metadata of one agent-reported tool-call update.
+ * The first report establishes the identity; later updates merge only the
+ * fields actually present, so a status-only `tool_call_update` never wipes an
+ * established `server`/`tool`/`kind`. A later field that contradicts the
+ * established identity keeps the original value and marks the record
+ * anomalous — the permission gate refuses every further request for that call.
+ * @returns 'created' | 'merged' | 'conflict', or undefined for ignored updates.
+ */
+export function recordReportedToolCall(
+  conv: { reportedToolCalls: Map<string, ReportedToolCall> },
+  update: AcpSessionUpdate,
+): 'created' | 'merged' | 'conflict' | undefined {
+  if (
+    update.sessionUpdate !== 'tool_call' &&
+    update.sessionUpdate !== 'tool_call_update'
+  )
+    return
+  if (typeof update.toolCallId !== 'string' || update.toolCallId.length === 0)
+    return
+  const {
+    serverName,
+    toolName,
+    conflict: metaConflict,
+  } = structuredToolMeta(update)
+  const kind = typeof update.kind === 'string' ? update.kind : undefined
+  const existing = conv.reportedToolCalls.get(update.toolCallId)
+  const merged: ReportedToolCall = existing === undefined ? {} : { ...existing }
+  let conflict = metaConflict === true
+  if (kind !== undefined) {
+    if (merged.kind !== undefined && merged.kind !== kind) conflict = true
+    else merged.kind = kind
+  }
+  if (serverName !== undefined) {
+    if (merged.serverName !== undefined && merged.serverName !== serverName)
+      conflict = true
+    else merged.serverName = serverName
+  }
+  if (toolName !== undefined) {
+    if (merged.toolName !== undefined && merged.toolName !== toolName)
+      conflict = true
+    else merged.toolName = toolName
+  }
+  if (conflict) merged.conflict = true
+  conv.reportedToolCalls.set(update.toolCallId, merged)
+  if (conflict) return 'conflict'
+  return existing === undefined ? 'created' : 'merged'
+}
+
+/** Whether `rawInput` carries no arguments at all (MCP server loading probes). */
+export function isEmptyInput(rawInput: unknown): boolean {
+  if (rawInput === undefined || rawInput === null) return true
+  if (typeof rawInput === 'string') return rawInput.trim().length === 0
+  if (Array.isArray(rawInput)) return rawInput.length === 0
+  if (typeof rawInput === 'object') return Object.keys(rawInput).length === 0
+  return false
 }
