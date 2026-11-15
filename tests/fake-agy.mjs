@@ -26,6 +26,7 @@ import { createInterface } from 'node:readline'
 const log = process.env.FAKE_AGY_LOG
 const initLog = process.env.FAKE_AGY_INIT
 const mcpLog = process.env.FAKE_AGY_MCP
+const flatNames = process.env.FAKE_AGY_FLAT_NAMES === '1'
 const homeIndex = process.argv.indexOf('--gemini-dir')
 const home = homeIndex >= 0 ? process.argv[homeIndex + 1] : undefined
 const sessions = new Map()
@@ -163,18 +164,32 @@ async function runToolCall(s, name, args, opts = {}) {
   s.lastToolCallId = toolCallId
   const toolCall = {
     toolCallId,
-    title: opts.title ?? `mcp_pi_${name}`,
+    title: opts.title ?? (flatNames ? `Run mcp_pi_${name}` : `mcp_pi_${name}`),
     kind: opts.kind ?? 'other',
     rawInput: opts.rawInput ?? args,
   }
+  const reportFlatName =
+    opts.reportName !== undefined
+      ? opts.reportName
+      : flatNames && opts.structured !== null
+        ? `mcp_pi_${name}`
+        : undefined
+  const claimFlatName = opts.barePermissionAsk
+    ? undefined
+    : opts.claimName !== undefined
+      ? opts.claimName
+      : reportFlatName
   const reportStructured =
-    opts.structured === undefined
-      ? { server: 'pi', tool: name }
-      : opts.structured
+    opts.structured !== undefined
+      ? opts.structured
+      : flatNames
+        ? null
+        : { server: 'pi', tool: name }
   if (!opts.noReport) {
     update(s.id, {
       sessionUpdate: 'tool_call',
       toolCallId,
+      ...(reportFlatName !== undefined ? { name: reportFlatName } : {}),
       title: toolCall.title,
       kind: toolCall.kind,
       rawInput: toolCall.rawInput,
@@ -184,6 +199,7 @@ async function runToolCall(s, name, args, opts = {}) {
             mcpToolName: reportStructured.tool,
           }
         : {}),
+      ...(opts.reportMeta ? { _meta: opts.reportMeta } : {}),
     })
   }
   // Incremental updates sent after the identity report, before the permission ask.
@@ -202,14 +218,24 @@ async function runToolCall(s, name, args, opts = {}) {
       mcpToolName: opts.conflictUpdateWith,
     })
   }
+  if (opts.conflictUpdateName !== undefined) {
+    update(s.id, {
+      sessionUpdate: 'tool_call_update',
+      toolCallId,
+      status: 'pending',
+      name: opts.conflictUpdateName,
+    })
+  }
   if (!opts.noPermission) {
     const outcome = await askPermission(
       s,
       {
         ...toolCall,
+        ...(claimFlatName !== undefined ? { name: claimFlatName } : {}),
         ...(opts.claim
           ? { mcpServerName: opts.claim.server, mcpToolName: opts.claim.tool }
           : {}),
+        ...(opts.claimMeta ? { _meta: opts.claimMeta } : {}),
       },
       opts.sessionIdOverride,
       opts.alwaysOnly ? 'always-only' : undefined,
@@ -335,6 +361,23 @@ async function runPrompt(s, text) {
           ? `PROBE_OK:${selected}`
           : `PROBE_DENIED:${selected}`,
       )
+    } else if (line.startsWith('PROBEFLAT ')) {
+      const flatName = line.slice('PROBEFLAT '.length).trim()
+      const toolCallId = `tc${++toolCallSeq}`
+      const outcome = await askPermission(s, {
+        toolCallId,
+        name: flatName,
+        title: flatName,
+        kind: 'other',
+        rawInput: {},
+      })
+      const selected =
+        outcome?.outcome === 'selected' ? String(outcome.optionId) : 'cancelled'
+      output.push(
+        selected.startsWith('allow')
+          ? `PROBE_OK:${selected}`
+          : `PROBE_DENIED:${selected}`,
+      )
     } else if (line.startsWith('PROBECALL')) {
       const toolCallId = `tc${++toolCallSeq}`
       const outcome = await askPermission(s, {
@@ -350,12 +393,92 @@ async function runPrompt(s, text) {
           ? `PROBE_OK:${selected}`
           : `PROBE_DENIED:${selected}`,
       )
+    } else if (line.startsWith('STATUSUPDCALL_BAREASK ')) {
+      const [, name, ...rest] = line.split(' ')
+      const result = await runToolCall(s, name, JSON.parse(rest.join(' ')), {
+        statusOnlyUpdate: true,
+        barePermissionAsk: true,
+      })
+      output.push(`RESULT(${name})=${result}`)
     } else if (line.startsWith('STATUSUPDCALL ')) {
       const [, name, ...rest] = line.split(' ')
       const result = await runToolCall(s, name, JSON.parse(rest.join(' ')), {
         statusOnlyUpdate: true,
       })
       output.push(`RESULT(${name})=${result}`)
+    } else if (line.startsWith('NATIVECALL ')) {
+      const [, flatName, ...rest] = line.split(' ')
+      const result = await runToolCall(s, flatName, JSON.parse(rest.join(' ')), {
+        reportName: flatName,
+        structured: null,
+        title: flatName,
+      })
+      output.push(`RESULT(${flatName})=${result}`)
+    } else if (line.startsWith('FLATCONFLICTCALL ')) {
+      const [head, claimedFlat] = line
+        .slice('FLATCONFLICTCALL '.length)
+        .split(' ;; ')
+      const [reportedFlat, ...rest] = head.trim().split(' ')
+      const result = await runToolCall(
+        s,
+        reportedFlat,
+        JSON.parse(rest.join(' ')),
+        {
+          reportName: reportedFlat,
+          claimName: claimedFlat.trim(),
+          structured: null,
+          title: reportedFlat,
+        },
+      )
+      output.push(`RESULT(${reportedFlat})=${result}`)
+    } else if (line.startsWith('FLATCONFLICTUPDCALL ')) {
+      const [head, second] = line
+        .slice('FLATCONFLICTUPDCALL '.length)
+        .split(' ;; ')
+      const [firstFlat, ...rest] = head.trim().split(' ')
+      const secondFlat = second.trim()
+      const args = JSON.parse(rest.join(' '))
+      const result = await runToolCall(s, firstFlat, args, {
+        reportName: firstFlat,
+        conflictUpdateName: secondFlat,
+        structured: null,
+        title: firstFlat,
+      })
+      const outcome = await askPermission(s, {
+        toolCallId: s.lastToolCallId,
+        name: secondFlat,
+        title: secondFlat,
+        kind: 'other',
+        rawInput: args,
+      })
+      const selected =
+        outcome?.outcome === 'selected' ? String(outcome.optionId) : 'cancelled'
+      const secondStatus = selected.startsWith('allow')
+        ? `SECOND_CLAIM_${secondFlat}_ALLOWED:${selected}`
+        : `SECOND_CLAIM_${secondFlat}_DENIED`
+      output.push(`RESULT(${firstFlat})=${result} ${secondStatus}`)
+    } else if (line.startsWith('MIXEDMETACALL ')) {
+      const [, flatName, server, tool, ...rest] = line.split(' ')
+      const result = await runToolCall(s, flatName, JSON.parse(rest.join(' ')), {
+        reportName: flatName,
+        structured: null,
+        reportMeta: { server, tool },
+        claimMeta: { server, tool },
+        title: flatName,
+      })
+      output.push(`RESULT(${flatName})=${result}`)
+    } else if (line.startsWith('TOPCONFLICTMETACALL ')) {
+      const [, flatName, topServer, topTool, metaServer, metaTool, ...rest] =
+        line.split(' ')
+      const result = await runToolCall(s, flatName, JSON.parse(rest.join(' ')), {
+        reportName: flatName,
+        structured: { server: topServer, tool: topTool },
+        reportMeta: { server: metaServer, tool: metaTool },
+        claim: { server: topServer, tool: topTool },
+        claimMeta: { server: metaServer, tool: metaTool },
+        title: flatName,
+      })
+      output.push(`RESULT(${flatName})=${result}`)
     } else if (line.startsWith('CONFLICTUPDCALL ')) {
       const [head, other] = line.slice(15).split(' ;; ')
       const [name, ...rest] = head.trim().split(' ')

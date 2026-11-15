@@ -36,6 +36,7 @@ export interface AcpSessionUpdate {
   sessionUpdate: string
   content?: { type: string; text?: string }
   toolCallId?: string
+  name?: string
   title?: string
   status?: string
   kind?: string
@@ -74,6 +75,7 @@ export interface AcpPermissionRequest {
   sessionId: string
   toolCall?: {
     toolCallId?: string
+    name?: string
     title?: string
     kind?: string
     rawInput?: unknown

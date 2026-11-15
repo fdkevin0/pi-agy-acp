@@ -883,7 +883,7 @@ export class AntigravityRuntime {
     }
     const reject = (reason: string): AcpPermissionOutcome => {
       this.host.log.warn(
-        `antigravity-acp: refused permission request (${reason}): ${request.toolCall?.title ?? 'unknown'}`,
+        `antigravity-acp: refused permission request (${reason}): ${request.toolCall?.title || request.toolCall?.name || 'unknown'}`,
       )
       return pick('reject_once') ?? { outcome: 'cancelled' }
     }
@@ -898,6 +898,9 @@ export class AntigravityRuntime {
       return reject('missing toolCallId')
     const reported = conv.reportedToolCalls.get(toolCallId)
     const claimed = structuredToolMeta(request.toolCall)
+    if (claimed.conflict === true) {
+      return reject('conflicting tool metadata in permission request')
+    }
     if (reported === undefined) {
       // Nothing the agent reported in `session/update` backs this call: its own
       // in-request metadata is untrusted (stale or cross-session toolCallId).
