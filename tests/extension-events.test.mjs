@@ -370,7 +370,18 @@ test('late background results after foreign switch, reset, error, or shutdown ca
   runCommand.mock.mockImplementationOnce(() => foreignPending.promise)
   h.handlers.get('agent_settled')({}, h.ctx)
   h.handlers.get('model_select')({ model: { provider: 'other' } }, h.ctx)
+  h.handlers.get('model_select')({ model: h.ctx.model }, h.ctx)
   await expectNoUpdate(() => foreignPending.resolve(usageOutput(liveGroups())))
+
+  now += 120_000
+  const newSessionPending = Promise.withResolvers()
+  runCommand.mock.mockImplementationOnce(() => newSessionPending.promise)
+  h.handlers.get('agent_settled')({}, h.ctx)
+  await h.handlers.get('session_start')({ reason: 'new' }, h.ctx)
+  h.handlers.get('model_select')({ model: h.ctx.model }, h.ctx)
+  await expectNoUpdate(() =>
+    newSessionPending.resolve(usageOutput(liveGroups())),
+  )
 
   now += 120_000
   const resetPending = Promise.withResolvers()
@@ -552,6 +563,34 @@ test('quota selection covers live agy 1.5.9 catalog, multi-group minimums, quali
     quotaForModel(collidingQualifiers, { id: 'claude-opus-5-5', name: 'Claude Opus 5.5' }),
     undefined,
   )
+
+  const singleEffortCap = groups(
+    group('Claude Opus 5.5 (High)', 0),
+    group('Claude and GPT models', 0.9),
+  )
+  assert.equal(
+    quotaForModel(singleEffortCap, {
+      id: 'claude-opus-5-5',
+      name: 'Claude Opus 5.5',
+    }),
+    undefined,
+  )
+  assert.equal(
+    formatQuotaStatus(
+      singleEffortCap,
+      { id: 'claude-opus-5-5-high', name: 'Claude Opus 5.5 (High)' },
+      'remaining',
+    ),
+    'AGY 0%',
+  )
+  assert.equal(
+    formatQuotaStatus(
+      singleEffortCap,
+      { id: 'claude-sonnet-5-5', name: 'Claude Sonnet 5.5' },
+      'remaining',
+    ),
+    'AGY 90%',
+  )
   assert.equal(
     quotaForModel(groups(group('Gemini Models', 0.2), group('Gemini Models', 0.8)), { id: 'gemini-3.8-flash' }),
     undefined,
@@ -565,8 +604,12 @@ test('quota selection covers live agy 1.5.9 catalog, multi-group minimums, quali
 test('agent_settled during reset or shutdown disposal skips quota reads and does not block replacement runtime', async (t) => {
   const resetDisposing = Promise.withResolvers()
   const shutdownDisposing = Promise.withResolvers()
-  const dispose = t.mock.method(AntigravityRuntime.prototype, 'dispose', async () => {})
-  dispose.mock.mockImplementationOnce(() => resetDisposing.promise)
+  const realDispose = AntigravityRuntime.prototype.dispose
+  const dispose = t.mock.method(AntigravityRuntime.prototype, 'dispose')
+  dispose.mock.mockImplementationOnce(async function () {
+    await realDispose.call(this)
+    await resetDisposing.promise
+  })
   const runCommand = t.mock.fn(async () => usageOutput(liveGroups()))
   const h = harness(t, { runCommand })
 
@@ -605,7 +648,10 @@ test('agent_settled during reset or shutdown disposal skips quota reads and does
     throw new Error('stale ctx')
   }
 
-  dispose.mock.mockImplementationOnce(() => shutdownDisposing.promise)
+  dispose.mock.mockImplementationOnce(async function () {
+    await realDispose.call(this)
+    await shutdownDisposing.promise
+  })
   const shutdownDone = h.handlers.get('session_shutdown')({}, h.ctx)
   h.handlers.get('agent_settled')({}, h.ctx)
   await tick()
@@ -691,6 +737,24 @@ test('unmatched or ambiguous quota ownership does not emit a misleading low-quot
     usageOutput([group('Gemini Models', 0), group('Gemini Models', 0.1)]),
   )
   h.handlers.get('agent_settled')({}, h.ctx)
+  await tick()
+  assert.equal(h.statuses.at(-1), undefined)
+  assert.equal(h.notices.length, 0)
+
+  now += 120_000
+  runCommand.mock.mockImplementationOnce(async () =>
+    usageOutput([
+      group('Claude Opus 5.5 (High)', 0),
+      group('Claude and GPT models', 0.9),
+    ]),
+  )
+  h.handlers.get('agent_settled')(
+    {},
+    {
+      ...h.ctx,
+      model: { provider, id: 'claude-opus-5-5', name: 'Claude Opus 5.5' },
+    },
+  )
   await tick()
   assert.equal(h.statuses.at(-1), undefined)
   assert.equal(h.notices.length, 0)

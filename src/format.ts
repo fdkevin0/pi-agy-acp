@@ -254,15 +254,30 @@ function selectQuotaGroups(
   if (variantOnly.length === 1) return [variantOnly[0]!.group]
   if (variantOnly.length > 1) return []
 
-  const qualifiedQual = (g: ParsedPhrase, m: ParsedPhrase) =>
-    g.qualifier !== undefined && m.qualifier === undefined
-  const qualifiedMatches = indexed.filter(
+  const thinkingQual = (g: ParsedPhrase, m: ParsedPhrase) =>
+    g.qualifier === 'thinking' && m.qualifier === undefined
+  const thinkingMatches = indexed.filter(
     (entry) =>
-      matchGroup(entry.phrases, candidates, isExactPhrase, qualifiedQual) ||
-      matchGroup(entry.phrases, candidates, isBroaderVariant, qualifiedQual),
+      matchGroup(entry.phrases, candidates, isExactPhrase, thinkingQual) ||
+      matchGroup(entry.phrases, candidates, isBroaderVariant, thinkingQual),
   )
-  if (qualifiedMatches.length === 1) return [qualifiedMatches[0]!.group]
-  if (qualifiedMatches.length > 1) return []
+  if (thinkingMatches.length === 1) return [thinkingMatches[0]!.group]
+  if (thinkingMatches.length > 1) return []
+
+  // Without an effort qualifier on the model reference, any effort-capped pool (`low`/`medium`/`high`)
+  // makes group ownership depend on unknown active effort; return unknown rather than guessing.
+  const effortQual = (g: ParsedPhrase, m: ParsedPhrase) =>
+    g.qualifier !== undefined &&
+    g.qualifier !== 'thinking' &&
+    m.qualifier === undefined
+  if (
+    indexed.some(
+      (entry) =>
+        matchGroup(entry.phrases, candidates, isExactPhrase, effortQual) ||
+        matchGroup(entry.phrases, candidates, isBroaderVariant, effortQual),
+    )
+  )
+    return []
 
   const family = extractFamily(model.id) ?? extractFamily(model.name)
   if (!family) return []

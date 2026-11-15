@@ -26,7 +26,7 @@ import type { QuotaSnapshot } from './src/quota.ts'
 
 export default function (
   pi: ExtensionAPI,
-  host: Partial<Pick<RuntimeHost, 'spawnAcp' | 'runCommand'>> = {},
+  host: Partial<Pick<RuntimeHost, 'runCommand'>> = {},
 ) {
   const envQuotaDisplay = asQuotaDisplay(process.env.PI_AGY_QUOTA_DISPLAY)
   const config = {
@@ -38,7 +38,7 @@ export default function (
   const createRuntime = () =>
     new AntigravityRuntime({
       config,
-      spawnAcp: host.spawnAcp ?? spawnAcp,
+      spawnAcp,
       runCommand: host.runCommand ?? runCommand,
       log: { info: () => {}, warn: () => {} },
       onModelsChanged: () => {
@@ -115,6 +115,7 @@ export default function (
   const warned = new Set<string>()
   const clearStatus = (ctx?: ExtensionContext) => {
     uiEpoch++
+    pendingSettle = undefined
     if (!shutDown && ctx?.hasUI) ctx.ui.setStatus(config.provider, undefined)
   }
   const updateStatus = (
@@ -172,11 +173,19 @@ export default function (
     ctx.model?.provider === config.provider ? { action: 'stop' } : undefined,
   )
   pi.on('model_select', (event, ctx) => {
+    const retarget =
+      pendingSettle &&
+      pendingSettle.runtime === activeRuntime &&
+      pendingSettle.epoch === uiEpoch &&
+      event.model?.provider === config.provider
+        ? pendingSettle
+        : undefined
     clearStatus(ctx)
-    if (pendingSettle && event.model?.provider === config.provider) {
-      pendingSettle.epoch = uiEpoch
-      pendingSettle.ctx = ctx
-      pendingSettle.model = event.model
+    if (retarget) {
+      retarget.epoch = uiEpoch
+      retarget.ctx = ctx
+      retarget.model = event.model
+      pendingSettle = retarget
     }
     updateStatus(ctx, activeRuntime?.quota.peek(), event.model)
   })
