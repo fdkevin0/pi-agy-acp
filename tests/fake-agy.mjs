@@ -680,7 +680,7 @@ rl.on('line', async (line) => {
       if (log)
         appendFileSync(
           log,
-          `${JSON.stringify({ session: s.id, text, images: params.prompt.filter((b) => b.type === 'image').length, tools: s.tools, model: s.model, level: s.level, system: s.system.slice(0, 80) })}\n`,
+          `${JSON.stringify({ session: s.id, text, images: params.prompt.filter((b) => b.type === 'image').length, tools: s.tools, model: s.model, level: s.level, system: s.system })}\n`,
         )
       s.cancelled = false
       const result = await runPrompt(s, text)

@@ -1,10 +1,12 @@
 /**
  * Projection of Pi request history into Antigravity ACP prompts.
  *
- * ACP sessions own their history, so Pi replays its authoritative history
- * once when a session is (re)built and afterwards sends only new input. The
- * replay renders earlier turns as a delimited transcript in front of the
- * newest user input; tool calls keep the agent-visible `mcp_pi_` names.
+ * ACP sessions own their history, so `session/new` appends only the static MCP
+ * tool-routing preamble while `<system_instructions>`,
+ * `<harness_tool_instructions>`, and `<pi_history>` travel in a session's
+ * opening prompt; subsequent turns send only new input. The replay renders
+ * earlier turns as a delimited transcript in front of the newest user input;
+ * tool calls keep the agent-visible `mcp_pi_` names.
  * @module pi-agy-acp/history
  */
 
@@ -87,27 +89,47 @@ export function textOf(content: readonly ContentBlock[]): string {
     .join('')
 }
 
+/** Compacted initial tool declaration forwarded in the session preamble. */
+export interface SupplementalTool {
+  name: string
+  description: string
+  inputSchema: Record<string, unknown>
+}
+
+/** Options controlling session preamble rendering and replay budgeting. */
+export interface ReplayPromptOptions {
+  system?: string
+  supplementalTools?: readonly SupplementalTool[]
+  maxHistoryBytes?: number
+}
+
 /**
- * The bridge instructions appended to the agent's system prompt.
+ * Static bridge instructions appended to the agent's system prompt.
+ * @returns the static bridge preamble.
+ */
+export function bridgeSystemPrompt(): string {
+  return [
+    'You are the primary model of a Pi coding agent session. The harness owns the conversation, the tools, and their permissions.',
+    `Every harness tool is available to you under the prefix \`${AGENT_TOOL_PREFIX}\`: a tool named \`X\` in the harness instructions is the tool \`${AGENT_TOOL_PREFIX}X\`. If \`${AGENT_TOOL_PREFIX}X\` is absent from your direct tool declarations, invoke it via \`${AGENT_TOOL_PREFIX}${CALL_TOOL_NAME}\` with \`{"name":"X","arguments":{...}}\`. Use only these tools; pass arguments exactly as their schemas define.`,
+    'When the first user message contains <system_instructions>, <harness_tool_instructions>, or <pi_history> blocks, treat <system_instructions> and <harness_tool_instructions> as harness instructions for the entire session and <pi_history> as the earlier part of this conversation; continue from the newest input after them without repeating completed actions.',
+  ].join('\n')
+}
+
+/**
+ * Render the harness system prompt and compacted initial tool instructions for
+ * delivery at the head of a session's opening prompt.
  * @param system - the Pi system prompt.
  * @param supplementalTools - initially advertised tools whose MCP schemas were compacted, preserving their full instructions.
- * @returns the complete appended system text.
+ * @returns the delimited instruction preamble ending in a blank line, or empty string when absent.
  */
-export function bridgeSystemPrompt(
+export function renderSessionInstructions(
   system: string,
-  supplementalTools: readonly {
-    name: string
-    description: string
-    inputSchema: Record<string, unknown>
-  }[] = [],
+  supplementalTools: readonly SupplementalTool[] = [],
 ): string {
-  const sections = [
-    [
-      'You are the primary model of a Pi coding agent session. The harness owns the conversation, the tools, and their permissions.',
-      `Every harness tool is available to you under the prefix \`${AGENT_TOOL_PREFIX}\`: a tool named \`X\` in the instructions below is the tool \`${AGENT_TOOL_PREFIX}X\`. If \`${AGENT_TOOL_PREFIX}X\` is absent from your direct tool declarations, invoke it via \`${AGENT_TOOL_PREFIX}${CALL_TOOL_NAME}\` with \`{"name":"X","arguments":{...}}\`. Use only these tools; pass arguments exactly as their schemas define.`,
-      'When the first user message contains a <pi_history> block, it reproduces the earlier part of this conversation; continue from the newest input after it without repeating completed actions.',
-    ].join('\n'),
-  ]
+  const sections: string[] = []
+  if (system.length > 0) {
+    sections.push(`<system_instructions>\n${system}\n</system_instructions>`)
+  }
   if (supplementalTools.length > 0) {
     const entries = supplementalTools.map((t) =>
       JSON.stringify({
@@ -120,8 +142,7 @@ export function bridgeSystemPrompt(
       `<harness_tool_instructions>\n${entries.join('\n')}\n</harness_tool_instructions>`,
     )
   }
-  if (system.length > 0) sections.push(system)
-  return sections.join('\n\n')
+  return sections.length > 0 ? `${sections.join('\n\n')}\n\n` : ''
 }
 
 /**
@@ -209,32 +230,39 @@ export function promptBlocks(
 }
 
 /**
- * Build the prompt that (re)creates a session: earlier history as transcript,
- * then the trailing input messages as live content.
+ * Build the prompt that (re)creates a session: harness system/tool instructions,
+ * earlier history as transcript, and trailing input messages as live content.
  *
- * The trailing input is always complete. History renders newest-first into the
- * remaining byte budget, so the most recent turns survive and only the oldest
- * messages are omitted; an omitted prefix is announced inside the block. The
- * `<pi_history>` block is always closed before the live input. When the plan
- * leaves no trailing input (the history ends with tool results), a short
- * continuation instruction is appended so the prompt is never empty.
+ * The trailing input and session instructions are always complete. History
+ * renders newest-first into the remaining byte budget, so the most recent turns
+ * survive and only the oldest messages are omitted; an omitted prefix is
+ * announced inside the block. The `<pi_history>` block is always closed before
+ * the live input. When the plan leaves no trailing input (the history ends with
+ * tool results), a short continuation instruction is appended so the prompt is
+ * never empty.
  * @param history - messages before the trailing input.
  * @param input - trailing input messages sent as live content.
- * @param maxHistoryBytes - combined history and input byte ceiling; defaults to {@link REPLAY_BUDGET_BYTES}.
+ * @param options - session instructions and replay byte ceiling; defaults to {@link REPLAY_BUDGET_BYTES}.
  * @returns prompt blocks.
  */
 export function replayPrompt(
   history: readonly RequestMessage[],
   input: readonly RequestMessage[],
-  maxHistoryBytes?: number,
+  options: ReplayPromptOptions = {},
 ): AcpPromptBlock[] {
+  const preamble = renderSessionInstructions(
+    options.system ?? '',
+    options.supplementalTools ?? [],
+  )
   const inputBlocks: AcpPromptBlock[] =
     input.length > 0
       ? inputPrompt(input)
       : [{ type: 'text', text: EMPTY_INPUT_CONTINUATION }]
   const blocks: AcpPromptBlock[] = []
+  if (preamble.length > 0) blocks.push({ type: 'text', text: preamble })
   if (history.length > 0) {
-    const maxBytes = maxHistoryBytes ?? REPLAY_BUDGET_BYTES
+    const maxBytes = options.maxHistoryBytes ?? REPLAY_BUDGET_BYTES
+    const preambleBytes = utf8Bytes(preamble)
     const inputBytes = inputBlocks.reduce(
       (total, block) =>
         total + (block.type === 'text' ? utf8Bytes(block.text) : 0),
@@ -246,7 +274,7 @@ export function replayPrompt(
       OMISSION_NOTICE_RESERVE_BYTES
     const text = historyTranscript(
       history,
-      Math.max(0, maxBytes - inputBytes - overhead),
+      Math.max(0, maxBytes - preambleBytes - inputBytes - overhead),
     )
     if (text.length > 0) blocks.push({ type: 'text', text })
   }
