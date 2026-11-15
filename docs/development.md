@@ -35,6 +35,11 @@ pi -e ./index.ts
   caller's wait; shared discovery still closes its session and cleans its files.
 - **Session lifecycle:** The bridge binds to `127.0.0.1`, uses per-session bearer
   credentials, and validates structured tool identity before granting permissions.
+  Live `agy 1.5.9` sessions issue `session/request_permission` only inside an
+  active `session/prompt` turn (never during `session/new` or
+  `session/set_config_option`), so session creation and idle pre-/post-turn
+  windows remain fail-closed (`cancelled` before `session/new` completes;
+  `reject_once` when no live turn owns the session, even after MCP handshake).
   Tree navigation and compaction close conversation sessions and their files,
   retaining the process, bridge, and caches. `session_start` (`new`, `resume`, or
   `fork`) uses the same light reset if the runtime survives; `session_shutdown`
@@ -118,9 +123,11 @@ npm pack --dry-run
 
 `ci.yml` checks pull requests and pushes to `main`. `release.yml` runs on pushes
 to `main` (to run `release-please`), version-tag pushes, or manual runs on an
-existing tag, so ordinary commits do not trigger the `publish` job. CI tests
-Node.js 22.19.0 and 24; releases use Node.js 24. There is no committed lockfile,
-so dependency installation uses `npm install`.
+existing tag, so ordinary commits do not trigger the `publish` job. CI tests the
+pinned `devDependencies` baseline on Node.js 22.19.0 and 24, plus a `pi-compat`
+matrix across `@earendil-works/pi-*` `1.5.0` and latest `1.5`; releases use
+Node.js 24. `.npmrc` sets `package-lock=false` so dependency installation stays
+lockfile-free via `npm install`.
 
 All changes to `main` require a pull request, passing CI on both Node versions,
 and resolved review discussions. Squash merge after CI passes; no second-person
