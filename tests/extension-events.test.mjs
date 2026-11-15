@@ -591,6 +591,46 @@ test('quota selection covers live agy 1.5.9 catalog, multi-group minimums, quali
     ),
     'AGY 90%',
   )
+
+  const explicitSharedWithEffortCap = groups(
+    group(
+      'Claude and GPT models',
+      0.9,
+      'Models within this group: Claude Opus 5.5, Claude Opus 4.6 (Thinking), Claude Sonnet 5.5',
+    ),
+    group('Claude Opus 5.5 (High)', 0),
+    group('Claude Opus 4.6 (High)', 0),
+  )
+  assert.equal(
+    quotaForModel(explicitSharedWithEffortCap, {
+      id: 'claude-opus-5-5',
+      name: 'Claude Opus 5.5',
+    }),
+    undefined,
+  )
+  assert.equal(
+    quotaForModel(explicitSharedWithEffortCap, {
+      id: 'claude-opus-4-6-thinking',
+      name: 'Claude Opus 4.6 (Thinking)',
+    }),
+    undefined,
+  )
+  assert.equal(
+    formatQuotaStatus(
+      explicitSharedWithEffortCap,
+      { id: 'claude-opus-5-5-high', name: 'Claude Opus 5.5 (High)' },
+      'remaining',
+    ),
+    'AGY 0%',
+  )
+  assert.equal(
+    formatQuotaStatus(
+      explicitSharedWithEffortCap,
+      { id: 'claude-sonnet-5-5', name: 'Claude Sonnet 5.5' },
+      'remaining',
+    ),
+    'AGY 90%',
+  )
   assert.equal(
     quotaForModel(groups(group('Gemini Models', 0.2), group('Gemini Models', 0.8)), { id: 'gemini-3.8-flash' }),
     undefined,
