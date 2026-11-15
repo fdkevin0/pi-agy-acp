@@ -20,7 +20,11 @@ import type {
   AcpToolCallMeta,
 } from './acp-process.ts'
 import type { BridgeTool, BridgeToolResult } from './mcp-bridge.ts'
-import { AGENT_TOOL_PREFIX, CALL_TOOL_NAME } from './history.ts'
+import {
+  AGENT_TOOL_PREFIX,
+  CALL_TOOL_NAME,
+  MCP_SERVER_NAME,
+} from './history.ts'
 import { AsyncQueue, deferred, type Deferred } from './util.ts'
 
 /** Agent-side transport retry notice streamed as message text, e.g. `⚠ API error (attempt 1): …`. */
@@ -662,8 +666,31 @@ function nonEmpty(value: unknown): string | undefined {
 }
 
 /**
- * Extract the structured `(serverName, toolName)` an agent claimed in one
- * permission request: top-level `mcpServerName`/`mcpToolName` or `_meta`.
+ * Resolve one explicit metadata field across candidate aliases, flagging when
+ * any two non-empty candidates disagree.
+ */
+function reconcileCandidates(values: readonly unknown[]): {
+  value?: string
+  conflict: boolean
+} {
+  let value: string | undefined
+  let conflict = false
+  for (const raw of values) {
+    const candidate = nonEmpty(raw)
+    if (candidate === undefined) continue
+    if (value === undefined) value = candidate
+    else if (value !== candidate) conflict = true
+  }
+  return { ...(value !== undefined ? { value } : {}), conflict }
+}
+
+/**
+ * Extract tool identity `(serverName, toolName)` from `session/update`
+ * (`recordReportedToolCall`) or `session/request_permission` (`answerPermission`).
+ * Reads top-level `mcpServerName`/`mcpToolName` or `_meta`, and reconciles flat
+ * `name` (`mcp_<server>_<tool>`). Non-Pi flat names map to a `non-pi:<name>`
+ * server sentinel, and contradictions across explicit fields or `name` set
+ * `conflict: true`. Returns `{}` only when no identity fields are present.
  * `title` and `rawInput` are deliberately not consulted.
  */
 export function structuredToolMeta(
@@ -671,21 +698,49 @@ export function structuredToolMeta(
 ): {
   serverName?: string
   toolName?: string
+  conflict?: boolean
 } {
   const meta: AcpToolCallMeta | undefined = toolCall?._meta
-  const serverName =
-    nonEmpty(toolCall?.mcpServerName) ??
-    nonEmpty(meta?.mcpServerName) ??
-    nonEmpty(meta?.serverName) ??
-    nonEmpty(meta?.server)
-  const toolName =
-    nonEmpty(toolCall?.mcpToolName) ??
-    nonEmpty(meta?.mcpToolName) ??
-    nonEmpty(meta?.toolName) ??
-    nonEmpty(meta?.tool)
+  const server = reconcileCandidates([
+    toolCall?.mcpServerName,
+    meta?.mcpServerName,
+    meta?.serverName,
+    meta?.server,
+  ])
+  const tool = reconcileCandidates([
+    toolCall?.mcpToolName,
+    meta?.mcpToolName,
+    meta?.toolName,
+    meta?.tool,
+  ])
+  const explicitServer = server.value
+  const explicitTool = tool.value
+  const flat = nonEmpty(toolCall?.name)
+  if (flat === undefined) {
+    const conflict = server.conflict || tool.conflict
+    return {
+      ...(explicitServer !== undefined ? { serverName: explicitServer } : {}),
+      ...(explicitTool !== undefined ? { toolName: explicitTool } : {}),
+      ...(conflict ? { conflict: true } : {}),
+    }
+  }
+  const candidateServer = explicitServer ?? MCP_SERVER_NAME
+  const prefix = `mcp_${candidateServer}_`
+  const hasPrefixedTool =
+    flat.startsWith(prefix) && flat.length > prefix.length
+  const flatServer = hasPrefixedTool ? candidateServer : `non-pi:${flat}`
+  const flatTool = hasPrefixedTool ? flat.slice(prefix.length) : flat
+  const hasExplicit = explicitServer !== undefined || explicitTool !== undefined
+  const conflict =
+    server.conflict ||
+    tool.conflict ||
+    (hasExplicit &&
+      (!hasPrefixedTool ||
+        (explicitTool !== undefined && explicitTool !== flatTool)))
   return {
-    ...(serverName !== undefined ? { serverName } : {}),
-    ...(toolName !== undefined ? { toolName } : {}),
+    serverName: explicitServer ?? flatServer,
+    toolName: explicitTool ?? flatTool,
+    ...(conflict ? { conflict: true } : {}),
   }
 }
 
@@ -709,11 +764,15 @@ export function recordReportedToolCall(
     return
   if (typeof update.toolCallId !== 'string' || update.toolCallId.length === 0)
     return
-  const { serverName, toolName } = structuredToolMeta(update)
+  const {
+    serverName,
+    toolName,
+    conflict: metaConflict,
+  } = structuredToolMeta(update)
   const kind = typeof update.kind === 'string' ? update.kind : undefined
   const existing = conv.reportedToolCalls.get(update.toolCallId)
   const merged: ReportedToolCall = existing === undefined ? {} : { ...existing }
-  let conflict = false
+  let conflict = metaConflict === true
   if (kind !== undefined) {
     if (merged.kind !== undefined && merged.kind !== kind) conflict = true
     else merged.kind = kind

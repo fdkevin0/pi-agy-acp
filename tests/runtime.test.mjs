@@ -27,7 +27,12 @@ import { JsonRpcPeer } from '../src/jsonrpc.ts'
 import { defaults } from '../src/config.ts'
 import { VERSION } from '../src/version.ts'
 import { AcpProcess } from '../src/acp-process.ts'
-import { AcpTurn, toTokenUsage, pumpStep } from '../src/conversation.ts'
+import {
+  AcpTurn,
+  pumpStep,
+  structuredToolMeta,
+  toTokenUsage,
+} from '../src/conversation.ts'
 import { deferred, digest } from '../src/util.ts'
 import {
   bridgeSystemPrompt,
@@ -1415,6 +1420,386 @@ test('permission requests naming another session are refused', async (t) => {
     }),
   )
   assert.match(textOf(step), /RESULT\(bash\)=PERMISSION_REJECTED/)
+})
+
+test('permission gate handles agy 1.5.8+ flat mcp_pi_<tool> names and blocks non-Pi bypasses end-to-end', async (t) => {
+  const { adapter } = makeRuntime(t, { env: { FAKE_AGY_FLAT_NAMES: '1' } })
+  const base = {
+    provider: 'antigravity',
+    model: 'gemini-4-argon',
+    sessionId: 'S33',
+    tools: [bash, read],
+  }
+
+  // Allowed flat mcp_pi_bash roundtrip (session/update + permission ask use flat name only).
+  const step1 = await collect(
+    adapter.stream({
+      ...base,
+      messages: [sys, user('u1', 'CALL bash {"command":"pwd"}')],
+    }),
+  )
+  assert.equal(finishOf(step1).reason.kind, 'tool-calls')
+  const [call1] = callsOf(step1)
+  assert.equal(call1.name, 'bash')
+  const resumed1 = await collect(
+    adapter.stream({
+      ...base,
+      messages: [
+        sys,
+        user('u1', 'CALL bash {"command":"pwd"}'),
+        assistantFrom('a1', step1),
+        tool('t1', call1.id, '/workspace'),
+      ],
+    }),
+  )
+  assert.equal(finishOf(resumed1).reason.kind, 'stop')
+  assert.equal(textOf(resumed1), 'RESULT(bash)=/workspace')
+
+  // Status-only tool_call_update (without name) preserves initial flat identity,
+  // both when request_permission repeats name and when it omits name.
+  const statusStep = await collect(
+    adapter.stream({
+      ...base,
+      messages: [sys, user('u2', 'STATUSUPDCALL read_file {"path":"README.md"}')],
+    }),
+  )
+  assert.equal(finishOf(statusStep).reason.kind, 'tool-calls')
+  const [statusCall] = callsOf(statusStep)
+  assert.equal(statusCall.name, 'read_file')
+  const statusResumed = await collect(
+    adapter.stream({
+      ...base,
+      messages: [
+        sys,
+        user('u2', 'STATUSUPDCALL read_file {"path":"README.md"}'),
+        assistantFrom('a2', statusStep),
+        tool('t2', statusCall.id, 'ok'),
+      ],
+    }),
+  )
+  assert.equal(textOf(statusResumed), 'RESULT(read_file)=ok')
+
+  const bareAskStep = await collect(
+    adapter.stream({
+      ...base,
+      messages: [
+        sys,
+        user('u3', 'STATUSUPDCALL_BAREASK read_file {"path":"README.md"}'),
+      ],
+    }),
+  )
+  assert.equal(finishOf(bareAskStep).reason.kind, 'tool-calls')
+  const [bareAskCall] = callsOf(bareAskStep)
+  assert.equal(bareAskCall.name, 'read_file')
+  const bareAskResumed = await collect(
+    adapter.stream({
+      ...base,
+      messages: [
+        sys,
+        user('u3', 'STATUSUPDCALL_BAREASK read_file {"path":"README.md"}'),
+        assistantFrom('a3', bareAskStep),
+        tool('t3', bareAskCall.id, 'ok-bare'),
+      ],
+    }),
+  )
+  assert.equal(textOf(bareAskResumed), 'RESULT(read_file)=ok-bare')
+
+  // Flat mcp_pi_pi_call_tool dispatches the underlying Pi tool and resumes to completion.
+  const dispatchStep = await collect(
+    adapter.stream({
+      ...base,
+      messages: [
+        sys,
+        user(
+          'u4',
+          'CALL pi_call_tool {"name":"mcp_pi_read_file","arguments":{"path":"README.md"}}',
+        ),
+      ],
+    }),
+  )
+  assert.equal(finishOf(dispatchStep).reason.kind, 'tool-calls')
+  const [dispatched] = callsOf(dispatchStep)
+  assert.equal(dispatched.name, 'read_file')
+  assert.deepEqual(JSON.parse(dispatched.arguments), { path: 'README.md' })
+  const dispatchResumed = await collect(
+    adapter.stream({
+      ...base,
+      messages: [
+        sys,
+        user(
+          'u4',
+          'CALL pi_call_tool {"name":"mcp_pi_read_file","arguments":{"path":"README.md"}}',
+        ),
+        assistantFrom('a4', dispatchStep),
+        tool('t4', dispatched.id, 'ok-dispatch'),
+      ],
+    }),
+  )
+  assert.equal(finishOf(dispatchResumed).reason.kind, 'stop')
+  assert.equal(textOf(dispatchResumed), 'RESULT(pi_call_tool)=ok-dispatch')
+
+  // Nameless MCP loading probe is allowed after handshake, but unreported
+  // zero-input requests carrying non-Pi or empty-suffix names are rejected.
+  const probes = await collect(
+    adapter.stream({
+      ...base,
+      messages: [
+        sys,
+        user(
+          'u5',
+          [
+            'PROBECALL',
+            'PROBEFLAT manage_subagents',
+            'PROBEFLAT mcp_other_list',
+            'PROBEFLAT mcp_pi_',
+          ].join('\n'),
+        ),
+      ],
+    }),
+  )
+  assert.equal(finishOf(probes).reason.kind, 'stop')
+  assert.equal(
+    textOf(probes),
+    [
+      'PROBE_OK:allow-once',
+      'PROBE_DENIED:reject-once',
+      'PROBE_DENIED:reject-once',
+      'PROBE_DENIED:reject-once',
+    ].join(' | '),
+  )
+
+  // Reported native, foreign-MCP, and empty-suffix flat names are rejected.
+  const nonPi = await collect(
+    adapter.stream({
+      ...base,
+      messages: [
+        sys,
+        user(
+          'u6',
+          [
+            'NATIVECALL bash {"command":"ls"}',
+            'NATIVECALL mcp_other_read {"path":"a"}',
+            'NATIVECALL mcp_pi_ {}',
+          ].join('\n'),
+        ),
+      ],
+    }),
+  )
+  assert.equal(finishOf(nonPi).reason.kind, 'stop')
+  assert.equal(
+    textOf(nonPi),
+    [
+      'RESULT(bash)=PERMISSION_REJECTED',
+      'RESULT(mcp_other_read)=PERMISSION_REJECTED',
+      'RESULT(mcp_pi_)=PERMISSION_REJECTED',
+    ].join(' | '),
+  )
+
+  // Permission requests claiming a different flat name than reported are rejected.
+  const flatConflicts = await collect(
+    adapter.stream({
+      ...base,
+      messages: [
+        sys,
+        user(
+          'u7',
+          [
+            'FLATCONFLICTCALL mcp_pi_bash {"command":"ls"} ;; mcp_pi_read_file',
+            'FLATCONFLICTCALL mcp_pi_bash {"command":"ls"} ;; bash',
+            'FLATCONFLICTCALL mcp_pi_bash {"command":"ls"} ;; mcp_other_exec',
+          ].join('\n'),
+        ),
+      ],
+    }),
+  )
+  assert.equal(finishOf(flatConflicts).reason.kind, 'stop')
+  assert.equal(
+    textOf(flatConflicts),
+    [
+      'RESULT(mcp_pi_bash)=PERMISSION_REJECTED',
+      'RESULT(mcp_pi_bash)=PERMISSION_REJECTED',
+      'RESULT(mcp_pi_bash)=PERMISSION_REJECTED',
+    ].join(' | '),
+  )
+
+  // Bidirectional and intra-Pi flat tool_call_update conflicts lock down the call id.
+  const updateConflicts = await collect(
+    adapter.stream({
+      ...base,
+      messages: [
+        sys,
+        user(
+          'u8',
+          [
+            'FLATCONFLICTUPDCALL mcp_pi_bash {"command":"ls"} ;; mcp_pi_read_file',
+            'FLATCONFLICTUPDCALL mcp_pi_bash {"command":"ls"} ;; read_file',
+            'FLATCONFLICTUPDCALL bash {"command":"ls"} ;; mcp_pi_read_file',
+          ].join('\n'),
+        ),
+      ],
+    }),
+  )
+  assert.equal(finishOf(updateConflicts).reason.kind, 'stop')
+  assert.equal(
+    textOf(updateConflicts),
+    [
+      'RESULT(mcp_pi_bash)=PERMISSION_REJECTED SECOND_CLAIM_mcp_pi_read_file_DENIED',
+      'RESULT(mcp_pi_bash)=PERMISSION_REJECTED SECOND_CLAIM_read_file_DENIED',
+      'RESULT(bash)=PERMISSION_REJECTED SECOND_CLAIM_mcp_pi_read_file_DENIED',
+    ].join(' | '),
+  )
+
+  // Contradictory _meta alongside flat native or top-level Pi names is rejected.
+  const mixedMeta = await collect(
+    adapter.stream({
+      ...base,
+      messages: [
+        sys,
+        user(
+          'u9',
+          [
+            'MIXEDMETACALL bash pi read_file {"path":"a"}',
+            'TOPCONFLICTMETACALL mcp_pi_bash pi bash other exec {"command":"ls"}',
+          ].join('\n'),
+        ),
+      ],
+    }),
+  )
+  assert.equal(finishOf(mixedMeta).reason.kind, 'stop')
+  assert.equal(
+    textOf(mixedMeta),
+    [
+      'RESULT(bash)=PERMISSION_REJECTED',
+      'RESULT(mcp_pi_bash)=PERMISSION_REJECTED',
+    ].join(' | '),
+  )
+})
+
+test('structuredToolMeta reconciles explicit fields with flat names and flags contradictions', () => {
+  assert.deepEqual(
+    structuredToolMeta({
+      toolCallId: 'call_1',
+      title: 'Run mcp_pi_read',
+      rawInput: { name: 'mcp_pi_read' },
+    }),
+    {},
+  )
+  assert.deepEqual(structuredToolMeta({ name: 'mcp_pi_read' }), {
+    serverName: 'pi',
+    toolName: 'read',
+  })
+  assert.deepEqual(
+    structuredToolMeta({
+      name: 'mcp_pi_read',
+      mcpServerName: 'pi',
+      mcpToolName: 'read',
+    }),
+    { serverName: 'pi', toolName: 'read' },
+  )
+  assert.deepEqual(
+    structuredToolMeta({
+      name: 'mcp_pi_read',
+      mcpServerName: 'pi',
+    }),
+    { serverName: 'pi', toolName: 'read' },
+  )
+  assert.deepEqual(
+    structuredToolMeta({
+      name: 'mcp_pi_read',
+      mcpToolName: 'read',
+    }),
+    { serverName: 'pi', toolName: 'read' },
+  )
+  assert.deepEqual(
+    structuredToolMeta({
+      name: 'mcp_pi_read',
+      mcpServerName: 'pi',
+      _meta: { server: 'pi', tool: 'read' },
+    }),
+    { serverName: 'pi', toolName: 'read' },
+  )
+  assert.deepEqual(
+    structuredToolMeta({
+      name: 'mcp_other_x',
+      mcpServerName: 'other',
+      mcpToolName: 'x',
+    }),
+    { serverName: 'other', toolName: 'x' },
+  )
+  assert.deepEqual(structuredToolMeta({ name: 'mcp_other_read' }), {
+    serverName: 'non-pi:mcp_other_read',
+    toolName: 'mcp_other_read',
+  })
+  assert.deepEqual(structuredToolMeta({ name: 'mcp_pi_' }), {
+    serverName: 'non-pi:mcp_pi_',
+    toolName: 'mcp_pi_',
+  })
+  assert.deepEqual(
+    structuredToolMeta({
+      mcpServerName: 'pi',
+      mcpToolName: 'bash',
+      _meta: { server: 'other', tool: 'exec' },
+    }),
+    { serverName: 'pi', toolName: 'bash', conflict: true },
+  )
+  assert.deepEqual(
+    structuredToolMeta({
+      name: 'mcp_pi_bash',
+      mcpServerName: 'pi',
+      mcpToolName: 'bash',
+      _meta: { server: 'other', tool: 'exec' },
+    }),
+    { serverName: 'pi', toolName: 'bash', conflict: true },
+  )
+  assert.deepEqual(
+    structuredToolMeta({
+      _meta: { mcpServerName: 'pi', server: 'other' },
+    }),
+    { serverName: 'pi', conflict: true },
+  )
+  assert.deepEqual(
+    structuredToolMeta({
+      name: 'mcp_pi_read',
+      mcpServerName: 'other',
+      mcpToolName: 'x',
+    }),
+    { serverName: 'other', toolName: 'x', conflict: true },
+  )
+  assert.deepEqual(
+    structuredToolMeta({
+      name: 'bash',
+      _meta: { server: 'pi', tool: 'read' },
+    }),
+    { serverName: 'pi', toolName: 'read', conflict: true },
+  )
+  assert.deepEqual(
+    structuredToolMeta({
+      name: 'bash',
+      mcpServerName: 'pi',
+    }),
+    { serverName: 'pi', toolName: 'bash', conflict: true },
+  )
+  assert.deepEqual(
+    structuredToolMeta({
+      name: 'bash',
+      mcpToolName: 'bash',
+    }),
+    { serverName: 'non-pi:bash', toolName: 'bash', conflict: true },
+  )
+  assert.deepEqual(
+    structuredToolMeta({
+      name: 'bash',
+      mcpServerName: 'non-pi:bash',
+    }),
+    { serverName: 'non-pi:bash', toolName: 'bash', conflict: true },
+  )
+  assert.deepEqual(
+    structuredToolMeta({
+      name: 'mcp_pi_bash',
+      mcpToolName: 'read',
+    }),
+    { serverName: 'pi', toolName: 'read', conflict: true },
+  )
 })
 
 test('the MCP bridge enforces per-tenant bearer secrets and drops the conversationId fallback', async (t) => {
