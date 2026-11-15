@@ -631,6 +631,67 @@ test('quota selection covers live agy 1.5.9 catalog, multi-group minimums, quali
     ),
     'AGY 90%',
   )
+
+  const exhaustedSharedThinking = groups(
+    group(
+      'Claude and GPT models',
+      0,
+      'Models within this group: Claude Opus 5.5, Claude Opus 4.6 (Thinking), Claude Sonnet 5.5',
+    ),
+    group('Claude Opus 4.6 (High)', 0.8),
+  )
+  assert.equal(
+    formatQuotaStatus(
+      exhaustedSharedThinking,
+      { id: 'claude-opus-4-6-high', name: 'Claude Opus 4.6 (High)' },
+      'remaining',
+    ),
+    'AGY 0%',
+  )
+  assert.equal(
+    formatQuotaStatus(
+      exhaustedSharedThinking,
+      { id: 'claude-opus-4-6-thinking', name: 'Claude Opus 4.6 (High)' },
+      'remaining',
+    ),
+    'AGY 0%',
+  )
+  assert.equal(
+    formatQuotaStatus(
+      exhaustedSharedThinking,
+      {
+        id: 'claude-opus-4-6-thinking-high',
+        name: 'Claude Opus 4.6 (Thinking) (High)',
+      },
+      'remaining',
+    ),
+    'AGY 0%',
+  )
+
+  const conflictingEfforts = groups(
+    group('GPT-OSS 120B (Medium)', 0.8),
+    group('GPT-OSS 120B (High)', 0.1),
+  )
+  assert.equal(
+    quotaForModel(conflictingEfforts, {
+      id: 'gpt-oss-120b-medium',
+      name: 'GPT-OSS 120B (High)',
+    }),
+    undefined,
+  )
+
+  const generationLineSized = groups(
+    group('Gemini 3.8', 0),
+    group('Gemini Models', 0.8),
+  )
+  assert.equal(
+    formatQuotaStatus(
+      generationLineSized,
+      { id: 'gemini-3.8-flash-8b' },
+      'remaining',
+    ),
+    'AGY 0%',
+  )
   assert.equal(
     quotaForModel(groups(group('Gemini Models', 0.2), group('Gemini Models', 0.8)), { id: 'gemini-3.8-flash' }),
     undefined,

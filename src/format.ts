@@ -1,4 +1,4 @@
-import type { QuotaDisplay } from './config.ts'
+import { asEffort, type Effort, type QuotaDisplay } from './config.ts'
 import type {
   AccountInfo,
   QuotaSnapshot,
@@ -69,14 +69,18 @@ interface ParsedPhrase {
   readonly head: string | undefined
   readonly words: readonly string[]
   readonly specs: readonly string[]
-  readonly qualifier: string | undefined
+  readonly effort: Effort | undefined
+  readonly thinking: boolean
+  readonly effortConflict: boolean
   readonly tokenCount: number
   readonly canonical: string
 }
 
 function buildPhrase(
   tokens: readonly string[],
-  qualifier?: string,
+  effort?: Effort,
+  thinking = false,
+  effortConflict = false,
 ): ParsedPhrase {
   const words: string[] = []
   const specs: string[] = []
@@ -88,7 +92,9 @@ function buildPhrase(
     head: tokens[0],
     words,
     specs,
-    qualifier,
+    effort,
+    thinking,
+    effortConflict,
     tokenCount: tokens.length,
     canonical: `${words.join(' ')}|${specs.join(' ')}`,
   }
@@ -96,18 +102,42 @@ function buildPhrase(
 
 function parseClause(raw: string, stripNoise = false): ParsedPhrase {
   let text = raw.trim().replace(/[.!?]+$/, '')
-  let qualifier: string | undefined
-  const groupQual = text.match(GROUP_QUALIFIER_SUFFIX)
-  if (groupQual) {
-    qualifier = groupQual[1]!.toLowerCase()
-    text = text.replace(GROUP_QUALIFIER_SUFFIX, '').replace(ID_DATE_SUFFIX, '')
-  } else {
-    text = text.replace(ID_DATE_SUFFIX, '')
-    const idQual = text.match(ID_QUALIFIER_SUFFIX)
-    if (idQual) {
-      qualifier = idQual[1]!.toLowerCase()
-      text = text.slice(0, idQual.index).replace(ID_DATE_SUFFIX, '')
+  let effort: Effort | undefined
+  let thinking = false
+  let effortConflict = false
+  while (text.length > 0) {
+    const withoutDate = text.replace(ID_DATE_SUFFIX, '')
+    if (withoutDate !== text) {
+      text = withoutDate
+      continue
     }
+    const groupQual = GROUP_QUALIFIER_SUFFIX.exec(text)
+    if (groupQual) {
+      const nextEffort = asEffort(groupQual[1]!.toLowerCase())
+      if (nextEffort) {
+        if (effort && effort !== nextEffort) effortConflict = true
+        effort = nextEffort
+      } else {
+        thinking = true
+      }
+      text =
+        text.slice(0, groupQual.index) +
+        text.slice(groupQual.index + groupQual[0].length)
+      continue
+    }
+    const idQual = ID_QUALIFIER_SUFFIX.exec(text)
+    if (idQual) {
+      const nextEffort = asEffort(idQual[1]!.toLowerCase())
+      if (nextEffort) {
+        if (effort && effort !== nextEffort) effortConflict = true
+        effort = nextEffort
+      } else {
+        thinking = true
+      }
+      text = text.slice(0, idQual.index)
+      continue
+    }
+    break
   }
   const baseTokens = normalizeTokens(text)
   const fallback = baseTokens.length === 0
@@ -119,7 +149,12 @@ function parseClause(raw: string, stripNoise = false): ParsedPhrase {
         return stripped.length >= 2 ? stripped : tokens
       })()
     : tokens
-  return buildPhrase(cleaned, fallback ? undefined : qualifier)
+  return buildPhrase(
+    cleaned,
+    fallback ? undefined : effort,
+    fallback ? false : thinking,
+    !fallback && effortConflict,
+  )
 }
 
 function parseGroupPhrases(
@@ -134,7 +169,7 @@ function parseGroupPhrases(
     )
       continue
     const phrase = parseClause(part, true)
-    if (phrase.tokenCount > 0) phrases.push(phrase)
+    if (phrase.tokenCount > 0 && !phrase.effortConflict) phrases.push(phrase)
   }
   return phrases
 }
@@ -142,16 +177,22 @@ function parseGroupPhrases(
 function buildModelCandidates(id: string, name?: string): ParsedPhrase[] {
   const idPhrase = parseClause(id)
   const namePhrase = name ? parseClause(name) : undefined
-  const sharedQualifier = idPhrase.qualifier ?? namePhrase?.qualifier
+  if (
+    idPhrase.effortConflict ||
+    namePhrase?.effortConflict ||
+    (idPhrase.effort &&
+      namePhrase?.effort &&
+      idPhrase.effort !== namePhrase.effort)
+  )
+    return []
+  const effort = idPhrase.effort ?? namePhrase?.effort
+  const thinking = idPhrase.thinking || Boolean(namePhrase?.thinking)
   const seen = new Set<string>()
   const out: ParsedPhrase[] = []
   for (const candidate of [idPhrase, namePhrase]) {
     if (!candidate || candidate.tokenCount === 0) continue
-    const phrase =
-      candidate.qualifier === undefined && sharedQualifier !== undefined
-        ? { ...candidate, qualifier: sharedQualifier }
-        : candidate
-    const key = `${phrase.canonical}#${phrase.qualifier ?? ''}`
+    const phrase = { ...candidate, effort, thinking }
+    const key = `${phrase.canonical}#${phrase.effort ?? ''}#${phrase.thinking ? 't' : ''}`
     if (!seen.has(key)) {
       seen.add(key)
       out.push(phrase)
@@ -179,12 +220,13 @@ function isBroaderVariant(
     return false
   if (groupPhrase.words.length >= 2 && groupPhrase.specs.length === 0)
     return groupPhrase.words.join(' ') === modelPhrase.words.join(' ')
+  const modelVersions = modelPhrase.specs.filter((s) => !s.endsWith('b'))
   return (
     groupPhrase.words.length === 1 &&
     groupPhrase.specs.length === 1 &&
     !groupPhrase.specs[0]!.endsWith('b') &&
-    modelPhrase.specs.length === 1 &&
-    modelPhrase.specs[0] === groupPhrase.specs[0]
+    modelVersions.length === 1 &&
+    modelVersions[0] === groupPhrase.specs[0]
   )
 }
 
@@ -231,9 +273,8 @@ function selectQuotaGroups(
 
   // Without an effort qualifier (`low`/`medium`/`high`) on the model reference, any matching
   // effort-capped pool makes group ownership depend on unknown active effort; return unknown.
-  const isEffort = (q?: string) => q === 'low' || q === 'medium' || q === 'high'
   const omittedEffort = (g: ParsedPhrase, m: ParsedPhrase) =>
-    isEffort(g.qualifier) && !isEffort(m.qualifier)
+    g.effort !== undefined && m.effort === undefined
   if (
     indexed.some(
       (entry) =>
@@ -244,7 +285,8 @@ function selectQuotaGroups(
     return []
 
   const compatQual = (g: ParsedPhrase, m: ParsedPhrase) =>
-    g.qualifier === undefined || g.qualifier === m.qualifier
+    (g.effort === undefined || g.effort === m.effort) &&
+    (!g.thinking || m.thinking || m.effort !== undefined)
 
   const authoritative: (typeof indexed)[number][] = []
   const variantOnly: (typeof indexed)[number][] = []
@@ -269,7 +311,7 @@ function selectQuotaGroups(
   if (variantOnly.length > 1) return []
 
   const thinkingQual = (g: ParsedPhrase, m: ParsedPhrase) =>
-    g.qualifier === 'thinking' && m.qualifier === undefined
+    g.thinking && !m.thinking && g.effort === undefined && m.effort === undefined
   const thinkingMatches = indexed.filter(
     (entry) =>
       matchGroup(entry.phrases, candidates, isExactPhrase, thinkingQual) ||
