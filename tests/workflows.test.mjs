@@ -171,3 +171,13 @@ test('release-please tag handoff validates and checks GitHub Release on main pus
   assert.equal(checked.status, 0, checked.stderr)
   assert.equal(checked.calls, 'release view v1.2.3\n')
 })
+
+test('release-please config emits bare vX.Y.Z tags matching release.yml validation', () => {
+  const config = JSON.parse(
+    readFileSync(
+      new URL('../release-please-config.json', import.meta.url),
+      'utf8',
+    ),
+  )
+  assert.equal(config.packages['.']['include-component-in-tag'], false)
+})
