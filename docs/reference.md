@@ -151,14 +151,28 @@ older history can be omitted to fit, and historical images become text placehold
 
 ## Usage and costs
 
-Usage comes only from the ACP `session/prompt` result. Parked tool steps have no
-separate usage report; statistics arrive when the full ACP turn finishes.
-For turns spanning multiple model steps, input token buckets use the upstream
-implementation's averaging method. They are not an exact per-step measurement.
+Usage comes from the ACP session rather than per-step API headers. Parked `toolUse`
+steps emit zero usage; statistics arrive on the final step when the full ACP turn
+finishes (accumulated across any automatic `max_tokens` continuations).
+
+The extension separates cumulative token consumption from final-call context
+occupancy:
+
+- `input`, `output`, `cacheRead`, and `cacheWrite` preserve unscaled cumulative
+  turn totals from `session/prompt`, so Pi's session totals and flat pricing
+  overrides reflect full multi-step consumption.
+- `totalTokens` (which feeds Pi's context meter and auto-compaction threshold via
+  `calculateContextTokens`) uses the final model call's live `usage_update.used`
+  count when `agy` provides it. When `usage_update` is absent, it falls back to
+  averaging the final `session/prompt` segment's prompt tokens across that
+  segment's model calls plus final-segment output tokens; this fallback is an
+  estimate rather than an exact per-step measurement.
 
 Default model prices are zero because pricing is unavailable. If you configure
-Pi model pricing overrides, reported usage is priced using those rates. These
-estimates are not an invoice amount or a promise of free access.
+Pi model pricing overrides, flat per-million rates price the cumulative turn
+buckets accurately; tiered `inputTokensAbove` rules evaluate against cumulative
+turn prompt tokens rather than per-call prompt sizes. These estimates are not
+an invoice amount or a promise of free access.
 
 The extension does not inspect agy's private databases or invoke or distribute
 binary patch scripts.
@@ -166,9 +180,11 @@ binary patch scripts.
 ## Compatibility limits
 
 This version targets the `@earendil-works/*` Pi packages at version 1.5.x.
-Host peer dependencies use `*` as required by Pi package conventions; development
-dependencies constrain CI to Pi 1.5.x, which requires Node.js >= 22.19.0. Compatibility with older
-`@mariozechner/*` interfaces is not claimed.
+Host `peerDependencies` use `*` as required by Pi package conventions;
+`devDependencies` pin a reproducible CI baseline (`1.5.2`), and CI validates
+both that baseline (on Node.js 22.19.0 and 24) and the `1.5.x` host range
+(`1.5.0` and latest `1.5`), which requires Node.js >= 22.19.0. Compatibility
+with older `@mariozechner/*` interfaces is not claimed.
 
 Sampling parameters, output limits, forced `toolChoice`, and provider-scoped
 environment overrides are not mapped to ACP. See

@@ -6,6 +6,7 @@
 //   PCALL <tool> <json> ;; <tool> <json>   call several tools concurrently
 //   SLEEP <ms>              wait before ending the turn
 //   MAXTOK                  end the first segment with max_tokens
+//   USAGEUPD <n>            emit a session/update usage_update notification
 //   DENYCALL <tool> <json>  native tool whose rawInput merely embeds "mcp_pi_<tool>"
 //   SPOOFCALL <tool> <json> title fakes "mcp_pi_<tool>" but no structured metadata
 //   STALECALL <tool> <json> permission claims structured metadata never reported
@@ -528,6 +529,12 @@ async function runPrompt(s, text) {
         calls.map(([name, args]) => runToolCall(s, name, args)),
       )
       output.push(...results.map((r, i) => `RESULT(${calls[i][0]})=${r}`))
+    } else if (line.startsWith('USAGEUPD ')) {
+      update(s.id, {
+        sessionUpdate: 'usage_update',
+        used: Number(line.slice(9).trim()),
+        size: 256_000,
+      })
     } else if (line.startsWith('SLEEP ')) {
       await new Promise((r) => setTimeout(r, Number(line.slice(6))))
     }

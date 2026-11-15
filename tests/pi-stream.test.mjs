@@ -11,6 +11,7 @@ import {
   isContextOverflow,
   isRetryableAssistantError,
 } from '@earendil-works/pi-ai'
+import { calculateContextTokens } from '@earendil-works/pi-coding-agent'
 import { defaults } from '../src/config.ts'
 import { spawnAcp } from '../src/host.ts'
 const model = {
@@ -38,9 +39,9 @@ const system = {
 }
 const context = (...messages) => ({ messages })
 const options = { sessionId: 'pi-test' }
-async function result(runtime, ctx, opts = options) {
+async function result(runtime, ctx, opts = options, selectedModel = model) {
   const events = []
-  const stream = streamPi(runtime, model, ctx, opts)
+  const stream = streamPi(runtime, selectedModel, ctx, opts)
   for await (const e of stream) events.push(e)
   return { message: await stream.result(), events }
 }
@@ -387,4 +388,58 @@ test('onPayload preserves routing metadata, inherits omitted tools, keeps empty 
   const badMessages = await result(runtime, ctx, { onPayload: () => ({ model: 'm', messages: 'nope' }) })
   assert.equal(badMessages.message.stopReason, 'error')
   assert.match(badMessages.message.errorMessage, /messages array/)
+})
+
+test('streamPi preserves cumulative turn pricing while feeding live context occupancy to calculateContextTokens', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'pi-usage-cost-'))
+  const fake = resolve('tests/fake-agy.mjs')
+  chmodSync(fake, 0o755)
+  const runtime = new AntigravityRuntime({
+    config: { ...defaults, command: fake, home },
+    spawnAcp,
+    runCommand: async () => ({ code: 0, stdout: '1.5.0', stderr: '' }),
+    log: { info() {}, warn() {} },
+    onModelsChanged() {},
+  })
+  const pricedModel = {
+    ...model,
+    cost: { input: 2, output: 4, cacheRead: 0.5, cacheWrite: 0 },
+  }
+  try {
+    const first = user('CALL bash {"command":"pwd"}\nUSAGEUPD 848')
+    const step1 = await result(runtime, context(system, first), options, pricedModel)
+    assert.equal(step1.message.stopReason, 'toolUse', step1.message.errorMessage)
+    assert.equal(step1.message.usage.totalTokens, 0)
+    assert.equal(step1.message.usage.cost.total, 0)
+
+    const call = step1.message.content.find((b) => b.type === 'toolCall')
+    const toolMsg = {
+      role: 'toolResult',
+      toolCallId: call.id,
+      toolName: 'bash',
+      content: [{ type: 'text', text: '/tmp/pi' }],
+      isError: false,
+      timestamp: 2,
+    }
+    const step2 = await result(
+      runtime,
+      context(system, first, step1.message, toolMsg),
+      options,
+      pricedModel,
+    )
+    assert.equal(step2.message.stopReason, 'stop')
+    assert.equal(step2.message.usage.input, 600)
+    assert.equal(step2.message.usage.output, 50)
+    assert.equal(step2.message.usage.cacheRead, 400)
+    assert.equal(step2.message.usage.totalTokens, 848)
+    assert.equal(calculateContextTokens(step2.message.usage), 848)
+    assert.ok(Math.abs(step2.message.usage.cost.input - 0.0012) < 1e-12)
+    assert.ok(Math.abs(step2.message.usage.cost.output - 0.0002) < 1e-12)
+    assert.ok(Math.abs(step2.message.usage.cost.cacheRead - 0.0002) < 1e-12)
+    assert.equal(step2.message.usage.cost.cacheWrite, 0)
+    assert.ok(Math.abs(step2.message.usage.cost.total - 0.0016) < 1e-12)
+  } finally {
+    await runtime.dispose()
+    rmSync(home, { recursive: true, force: true })
+  }
 })

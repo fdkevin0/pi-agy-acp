@@ -356,6 +356,7 @@ export class McpBridge {
     this.openResponses.add(res)
     const controller = new AbortController()
     let settled = false
+    let keepAlive: ReturnType<typeof setInterval> | undefined
     const onClose = (): void => {
       this.openResponses.delete(res)
       clearInterval(keepAlive)
@@ -364,7 +365,7 @@ export class McpBridge {
     }
     res.on('close', onClose)
     let ticks = 0
-    const keepAlive = setInterval(() => {
+    keepAlive = setInterval(() => {
       if (res.writableEnded || res.destroyed) return
       ticks++
       try {
@@ -553,7 +554,7 @@ function compactSchemaNode(value: unknown, maxDescChars: number): unknown {
 /**
  * Keep each MCP-advertised tool schema under `agy`'s eager size threshold while
  * preserving every parameter name, type, required list, and enum constraint.
- * Full prose instructions for compacted tools are appended to the session system prompt.
+ * Full prose instructions for compacted tools travel in the session's opening prompt.
  * @param tool - raw bridge tool descriptor.
  * @returns compacted descriptor when oversized, otherwise the original descriptor.
  */

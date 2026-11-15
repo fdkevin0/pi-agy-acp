@@ -2,6 +2,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
+import { createInterface } from 'node:readline'
 import { PassThrough, Writable } from 'node:stream'
 import {
   mkdtempSync,
@@ -460,9 +461,9 @@ test('a tool call parks, ends the step, and resumes the same ACP turn with the P
   assert.equal(finishOf(step2).reason.kind, 'stop')
   assert.equal(textOf(step2), 'RESULT(bash)=file-a')
   assert.deepEqual(step2.find((c) => c.type === 'usage').usage, {
-    inputTokens: 300,
+    inputTokens: 600,
     outputTokens: 50,
-    cacheReadTokens: 200,
+    cacheReadTokens: 400,
     reasoningTokens: 20,
     totalTokens: 550,
   })
@@ -967,7 +968,33 @@ test('an output-length stop continues automatically (long decode)', async (t) =>
   )
   assert.equal(finishOf(chunks).reason.kind, 'stop')
   assert.match(textOf(chunks), /^part-one echo:/)
-  assert.equal(adapter.status().lastTurn.usage.inputTokens, 600)
+  assert.equal(adapter.status().lastTurn.usage.inputTokens, 610)
+  assert.equal(adapter.status().lastTurn.usage.outputTokens, 55)
+  assert.deepEqual(chunks.find((c) => c.type === 'usage').usage, {
+    inputTokens: 610,
+    outputTokens: 55,
+    cacheReadTokens: 400,
+    reasoningTokens: 20,
+    totalTokens: 1050,
+  })
+
+  // Continuation clears any earlier segment's usage_update so fallback reflects Segment 2.
+  const clearStale = await collect(
+    adapter.stream({
+      provider: 'antigravity',
+      model: 'gemini-4-argon',
+      sessionId: 'S8b',
+      messages: [sys, user('u1', 'USAGEUPD 123\nMAXTOK write a lot')],
+    }),
+  )
+  assert.equal(finishOf(clearStale).reason.kind, 'stop')
+  assert.deepEqual(clearStale.find((c) => c.type === 'usage').usage, {
+    inputTokens: 610,
+    outputTokens: 55,
+    cacheReadTokens: 400,
+    reasoningTokens: 20,
+    totalTokens: 1050,
+  })
 })
 
 test('images in user input are sent as ACP image blocks', async (t) => {
@@ -1037,6 +1064,95 @@ test('cache reads stay disjoint from the uncached input count', () => {
     totalTokens: 11_677 + 31_377 + 321,
   })
   assert.equal(toTokenUsage(undefined), undefined)
+})
+
+test('toTokenUsage keeps cumulative buckets unscaled and prefers positive live usage_update context', () => {
+  assert.deepEqual(
+    toTokenUsage(
+      {
+        inputTokens: 1_501,
+        outputTokens: 107,
+        cachedReadTokens: 400,
+        cachedWriteTokens: 20,
+        thoughtTokens: 15,
+        totalTokens: 2_028,
+      },
+      2,
+      { contextTokens: 848 },
+    ),
+    {
+      inputTokens: 1_501,
+      outputTokens: 107,
+      cacheReadTokens: 400,
+      cacheWriteTokens: 20,
+      reasoningTokens: 15,
+      totalTokens: 848,
+    },
+  )
+  assert.deepEqual(
+    toTokenUsage(
+      {
+        inputTokens: 610,
+        outputTokens: 55,
+        cachedReadTokens: 400,
+      },
+      2,
+      {
+        contextTokens: 0,
+        lastSegmentUsage: {
+          inputTokens: 600,
+          outputTokens: 50,
+          cachedReadTokens: 400,
+        },
+      },
+    ),
+    {
+      inputTokens: 610,
+      outputTokens: 55,
+      cacheReadTokens: 400,
+      totalTokens: 550,
+    },
+  )
+})
+
+test('usage_update sets single-call totalTokens across tool steps while ignoring zero reset frames', async (t) => {
+  const { adapter } = makeRuntime(t)
+  const base = {
+    provider: 'antigravity',
+    model: 'gemini-4-argon',
+    sessionId: 'S-USAGE-UPD',
+    tools: [bash],
+  }
+  const step1 = await collect(
+    adapter.stream({
+      ...base,
+      messages: [
+        sys,
+        user('u1', 'USAGEUPD 0\nCALL bash {"command":"ls"}\nUSAGEUPD 848\nUSAGEUPD 0'),
+      ],
+    }),
+  )
+  assert.equal(step1.find((c) => c.type === 'usage'), undefined)
+  const [call] = callsOf(step1)
+  const step2 = await collect(
+    adapter.stream({
+      ...base,
+      messages: [
+        sys,
+        user('u1', 'x'),
+        assistantFrom('a1', step1),
+        tool('t1', call.id, 'ok'),
+      ],
+    }),
+  )
+  assert.equal(finishOf(step2).reason.kind, 'stop')
+  assert.deepEqual(step2.find((c) => c.type === 'usage').usage, {
+    inputTokens: 600,
+    outputTokens: 50,
+    cacheReadTokens: 400,
+    reasoningTokens: 20,
+    totalTokens: 848,
+  })
 })
 
 test('bounded replay drops the oldest history, closes the block, and keeps the latest input intact', async (t) => {
@@ -3460,4 +3576,136 @@ test('session/new keeps a static bridge system prompt while opening and rebuilt 
   assert.ok(
     Buffer.byteLength(rebuiltPrompt.text, 'utf8') <= REPLAY_BUDGET_BYTES,
   )
+})
+
+test('permission probes fail closed during session/new and pre-/post-turn windows even after MCP handshake', async (t) => {
+  const toAgent = new PassThrough()
+  const fromAgent = new PassThrough()
+  const exited = deferred()
+  const child = {
+    stdin: toAgent,
+    stdout: fromAgent,
+    exited: exited.promise,
+    stderrTail: () => '',
+    terminate: () => exited.resolve({ code: 0, signal: null }),
+  }
+  t.after(() => {
+    exited.resolve({ code: 0, signal: null })
+    toAgent.end()
+    fromAgent.end()
+  })
+
+  const responses = new Map()
+  let probeSeq = 0
+  const send = (payload) => fromAgent.write(`${JSON.stringify(payload)}\n`)
+  const requestProbe = (sessionId) => {
+    const id = `perm-${++probeSeq}`
+    const reply = deferred()
+    responses.set(id, reply)
+    send({
+      jsonrpc: '2.0',
+      id,
+      method: 'session/request_permission',
+      params: {
+        sessionId,
+        toolCall: { toolCallId: id, title: 'probe', kind: 'other', rawInput: {} },
+        options: [
+          { optionId: 'allow-once', kind: 'allow_once' },
+          { optionId: 'reject-once', kind: 'reject_once' },
+        ],
+      },
+    })
+    return reply.promise
+  }
+
+  let permCreating
+  let permPreTurn
+  let permLiveTurn
+  const onMethod = {
+    initialize: (msg) =>
+      send({
+        jsonrpc: '2.0',
+        id: msg.id,
+        result: { protocolVersion: 1, agentCapabilities: { mcpCapabilities: { http: true } } },
+      }),
+    'session/new': async (msg) => {
+      const mcp = msg.params.mcpServers[0]
+      const headers = Object.fromEntries(mcp.headers.map((h) => [h.name, h.value]))
+      const mcpInit = await fetch(mcp.url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...headers },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'initialize',
+          params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'probe', version: '0' } },
+        }),
+      })
+      assert.equal(mcpInit.status, 200)
+      // Phase 1: before session/new completes, no session listener is registered yet.
+      permCreating = await requestProbe('sess-timing-1')
+      send({
+        jsonrpc: '2.0',
+        id: msg.id,
+        result: {
+          sessionId: 'sess-timing-1',
+          configOptions: [
+            {
+              id: 'model',
+              category: 'model',
+              currentValue: 'gemini-3.8-flash',
+              options: [
+                { value: 'gemini-4-argon', name: 'Gemini 4 Argon' },
+                { value: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash' },
+              ],
+            },
+          ],
+        },
+      })
+    },
+    'session/set_config_option': async (msg) => {
+      // Phase 2: after session/new + MCP handshake, before any turn owns the session.
+      permPreTurn = await requestProbe(msg.params.sessionId)
+      send({ jsonrpc: '2.0', id: msg.id, result: { configOptions: [] } })
+    },
+    'session/prompt': async (msg) => {
+      // Phase 3: inside an active turn with completed MCP handshake.
+      permLiveTurn = await requestProbe(msg.params.sessionId)
+      send({
+        jsonrpc: '2.0',
+        method: 'session/update',
+        params: {
+          sessionId: msg.params.sessionId,
+          update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'ok' } },
+        },
+      })
+      send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } })
+    },
+    'session/close': (msg) => send({ jsonrpc: '2.0', id: msg.id, result: {} }),
+  }
+  createInterface({ input: toAgent }).on('line', (line) => {
+    const msg = JSON.parse(line)
+    responses.get(msg.id)?.resolve(msg.result)
+    responses.delete(msg.id)
+    void onMethod[msg.method]?.(msg)
+  })
+
+  const { adapter } = makeRuntime(t, { host: { spawnAcp: () => child } })
+  const chunks = await collect(
+    adapter.stream({
+      provider: 'antigravity',
+      model: 'gemini-4-argon',
+      sessionId: 'S-PERM-TIMING',
+      tools: [bash],
+      messages: [sys, user('u1', 'hello')],
+    }),
+  )
+  assert.equal(finishOf(chunks).reason.kind, 'stop')
+  // Phase 4: after the turn ends while the session stays open.
+  const permPostTurn = await requestProbe('sess-timing-1')
+
+  assert.deepEqual(permCreating, { outcome: { outcome: 'cancelled' } })
+  assert.deepEqual(permPreTurn, { outcome: { outcome: 'selected', optionId: 'reject-once' } })
+  assert.deepEqual(permLiveTurn, { outcome: { outcome: 'selected', optionId: 'allow-once' } })
+  assert.deepEqual(permPostTurn, { outcome: { outcome: 'selected', optionId: 'reject-once' } })
 })

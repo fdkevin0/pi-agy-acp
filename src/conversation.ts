@@ -154,6 +154,8 @@ export class AcpTurn {
   readonly calls = new Map<string, ParkedCall>()
   /** Pi steps this turn has ended with `tool-calls`. */
   toolSteps = 0
+  /** Tool steps completed inside the active `session/prompt` segment. */
+  segmentToolSteps = 0
   /** Long-decode continuations sent in this turn. */
   continuations = 0
   /** The agent ended the prompt. */
@@ -161,6 +163,8 @@ export class AcpTurn {
   /** Settles after the current prompt's result or error has been queued. */
   promptSettled: Promise<void> = Promise.resolve()
   usage?: AcpPromptResult['usage']
+  /** Latest positive single-call context occupancy reported via `usage_update.used`. */
+  contextUsed?: number
   /** Relayed call ids whose results the agent has not yet re-awaited via `pi_await_result`. */
   readonly relayedCalls = new Set<string>()
   /** Bounded output buffered while one or more calls are relayed. */
@@ -253,6 +257,15 @@ export class AcpTurn {
    * @param update - the agent notification.
    */
   onUpdate(update: AcpSessionUpdate): void {
+    if (
+      update.sessionUpdate === 'usage_update' &&
+      typeof update.used === 'number' &&
+      Number.isFinite(update.used) &&
+      update.used > 0
+    ) {
+      this.contextUsed = update.used
+      return
+    }
     const text =
       update.content?.type === 'text' ? (update.content.text ?? '') : ''
     if (update.sessionUpdate === 'agent_message_chunk' && text.length > 0) {
@@ -359,39 +372,90 @@ export interface PumpHost {
   cancel(): void
 }
 
+/** Optional single-call context occupancy inputs for {@link toTokenUsage}. */
+export interface TokenUsageOptions {
+  /** Latest single-call context occupancy reported via `usage_update.used`. */
+  contextTokens?: number
+  /** Final `session/prompt` segment's usage when the turn spanned `max_tokens` continuations. */
+  lastSegmentUsage?: AcpPromptResult['usage']
+}
+
+function accumulateRawUsage(
+  prior: AcpPromptResult['usage'],
+  next: AcpPromptResult['usage'],
+): AcpPromptResult['usage'] {
+  if (prior === undefined) return next
+  if (next === undefined) return prior
+  const add = (a?: number, b?: number): number | undefined =>
+    a === undefined && b === undefined ? undefined : (a ?? 0) + (b ?? 0)
+  return {
+    inputTokens: add(prior.inputTokens, next.inputTokens),
+    outputTokens: add(prior.outputTokens, next.outputTokens),
+    cachedReadTokens: add(prior.cachedReadTokens, next.cachedReadTokens),
+    cachedWriteTokens: add(prior.cachedWriteTokens, next.cachedWriteTokens),
+    thoughtTokens: add(prior.thoughtTokens, next.thoughtTokens),
+    totalTokens: add(prior.totalTokens, next.totalTokens),
+  }
+}
+
 /**
- * Map one completed prompt or step sample to Pi token usage. When a single
- * sample spanned `calls` internal model steps (tool rounds or continuations),
- * prompt buckets are normalized by `calls` so Pi's native ContextMeter reflects
- * single-request context occupancy rather than the multi-step sum.
+ * Map accumulated ACP turn usage into Pi token usage.
+ *
+ * Consumption buckets (`inputTokens`, `outputTokens`, `cacheReadTokens`,
+ * `cacheWriteTokens`, `reasoningTokens`) stay unscaled cumulative turn totals
+ * because intermediate `toolUse` steps emit zero usage and Pi sums those
+ * buckets across steps for session accounting and flat pricing overrides.
+ *
+ * `totalTokens` feeds Pi's `calculateContextTokens` / ContextMeter / compaction
+ * threshold as final-call context occupancy: when `options.contextTokens`
+ * (from live `usage_update.used`) is positive, it is used directly; otherwise
+ * final-segment prompt buckets are normalized by `calls` and added to final-
+ * segment output tokens.
  *
  * `agy acp` reports `inputTokens` as uncached input only, disjoint from
- * `cachedReadTokens` and `cachedWriteTokens`, so every bucket is kept as
- * reported and the total is their sum.
- * @param usage - the agent's step or turn usage.
- * @param calls - model calls executed inside this sample (>= 1).
+ * `cachedReadTokens` and `cachedWriteTokens`.
+ * @param usage - accumulated turn usage.
+ * @param calls - model calls inside the final `session/prompt` segment (>= 1).
+ * @param options - optional live `usage_update` count and final segment usage.
  * @returns Pi usage.
  */
 export function toTokenUsage(
   usage: AcpPromptResult['usage'],
   calls = 1,
+  options?: TokenUsageOptions,
 ): TokenUsage | undefined {
   if (usage === undefined) return undefined
-  const scale = Math.max(1, calls)
-  const input = Math.max(0, Math.round((usage.inputTokens ?? 0) / scale))
-  const cacheRead = Math.max(
-    0,
-    Math.round((usage.cachedReadTokens ?? 0) / scale),
-  )
-  const cacheWrite = Math.max(
-    0,
-    Math.round((usage.cachedWriteTokens ?? 0) / scale),
-  )
-  const output = Math.max(0, usage.outputTokens ?? 0)
+  const input = Math.max(0, Math.round(usage.inputTokens ?? 0))
+  const cacheRead = Math.max(0, Math.round(usage.cachedReadTokens ?? 0))
+  const cacheWrite = Math.max(0, Math.round(usage.cachedWriteTokens ?? 0))
+  const output = Math.max(0, Math.round(usage.outputTokens ?? 0))
   const reasoning =
     usage.thoughtTokens !== undefined && usage.thoughtTokens > 0
-      ? Math.min(output, usage.thoughtTokens)
+      ? Math.min(output, Math.round(usage.thoughtTokens))
       : undefined
+  const liveContext = options?.contextTokens
+  let totalTokens: number
+  if (
+    typeof liveContext === 'number' &&
+    Number.isFinite(liveContext) &&
+    liveContext > 0
+  ) {
+    totalTokens = Math.round(liveContext)
+  } else {
+    const seg = options?.lastSegmentUsage ?? usage
+    const scale = Math.max(1, calls)
+    const segPrompt = Math.max(
+      0,
+      Math.round(
+        ((seg.inputTokens ?? 0) +
+          (seg.cachedReadTokens ?? 0) +
+          (seg.cachedWriteTokens ?? 0)) /
+          scale,
+      ),
+    )
+    const segOutput = Math.max(0, Math.round(seg.outputTokens ?? 0))
+    totalTokens = segPrompt + segOutput
+  }
   return {
     inputTokens: input,
     outputTokens: output,
@@ -402,7 +466,7 @@ export function toTokenUsage(
     ...(reasoning !== undefined && reasoning > 0
       ? { reasoningTokens: reasoning }
       : {}),
-    totalTokens: input + cacheRead + cacheWrite + output,
+    totalTokens,
   }
 }
 
@@ -542,16 +606,20 @@ async function* stepChunks(
           }
         }
         turn.toolSteps++
+        turn.segmentToolSteps++
         yield { type: 'finish', reason: { kind: 'tool-calls' } }
         return
       }
       case 'done': {
+        turn.usage = accumulateRawUsage(turn.usage, event.result.usage)
         const stop = event.result.stopReason
         if (
           stop === 'max_tokens' &&
           turn.continuations < host.maxContinuations
         ) {
           turn.continuations++
+          turn.segmentToolSteps = 0
+          turn.contextUsed = undefined
           turn.promptSettled = host.continuePrompt().then(
             (result) => turn.events.push({ kind: 'done', result }),
             (error: unknown) =>
@@ -561,9 +629,14 @@ async function* stepChunks(
         }
         turn.finished = true
         yield* close()
-        const calls = turn.toolSteps + turn.continuations + 1
-        turn.usage = event.result.usage
-        const usage = toTokenUsage(event.result.usage, calls)
+        const segmentCalls =
+          event.result.usage !== undefined
+            ? turn.segmentToolSteps + 1
+            : turn.toolSteps + turn.continuations + 1
+        const usage = toTokenUsage(turn.usage, segmentCalls, {
+          contextTokens: turn.contextUsed,
+          lastSegmentUsage: event.result.usage ?? turn.usage,
+        })
         if (usage !== undefined) yield { type: 'usage', usage }
         if (
           turn.isRelaying &&
