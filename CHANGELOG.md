@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.1.4](https://github.com/fdkevin0/pi-agy-acp/compare/v0.1.3...v0.1.4) (2026-11-15)
+
+
+### Bug Fixes
+
+* accept the flat mcp_pi_&lt;tool&gt; name agy 1.5.8 reports for Pi tools ([#23](https://github.com/fdkevin0/pi-agy-acp/issues/23)) ([d202134](https://github.com/fdkevin0/pi-agy-acp/commit/d2021349a4886ae34c5d4de7510da102f0e0c655))
+* deliver harness system prompt in opening ACP prompt ([#24](https://github.com/fdkevin0/pi-agy-acp/issues/24)) ([#26](https://github.com/fdkevin0/pi-agy-acp/issues/26)) ([b8679b0](https://github.com/fdkevin0/pi-agy-acp/commit/b8679b0baa171d6447a1cb11195d82a949bb2adf))
+* match quota groups to specific models and scope cache-warming veto ([#21](https://github.com/fdkevin0/pi-agy-acp/issues/21)) ([4f5bc7b](https://github.com/fdkevin0/pi-agy-acp/commit/4f5bc7b82f4e232ba36e2fcd3aa1e9ea5483e88b))
+* preserve turn usage totals, pin CI baseline, and test permission probe timing ([#10](https://github.com/fdkevin0/pi-agy-acp/issues/10)) ([#27](https://github.com/fdkevin0/pi-agy-acp/issues/27)) ([148fb6a](https://github.com/fdkevin0/pi-agy-acp/commit/148fb6a2f9bf12b31cac4e854d22a652a72c4f3b))
+
 ## [0.1.3]
 
 - Default quota display to `used` across the status bar, quota panel, and warnings, with `/agy-acp quota [used|remaining]` persistence in `settings.json` and `PI_AGY_QUOTA_DISPLAY` startup override.
