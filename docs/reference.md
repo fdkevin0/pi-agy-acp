@@ -77,23 +77,25 @@ isolated. Cached plans and login logs can be stale after an account change.
 ### Quota status and warnings
 
 When a run using `antigravity-acp` fully settles, the extension checks `/usage`
-in the background and shows a compact status such as `AGY 20%` (or `AGY 80%`
-in `remaining` mode). It uses the lowest remaining window in the selected
-model's matching quota group (or an unambiguous generic family group), and
-omits the status and low-quota warning when group ownership is unknown or
-ambiguous. Failed checks stay silent. Successful results and failures both
-respect the two-minute quota TTL, and overlapping background checks are skipped.
+in the background and shows a compact status indicator such as `AGY 20%` (or
+`AGY 80%` in `remaining` mode). It uses the lowest known remaining window in the
+selected model's matching quota group (or an unambiguous generic family group),
+and omits the status indicator and low-quota warning when group ownership is
+unknown or ambiguous. Failed background checks stay silent. Successful results
+and failures both respect the two-minute quota TTL, and concurrent background
+checks share the in-flight query.
 
-At 20% and 5% remaining (80% and 95% used), a warning appears once per bucket,
-reset time, and threshold. `/agy-acp quota` explicitly refreshes quota and updates
-the status; `/agy-acp status` uses fresh cached quota only. Neither session start
-nor model selection launches a quota command. Selecting another provider hides the
-status; returning to Antigravity uses only a fresh in-memory snapshot. Reset and
-shutdown clear the status.
+At or below 20% and 5% remaining (≥80% and ≥95% used), a warning appears once
+per group, bucket, reset time, and threshold. `/agy-acp quota` explicitly
+refreshes quota and updates the status indicator; `/agy-acp status` uses fresh
+cached quota only. Neither session start nor model selection launches a quota
+command. Selecting another provider hides the status indicator; returning to
+Antigravity uses only a fresh in-memory snapshot. `/agy-acp reset` clears the
+status indicator and warning history; shutdown clears the status indicator.
 
 When the active model belongs to `antigravity-acp`, this extension vetoes Pi's
-automatic prompt-cache warming to avoid idle requests consuming quota. Other
-providers' warming decisions and explicit model requests are left unchanged.
+automatic prompt-cache warming to avoid background warming requests consuming
+quota. Other providers' warming decisions are left unchanged.
 
 ## Configuration
 

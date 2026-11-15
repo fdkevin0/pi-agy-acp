@@ -25,13 +25,21 @@ function formatAccount(account?: AccountInfo): string {
 export type QuotaModelRef = string | { id: string; name?: string }
 
 const EXPLICIT_MEMBERS_PREFIX = /^models within this group:\s*/i
-
+const CLAUSE_SPLIT = /[,;\n/|&+]+|\b(?:and|or)\b/i
+const ID_DATE_SUFFIX = /[-_](?:20\d{2}[-_]\d{2}[-_]\d{2}|20\d{6})$/i
+const ID_QUALIFIER_SUFFIX = /[-_](low|medium|high|thinking)$/i
+const GROUP_QUALIFIER_SUFFIX =
+  /\s*\((low|medium|high|thinking)\)(?=\s*(?:models?|groups?)?[\s.!?)]*$)/i
+const PURE_VERSION = /^\d+(?:\.\d+)*$/
+const PARAM_SIZE = /^\d+(?:\.\d+)*b$/
+const GROUP_NOISE_TOKENS = new Set(['model', 'models', 'group', 'groups'])
 const GENERIC_GROUP_TOKENS = new Set([
+  'google',
+  'anthropic',
+  'openai',
   'gemini',
   'claude',
   'gpt',
-  'and',
-  'or',
   'model',
   'models',
   'group',
@@ -43,104 +51,258 @@ const GENERIC_GROUP_TOKENS = new Set([
 ])
 
 function normalizeTokens(text: string): string[] {
-  return text.toLowerCase().match(/[a-z0-9]+(?:\.[0-9]+)*/g) ?? []
+  return (
+    text
+      .toLowerCase()
+      .replace(/(?<=\d)-(?=\d{1,2}(?![a-z0-9.]))/g, '.')
+      .match(/[a-z0-9]+(?:\.[0-9]+)*(?:b(?![a-z0-9]))?/g) ?? []
+  )
 }
 
-function modelCandidates(id: string, name?: string): string[][] {
-  const base = [id, id.replace(/-(?:low|medium|high)$/i, '')]
-  if (name) {
-    base.push(name, name.replace(/\s*\((?:low|medium|high)\)\s*$/i, ''))
+function stripGroupNoise(tokens: string[]): string[] {
+  const stripped = tokens.filter((t) => !GROUP_NOISE_TOKENS.has(t))
+  return stripped.length >= 2 ? stripped : tokens
+}
+
+interface ParsedPhrase {
+  readonly head: string | undefined
+  readonly words: readonly string[]
+  readonly versions: readonly string[]
+  readonly sizes: readonly string[]
+  readonly qualifier: string | undefined
+  readonly tokenCount: number
+  readonly canonical: string
+}
+
+function buildPhrase(
+  tokens: readonly string[],
+  qualifier?: string,
+): ParsedPhrase {
+  const words: string[] = []
+  const versions: string[] = []
+  const sizes: string[] = []
+  for (const token of tokens) {
+    if (PURE_VERSION.test(token)) versions.push(token)
+    else if (PARAM_SIZE.test(token)) sizes.push(token)
+    else words.push(token)
   }
+  return {
+    head: tokens[0],
+    words,
+    versions,
+    sizes,
+    qualifier,
+    tokenCount: tokens.length,
+    canonical: `${words.join(' ')}|${versions.join(' ')}|${sizes.join(' ')}`,
+  }
+}
+
+function parseClause(raw: string, stripNoise = false): ParsedPhrase {
+  let text = raw.trim().replace(/[.!?]+$/, '')
+  let qualifier: string | undefined
+  const groupQual = text.match(GROUP_QUALIFIER_SUFFIX)
+  if (groupQual) {
+    qualifier = groupQual[1]!.toLowerCase()
+    text = text.replace(GROUP_QUALIFIER_SUFFIX, '')
+  } else {
+    text = text.replace(ID_DATE_SUFFIX, '')
+    const idQual = text.match(ID_QUALIFIER_SUFFIX)
+    if (idQual) {
+      qualifier = idQual[1]!.toLowerCase()
+      text = text.slice(0, idQual.index).replace(ID_DATE_SUFFIX, '')
+    }
+  }
+  const rawTokens = normalizeTokens(text)
+  const tokens = stripNoise ? stripGroupNoise(rawTokens) : rawTokens
+  if (tokens.length === 0) {
+    const fallback = normalizeTokens(raw)
+    return buildPhrase(
+      stripNoise ? stripGroupNoise(fallback) : fallback,
+      undefined,
+    )
+  }
+  return buildPhrase(tokens, qualifier)
+}
+
+function dedupePhrases(
+  phrases: readonly (ParsedPhrase | undefined)[],
+): ParsedPhrase[] {
   const seen = new Set<string>()
-  const out: string[][] = []
-  for (const item of base) {
-    for (const variant of [item, item.replace(/(?<=\d)-(?=\d)/g, '.')]) {
-      const tokens = normalizeTokens(variant)
-      const key = tokens.join(' ')
-      if (tokens.length > 0 && !seen.has(key)) {
-        seen.add(key)
-        out.push(tokens)
-      }
+  const out: ParsedPhrase[] = []
+  for (const phrase of phrases) {
+    const key = phrase ? `${phrase.canonical}#${phrase.qualifier ?? ''}` : ''
+    if (phrase && phrase.tokenCount > 0 && !seen.has(key)) {
+      seen.add(key)
+      out.push(phrase)
     }
   }
   return out
 }
 
-function splitPhrases(text: string): string[][] {
-  return text
-    .split(/[,;\n/|&]+/)
-    .map(normalizeTokens)
-    .filter((tokens) => tokens.length > 0)
+function buildModelCandidates(id: string, name?: string): ParsedPhrase[] {
+  const idPhrase = parseClause(id)
+  const namePhrase = name ? parseClause(name) : undefined
+  const sharedQualifier = idPhrase.qualifier ?? namePhrase?.qualifier
+  const withQualifier = (
+    phrase: ParsedPhrase | undefined,
+  ): ParsedPhrase | undefined =>
+    phrase && phrase.qualifier === undefined && sharedQualifier !== undefined
+      ? { ...phrase, qualifier: sharedQualifier }
+      : phrase
+  return dedupePhrases([withQualifier(idPhrase), withQualifier(namePhrase)])
 }
 
-function isSubsetMatch(target: string[], candidate: string[]): boolean {
-  const specific = target.filter(
-    (t) => t !== 'model' && t !== 'models' && t !== 'group' && t !== 'groups',
+function parseGroupPhrases(text: string): ParsedPhrase[] {
+  return text
+    .split(CLAUSE_SPLIT)
+    .map((part) => parseClause(part, true))
+    .filter((phrase) => phrase.tokenCount > 0)
+}
+
+function isBroaderVariant(
+  groupPhrase: ParsedPhrase,
+  modelPhrase: ParsedPhrase,
+): boolean {
+  if (
+    groupPhrase.tokenCount < 2 ||
+    !groupPhrase.head ||
+    groupPhrase.head !== modelPhrase.head
   )
-  if (specific.length < 2 || specific[0] !== candidate[0]) return false
-  let pos = 1
-  for (let i = 1; i < specific.length; i++) {
-    const found = candidate.indexOf(specific[i]!, pos)
-    if (found === -1) return false
-    pos = found + 1
+    return false
+  if (
+    groupPhrase.words.length >= 2 &&
+    groupPhrase.versions.length === 0 &&
+    groupPhrase.sizes.length === 0
+  ) {
+    return groupPhrase.words.join(' ') === modelPhrase.words.join(' ')
   }
-  return true
+  if (
+    groupPhrase.words.length === 1 &&
+    groupPhrase.versions.length === 1 &&
+    groupPhrase.sizes.length === 0
+  ) {
+    return (
+      modelPhrase.versions.length === 1 &&
+      modelPhrase.versions[0] === groupPhrase.versions[0]
+    )
+  }
+  return false
+}
+
+function extractFamily(text?: string): string | undefined {
+  const first = text ? normalizeTokens(text)[0] : undefined
+  return first === 'gemini' || first === 'claude' || first === 'gpt'
+    ? first
+    : undefined
 }
 
 function isGenericFamilyGroup(group: QuotaGroup, family: string): boolean {
   if (EXPLICIT_MEMBERS_PREFIX.test(group.description)) return false
-  const nameTokens = normalizeTokens(group.name)
-  return (
-    nameTokens.includes(family) &&
-    nameTokens.every((t) => GENERIC_GROUP_TOKENS.has(t))
-  )
+  return group.name.split(CLAUSE_SPLIT).some((clause) => {
+    const tokens = normalizeTokens(clause)
+    return (
+      tokens.includes(family) &&
+      tokens.every((token) => GENERIC_GROUP_TOKENS.has(token))
+    )
+  })
 }
 
-function uniqueMatch(
-  groups: readonly QuotaGroup[],
-  match: (group: QuotaGroup) => boolean,
-): QuotaGroup[] | undefined {
-  const matched = groups.filter(match)
-  if (matched.length === 0) return undefined
-  return matched.length === 1 ? matched : []
+interface IndexedGroup {
+  readonly group: QuotaGroup
+  readonly explicit: boolean
+  readonly name: readonly ParsedPhrase[]
+  readonly desc: readonly ParsedPhrase[]
 }
 
-function selectQuotaGroups(
+function firstUniqueGroup(
+  groups: readonly IndexedGroup[],
+  tiers: readonly ((group: IndexedGroup) => boolean)[],
+): QuotaGroup | undefined {
+  for (const match of tiers) {
+    const matched = groups.filter(match)
+    if (matched.length === 1) return matched[0]!.group
+    if (matched.length > 1) return undefined
+  }
+  return undefined
+}
+
+const hasSameQualifier = (a: ParsedPhrase, b: ParsedPhrase) =>
+  a.qualifier === b.qualifier
+
+const hasCompatibleQualifier = (a: ParsedPhrase, b: ParsedPhrase) =>
+  a.qualifier === undefined ||
+  b.qualifier === undefined ||
+  a.qualifier === b.qualifier
+
+const isExactPhrase = (groupPhrase: ParsedPhrase, modelPhrase: ParsedPhrase) =>
+  groupPhrase.canonical === modelPhrase.canonical
+
+function selectQuotaGroup(
   snapshot: QuotaSnapshot,
   model?: QuotaModelRef,
-): QuotaGroup[] {
-  if (!model) return []
+): QuotaGroup | undefined {
+  if (!model) return undefined
   const id = typeof model === 'string' ? model : model.id
   const name = typeof model === 'string' ? undefined : model.name
-  const candidates = modelCandidates(id, name)
-  if (candidates.length === 0) return []
-  const candPhrases = candidates.map((c) => c.join(' '))
+  const models = buildModelCandidates(id, name)
+  if (models.length === 0) return undefined
 
-  const exactMatch = (phrases: string[][]) =>
-    phrases.some((p) => candPhrases.includes(p.join(' ')))
-  const variantMatch = (phrases: string[][]) =>
-    phrases.some((p) => candidates.some((c) => isSubsetMatch(p, c)))
+  const groups: IndexedGroup[] = snapshot.groups.map((group) => ({
+    group,
+    explicit: EXPLICIT_MEMBERS_PREFIX.test(group.description),
+    name: parseGroupPhrases(group.name),
+    desc: parseGroupPhrases(
+      group.description.replace(EXPLICIT_MEMBERS_PREFIX, ''),
+    ),
+  }))
 
-  const descText = (g: QuotaGroup) =>
-    g.description.replace(EXPLICIT_MEMBERS_PREFIX, '')
+  const matchPhrases = (
+    phrases: readonly ParsedPhrase[],
+    candidates: readonly ParsedPhrase[],
+    relation: (groupPhrase: ParsedPhrase, modelPhrase: ParsedPhrase) => boolean,
+    qualOk: (a: ParsedPhrase, b: ParsedPhrase) => boolean,
+  ) =>
+    phrases.some((p) => candidates.some((c) => qualOk(p, c) && relation(p, c)))
 
-  const resolved =
-    uniqueMatch(snapshot.groups, (g) => exactMatch(splitPhrases(g.name))) ??
-    uniqueMatch(snapshot.groups, (g) => exactMatch(splitPhrases(descText(g)))) ??
-    uniqueMatch(snapshot.groups, (g) => variantMatch(splitPhrases(g.name))) ??
-    uniqueMatch(snapshot.groups, (g) =>
-      variantMatch(splitPhrases(descText(g))),
-    )
-  if (resolved) return resolved
+  const allowsExplicit = (
+    g: IndexedGroup,
+    qualOk: (a: ParsedPhrase, b: ParsedPhrase) => boolean,
+  ) =>
+    matchPhrases(g.desc, models, isExactPhrase, qualOk) ||
+    matchPhrases(g.desc, models, isBroaderVariant, qualOk)
 
-  const family =
-    /^(gemini|claude|gpt)(?:-|$)/i.exec(id)?.[1]?.toLowerCase() ??
-    /^(gemini|claude|gpt)(?:\s|$)/i.exec(name ?? '')?.[1]?.toLowerCase()
-  if (!family) return []
+  const tiersFor = (
+    relation: (groupPhrase: ParsedPhrase, modelPhrase: ParsedPhrase) => boolean,
+    qualOk: (a: ParsedPhrase, b: ParsedPhrase) => boolean,
+    allowExplicitName: boolean,
+  ): ((group: IndexedGroup) => boolean)[] => [
+    (g) =>
+      (!g.explicit || (allowExplicitName && allowsExplicit(g, qualOk))) &&
+      matchPhrases(g.name, models, relation, qualOk),
+    (g) => g.explicit && matchPhrases(g.desc, models, relation, qualOk),
+    (g) => !g.explicit && matchPhrases(g.desc, models, relation, qualOk),
+  ]
 
-  return (
-    uniqueMatch(snapshot.groups, (g) => isGenericFamilyGroup(g, family)) ?? []
-  )
+  const family = extractFamily(id) ?? extractFamily(name)
+  // Priority order (each stage checks name -> explicit member list -> unprefixed description,
+  // requiring closed "Models within this group:" lists to authorize any name match):
+  // 1. Exact phrase with identical qualifier
+  // 2. Exact phrase with one-sided missing qualifier (conflicting qualifiers never match)
+  // 3. Broader family/version variant with identical qualifier
+  // 4. Broader family/version variant with compatible qualifier
+  // 5. Unambiguous generic family group fallback
+  return firstUniqueGroup(groups, [
+    ...tiersFor(isExactPhrase, hasSameQualifier, true),
+    ...tiersFor(isExactPhrase, hasCompatibleQualifier, true),
+    ...tiersFor(isBroaderVariant, hasSameQualifier, false),
+    ...tiersFor(isBroaderVariant, hasCompatibleQualifier, false),
+    ...(family
+      ? [
+          (g: IndexedGroup) =>
+            !g.explicit && isGenericFamilyGroup(g.group, family),
+        ]
+      : []),
+  ])
 }
 
 /** Lowest known window for the model's matching quota group; returns undefined when unknown or ambiguous. */
@@ -149,15 +311,14 @@ export function quotaForModel(
   model?: QuotaModelRef,
 ): { group: QuotaGroup; bucket: QuotaBucket; fraction: number } | undefined {
   if (snapshot.status !== 'ok') return undefined
-  const groups = selectQuotaGroups(snapshot, model)
+  const group = selectQuotaGroup(snapshot, model)
+  if (!group) return undefined
   let lowest: ReturnType<typeof quotaForModel>
-  for (const group of groups) {
-    for (const bucket of group.buckets) {
-      const fraction = clampFraction(bucket.remainingFraction)
-      if (fraction === undefined) continue
-      if (!lowest || fraction < lowest.fraction)
-        lowest = { group, bucket, fraction }
-    }
+  for (const bucket of group.buckets) {
+    const fraction = clampFraction(bucket.remainingFraction)
+    if (fraction === undefined) continue
+    if (!lowest || fraction < lowest.fraction)
+      lowest = { group, bucket, fraction }
   }
   return lowest
 }
@@ -210,10 +371,11 @@ export function formatQuota(
   }
   for (const group of snapshot.groups) {
     lines.push('', `  ${group.name || 'Unnamed model group'}`)
-    if (group.description) {
-      lines.push(
-        `    ${group.description.replace(EXPLICIT_MEMBERS_PREFIX, '')}`,
-      )
+    const description = group.description
+      .replace(EXPLICIT_MEMBERS_PREFIX, '')
+      .trim()
+    if (description) {
+      lines.push(`    ${description}`)
     }
     if (group.buckets.length === 0)
       lines.push('    No quota windows available.')
