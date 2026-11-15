@@ -46,8 +46,8 @@ pi -e ./index.ts
   over buffered output, and turn/tenant identities guard all async callbacks.
 - **Quota and TUI:** Settled checks share the reader's TTL and in-flight request
   without blocking Pi. Model selection reads memory only. UI generation checks
-  discard stale background results; warning keys include bucket, reset time, and
-  threshold. An explicit quota query can discover uncached account tiers through
+  discard stale background results; warning keys include group, bucket, reset
+  time, and threshold. An explicit quota query can discover uncached account tiers through
   one tool-less ACP session per runtime, persisting the tier in `catalog.json`.
   Email lookup reads at most the last 64 KiB of each candidate login log and uses
   the last match in the first matching file. Runtime warnings stay off stderr to

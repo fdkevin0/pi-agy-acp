@@ -22,34 +22,38 @@ function formatAccount(account?: AccountInfo): string {
   return [account?.email, account?.plan].filter(Boolean).join(' · ')
 }
 
+/** Model identifier or `{ id, name }` metadata from Pi's active model context. */
 export type QuotaModelRef = string | { id: string; name?: string }
 
-const EXPLICIT_MEMBERS_PREFIX = /^models within this group:\s*/i
+// `agy` `/usage` prefixes closed, exhaustive member lists with "Models within this group:";
+// unprefixed descriptions are free-form prose notes.
+const EXPLICIT_MEMBERS_PREFIX = /^\s*models within this group:\s*/i
 const CLAUSE_SPLIT = /[,;\n/|&+]+|\b(?:and|or)\b/i
 const ID_DATE_SUFFIX = /[-_](?:20\d{2}[-_]\d{2}[-_]\d{2}|20\d{6})$/i
+// Effort or thinking-mode suffixes in model IDs (`-thinking`) and `/usage` labels (`(Thinking)`).
 const ID_QUALIFIER_SUFFIX = /[-_](low|medium|high|thinking)$/i
 const GROUP_QUALIFIER_SUFFIX =
   /\s*\((low|medium|high|thinking)\)(?=\s*(?:models?|groups?)?[\s.!?)]*$)/i
 const PURE_VERSION = /^\d+(?:\.\d+)*$/
 const PARAM_SIZE = /^\d+(?:\.\d+)*b$/
+const VENDOR_TOKENS = new Set(['google', 'anthropic', 'openai'])
+const FAMILY_TOKENS = new Set(['gemini', 'claude', 'gpt'])
 const GROUP_NOISE_TOKENS = new Set(['model', 'models', 'group', 'groups'])
 const GENERIC_GROUP_TOKENS = new Set([
-  'google',
-  'anthropic',
-  'openai',
-  'gemini',
-  'claude',
-  'gpt',
-  'model',
-  'models',
-  'group',
-  'groups',
+  ...VENDOR_TOKENS,
+  ...FAMILY_TOKENS,
+  ...GROUP_NOISE_TOKENS,
   'all',
   'other',
   'default',
   'general',
 ])
 
+/**
+ * Tokenize into lowercase words, dotted versions, and `<n>b` parameter sizes.
+ * Hyphens between digits become dots only for 1–2 digit version segments (`5-5` -> `5.5`),
+ * preserving parameter sizes (`3-8b`, `120b`) and dates stripped beforehand.
+ */
 function normalizeTokens(text: string): string[] {
   return (
     text
@@ -59,6 +63,11 @@ function normalizeTokens(text: string): string[] {
   )
 }
 
+/**
+ * Drop group-label nouns (`model`, `models`, `group`, `groups`) only when at least two
+ * identifying tokens remain, keeping generic pool names like `"Gemini Models"` intact
+ * so they only match via `isGenericFamilyGroup`.
+ */
 function stripGroupNoise(tokens: string[]): string[] {
   const stripped = tokens.filter((t) => !GROUP_NOISE_TOKENS.has(t))
   return stripped.length >= 2 ? stripped : tokens
@@ -74,6 +83,10 @@ interface ParsedPhrase {
   readonly canonical: string
 }
 
+/**
+ * Partition tokens into words, versions, and parameter sizes so `canonical` compares
+ * model names order-insensitively across categories (e.g. `Claude 5.5 Opus` vs `claude-opus-5-5`).
+ */
 function buildPhrase(
   tokens: readonly string[],
   qualifier?: string,
@@ -103,7 +116,7 @@ function parseClause(raw: string, stripNoise = false): ParsedPhrase {
   const groupQual = text.match(GROUP_QUALIFIER_SUFFIX)
   if (groupQual) {
     qualifier = groupQual[1]!.toLowerCase()
-    text = text.replace(GROUP_QUALIFIER_SUFFIX, '')
+    text = text.replace(GROUP_QUALIFIER_SUFFIX, '').replace(ID_DATE_SUFFIX, '')
   } else {
     text = text.replace(ID_DATE_SUFFIX, '')
     const idQual = text.match(ID_QUALIFIER_SUFFIX)
@@ -159,6 +172,11 @@ function parseGroupPhrases(text: string): ParsedPhrase[] {
     .filter((phrase) => phrase.tokenCount > 0)
 }
 
+/**
+ * True when `groupPhrase` names a broader release line that still identifies `modelPhrase`:
+ * either an unversioned sub-family with matching words (`Gemini Flash` -> `gemini-3.8-flash`)
+ * or a single-version family line (`Gemini 3.8` -> `gemini-3.8-flash`), never crossing sizes.
+ */
 function isBroaderVariant(
   groupPhrase: ParsedPhrase,
   modelPhrase: ParsedPhrase,
@@ -190,10 +208,10 @@ function isBroaderVariant(
 }
 
 function extractFamily(text?: string): string | undefined {
-  const first = text ? normalizeTokens(text)[0] : undefined
-  return first === 'gemini' || first === 'claude' || first === 'gpt'
-    ? first
+  const head = text
+    ? normalizeTokens(text).find((token) => !VENDOR_TOKENS.has(token))
     : undefined
+  return head && FAMILY_TOKENS.has(head) ? head : undefined
 }
 
 function isGenericFamilyGroup(group: QuotaGroup, family: string): boolean {
@@ -229,10 +247,15 @@ function firstUniqueGroup(
 const hasSameQualifier = (a: ParsedPhrase, b: ParsedPhrase) =>
   a.qualifier === b.qualifier
 
-const hasCompatibleQualifier = (a: ParsedPhrase, b: ParsedPhrase) =>
-  a.qualifier === undefined ||
-  b.qualifier === undefined ||
-  a.qualifier === b.qualifier
+const isUnqualifiedGroup = (
+  groupPhrase: ParsedPhrase,
+  modelPhrase: ParsedPhrase,
+) => groupPhrase.qualifier === undefined && modelPhrase.qualifier !== undefined
+
+const isUnqualifiedModel = (
+  groupPhrase: ParsedPhrase,
+  modelPhrase: ParsedPhrase,
+) => groupPhrase.qualifier !== undefined && modelPhrase.qualifier === undefined
 
 const isExactPhrase = (groupPhrase: ParsedPhrase, modelPhrase: ParsedPhrase) =>
   groupPhrase.canonical === modelPhrase.canonical
@@ -274,28 +297,34 @@ function selectQuotaGroup(
   const tiersFor = (
     relation: (groupPhrase: ParsedPhrase, modelPhrase: ParsedPhrase) => boolean,
     qualOk: (a: ParsedPhrase, b: ParsedPhrase) => boolean,
-    allowExplicitName: boolean,
-  ): ((group: IndexedGroup) => boolean)[] => [
-    (g) =>
-      (!g.explicit || (allowExplicitName && allowsExplicit(g, qualOk))) &&
-      matchPhrases(g.name, models, relation, qualOk),
-    (g) => g.explicit && matchPhrases(g.desc, models, relation, qualOk),
-    (g) => !g.explicit && matchPhrases(g.desc, models, relation, qualOk),
-  ]
+    mergeAuthoritative = false,
+  ): ((group: IndexedGroup) => boolean)[] => {
+    const byName = (g: IndexedGroup) =>
+      (!g.explicit || allowsExplicit(g, qualOk)) &&
+      matchPhrases(g.name, models, relation, qualOk)
+    const byExplicitDesc = (g: IndexedGroup) =>
+      g.explicit && matchPhrases(g.desc, models, relation, qualOk)
+    const byProseDesc = (g: IndexedGroup) =>
+      !g.explicit && matchPhrases(g.desc, models, relation, qualOk)
+    return mergeAuthoritative
+      ? [(g) => byName(g) || byExplicitDesc(g), byProseDesc]
+      : [byName, byExplicitDesc, byProseDesc]
+  }
 
   const family = extractFamily(id) ?? extractFamily(name)
-  // Priority order (each stage checks name -> explicit member list -> unprefixed description,
-  // requiring closed "Models within this group:" lists to authorize any name match):
-  // 1. Exact phrase with identical qualifier
-  // 2. Exact phrase with one-sided missing qualifier (conflicting qualifiers never match)
-  // 3. Broader family/version variant with identical qualifier
-  // 4. Broader family/version variant with compatible qualifier
-  // 5. Unambiguous generic family group fallback
+  // Priority order (closed "Models within this group:" lists must authorize any name match):
+  // 1. Exact phrase + identical qualifier (`name -> explicit list -> prose description`)
+  // 2. Exact phrase + unqualified group for a qualified model (`name -> explicit list -> prose`)
+  // 3. Exact phrase + qualified group for an unqualified model (`name | explicit list -> prose`)
+  // 4. Broader release-line variant with the same three qualifier tiers
+  // 5. Unambiguous generic family pool (`Gemini Models`, `Claude and GPT models`)
   return firstUniqueGroup(groups, [
-    ...tiersFor(isExactPhrase, hasSameQualifier, true),
-    ...tiersFor(isExactPhrase, hasCompatibleQualifier, true),
-    ...tiersFor(isBroaderVariant, hasSameQualifier, false),
-    ...tiersFor(isBroaderVariant, hasCompatibleQualifier, false),
+    ...tiersFor(isExactPhrase, hasSameQualifier),
+    ...tiersFor(isExactPhrase, isUnqualifiedGroup),
+    ...tiersFor(isExactPhrase, isUnqualifiedModel, true),
+    ...tiersFor(isBroaderVariant, hasSameQualifier),
+    ...tiersFor(isBroaderVariant, isUnqualifiedGroup),
+    ...tiersFor(isBroaderVariant, isUnqualifiedModel, true),
     ...(family
       ? [
           (g: IndexedGroup) =>

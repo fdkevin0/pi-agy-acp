@@ -86,7 +86,7 @@ and failures both respect the two-minute quota TTL, and concurrent background
 checks share the in-flight query.
 
 At or below 20% and 5% remaining (≥80% and ≥95% used), a warning appears once
-per group, bucket, reset time, and threshold. `/agy-acp quota` explicitly
+per group, quota window, reset time, and threshold. `/agy-acp quota` explicitly
 refreshes quota and updates the status indicator; `/agy-acp status` uses fresh
 cached quota only. Neither session start nor model selection launches a quota
 command. Selecting another provider hides the status indicator; returning to

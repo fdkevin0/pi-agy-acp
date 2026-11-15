@@ -154,7 +154,7 @@ test('refresh does not re-register and abort itself, forwards force/signal, and 
   assert.equal(h.registrations.length, 2)
 })
 
-test('lifecycle uses light resets, cache warming stops, and selecting models only reads fresh memory', async (t) => {
+test('lifecycle uses light resets, cache warming stops only for this provider, and selecting models only reads fresh memory', async (t) => {
   const light = t.mock.method(
     AntigravityRuntime.prototype,
     'resetConversations',
@@ -408,6 +408,26 @@ test('quota selection matches specific groups, explicit members, and display nam
     quotaForModel(collidingQualifiers, { id: 'claude-opus-5-5', name: 'Claude Opus 5.5' }),
     undefined,
   )
+  const splitAcrossNameAndExplicit = groups(
+    group('Claude Opus 5.5 (Low)', 0.1),
+    group('Claude and GPT models', 0.9, 'Models within this group: Claude Opus 5.5 (Thinking)'),
+  )
+  assert.equal(
+    quotaForModel(splitAcrossNameAndExplicit, { id: 'claude-opus-5-5', name: 'Claude Opus 5.5' }),
+    undefined,
+  )
+  assert.equal(
+    formatQuotaStatus(splitAcrossNameAndExplicit, 'claude-opus-5-5-low', 'remaining'),
+    'AGY 10%',
+  )
+  assert.equal(
+    formatQuotaStatus(splitAcrossNameAndExplicit, 'claude-opus-5-5-thinking', 'remaining'),
+    'AGY 90%',
+  )
+  assert.equal(
+    formatQuotaStatus(splitAcrossNameAndExplicit, 'claude-opus-5-5-20260301 (Thinking)', 'remaining'),
+    'AGY 90%',
+  )
   const reorderedDated = groups(group('Claude Models', 0.9), group('Claude 5.5 Opus', 0))
   assert.equal(
     formatQuotaStatus(reorderedDated, 'claude-opus-5-5-20260301', 'remaining'),
@@ -419,6 +439,14 @@ test('quota selection matches specific groups, explicit members, and display nam
   )
   assert.equal(
     formatQuotaStatus(groups(group('Google Gemini Models', 0.6)), 'gemini-3.8-flash', 'remaining'),
+    'AGY 60%',
+  )
+  assert.equal(
+    formatQuotaStatus(
+      groups(group('Gemini Models', 0.6)),
+      { id: 'opaque-id', name: 'Google Gemini 3.8 Flash' },
+      'remaining',
+    ),
     'AGY 60%',
   )
 
@@ -448,6 +476,11 @@ test('quota selection matches specific groups, explicit members, and display nam
   )
   assert.equal(formatQuotaStatus(variantExplicit, 'gemini-3.8-flash', 'remaining'), 'AGY 40%')
   assert.equal(formatQuotaStatus(variantExplicit, 'claude-opus-5-5', 'remaining'), 'AGY 40%')
+  const explicitVariantName = groups(
+    group('Gemini Flash', 0.3, '  Models within this group: Gemini 3.8'),
+    group('Shared Tier', 0.8, 'Models within this group: Gemini Flash'),
+  )
+  assert.equal(formatQuotaStatus(explicitVariantName, 'gemini-3.8-flash', 'remaining'), 'AGY 30%')
 
   const dedicatedFlash = groups(group('Gemini Models', 0.7), group('Gemini 3.8 Flash', 0))
   assert.equal(
@@ -485,7 +518,7 @@ test('quota selection matches specific groups, explicit members, and display nam
   assert.equal(formatQuotaStatus(mixedClause, 'gpt-oss-120b-medium', 'remaining'), 'AGY 60%')
   assert.equal(quotaForModel(mixedClause, 'gpt-5'), undefined)
 
-  // Ambiguity rejection.
+  // Unmatched and ambiguous group rejection.
   assert.equal(
     quotaForModel(groups(group('Gemini 4 Argon', 0), group('Gemini Pro', 0.8)), 'gemini-3.8-flash'),
     undefined,
@@ -605,21 +638,17 @@ test('cancelled TUI quota check shares in-flight request with agent_settled, and
   assert.match(h.notices.at(-1).text, /Antigravity ACP runtime is disposed\./)
 })
 
-test('ambiguous quota ownership does not emit a misleading low-quota warning on settle', async (t) => {
-  const ambiguous = {
-    status: 'ok',
-    updatedAt: new Date().toISOString(),
-    groups: [
-      {
-        name: 'Gemini 4 Argon',
-        description: '',
-        buckets: [{ id: 'a', window: '5h', remainingFraction: 0 }],
-      },
-    ],
-  }
-  t.mock.method(QuotaReader.prototype, 'read', async () => ambiguous)
+test('unmatched or ambiguous quota ownership does not emit a misleading low-quota warning on settle', async (t) => {
+  let current = groups(group('Gemini 4 Argon', 0))
+  t.mock.method(QuotaReader.prototype, 'read', async () => current)
   const h = harness(t)
   h.ctx.model = { provider, id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash' }
+  h.handlers.get('agent_settled')({}, h.ctx)
+  await tick()
+  assert.equal(h.statuses.at(-1), undefined)
+  assert.equal(h.notices.length, 0)
+
+  current = groups(group('Gemini Models', 0), group('Gemini Models', 0.1))
   h.handlers.get('agent_settled')({}, h.ctx)
   await tick()
   assert.equal(h.statuses.at(-1), undefined)
