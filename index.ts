@@ -4,7 +4,7 @@ import {
   type ProviderModelConfig,
   type ExtensionContext,
 } from '@earendil-works/pi-coding-agent'
-import { AntigravityRuntime } from './src/runtime.ts'
+import { AntigravityRuntime, type RuntimeHost } from './src/runtime.ts'
 import {
   asQuotaDisplay,
   DEFAULT_QUOTA_DISPLAY,
@@ -24,7 +24,10 @@ import {
 } from './src/format.ts'
 import type { QuotaSnapshot } from './src/quota.ts'
 
-export default function (pi: ExtensionAPI) {
+export default function (
+  pi: ExtensionAPI,
+  host: Partial<Pick<RuntimeHost, 'spawnAcp' | 'runCommand'>> = {},
+) {
   const envQuotaDisplay = asQuotaDisplay(process.env.PI_AGY_QUOTA_DISPLAY)
   const config = {
     ...defaults,
@@ -35,8 +38,8 @@ export default function (pi: ExtensionAPI) {
   const createRuntime = () =>
     new AntigravityRuntime({
       config,
-      spawnAcp,
-      runCommand,
+      spawnAcp: host.spawnAcp ?? spawnAcp,
+      runCommand: host.runCommand ?? runCommand,
       log: { info: () => {}, warn: () => {} },
       onModelsChanged: () => {
         if (refreshDepth === 0) register()
@@ -106,6 +109,7 @@ export default function (pi: ExtensionAPI) {
     runtime: AntigravityRuntime
     epoch: number
     ctx: ExtensionContext
+    model: ExtensionContext['model']
   }
   let pendingSettle: PendingSettle | undefined
   const warned = new Set<string>()
@@ -169,6 +173,11 @@ export default function (pi: ExtensionAPI) {
   )
   pi.on('model_select', (event, ctx) => {
     clearStatus(ctx)
+    if (pendingSettle && event.model?.provider === config.provider) {
+      pendingSettle.epoch = uiEpoch
+      pendingSettle.ctx = ctx
+      pendingSettle.model = event.model
+    }
     updateStatus(ctx, activeRuntime?.quota.peek(), event.model)
   })
   pi.on('agent_settled', (_event, ctx) => {
@@ -179,9 +188,15 @@ export default function (pi: ExtensionAPI) {
     if (pendingSettle?.runtime === current) {
       pendingSettle.epoch = uiEpoch
       pendingSettle.ctx = ctx
+      pendingSettle.model = ctx.model
       return
     }
-    const state: PendingSettle = { runtime: current, epoch: uiEpoch, ctx }
+    const state: PendingSettle = {
+      runtime: current,
+      epoch: uiEpoch,
+      ctx,
+      model: ctx.model,
+    }
     pendingSettle = state
     void current.quota
       .read(false)
@@ -195,15 +210,10 @@ export default function (pi: ExtensionAPI) {
         )
           return
         const targetCtx = state.ctx
-        const model = targetCtx.model
+        const model = state.model
         if (!targetCtx.hasUI || model?.provider !== config.provider) return
+        updateStatus(targetCtx, snapshot, model)
         const quota = quotaForModel(snapshot, model)
-        targetCtx.ui.setStatus(
-          config.provider,
-          quota
-            ? `AGY ${Math.round(displayFraction(quota.fraction, quotaDisplay) * 100)}%`
-            : undefined,
-        )
         if (!quota || quota.fraction > 0.2) return
         const threshold = quota.fraction <= 0.05 ? 5 : 20
         const groupName = quota.group.name || 'Unnamed model group'

@@ -11,30 +11,73 @@ import { formatQuotaStatus, quotaForModel } from '../src/format.ts'
 
 const provider = 'antigravity-acp'
 const tick = () => new Promise((resolve) => setImmediate(resolve))
-const snapshot = (remaining = 0.1, resetTime = '2030-01-01T00:00:00Z') => ({
+
+const LIVE_CATALOG = [
+  { id: 'gemini-4-carbon', name: 'Gemini 4 Carbon' },
+  { id: 'gemini-4-argon', name: 'Gemini 4 Argon' },
+  { id: 'gemini-4-hydrogen', name: 'Gemini 4 Hydrogen' },
+  { id: 'gemini-pro-orchestrator', name: 'Orchestrator (Carbon)' },
+  { id: 'gemini-pro-orchestrator-argon', name: 'Orchestrator (Argon)' },
+  { id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash' },
+  { id: 'claude-opus-5-5', name: 'Claude Opus 5.5' },
+  { id: 'claude-sonnet-5-5', name: 'Claude Sonnet 5.5' },
+  { id: 'gpt-oss-120b-medium', name: 'GPT-OSS 120B (Medium)' },
+]
+
+// Matches real `agy 1.5.9 -p /usage --output-format json` schema and group descriptions.
+const liveGroups = (claudeRemaining = 0.1, resetTime = '2030-01-01T00:00:00Z') => [
+  {
+    name: 'Gemini Models',
+    description:
+      'Models within this group: Gemini 4 Carbon, Gemini 4 Argon, Gemini 4 Hydrogen, Orchestrator (Carbon), Orchestrator (Argon), Gemini 3.8 Flash',
+    buckets: [
+      { id: 'gemini-5h', window: '5h', remainingFraction: 0.8, resetTime },
+    ],
+  },
+  {
+    name: 'Claude and GPT models',
+    description:
+      'Models within this group: Claude Opus 5.5, Claude Sonnet 5.5, GPT-OSS 120B',
+    buckets: [
+      {
+        id: '3p-weekly',
+        window: 'weekly',
+        remainingFraction: claudeRemaining,
+        resetTime,
+      },
+    ],
+  },
+]
+
+const snapshot = (
+  claudeRemaining = 0.1,
+  resetTime = '2030-01-01T00:00:00Z',
+) => ({
   status: 'ok',
   updatedAt: new Date().toISOString(),
-  groups: [
-    {
-      name: 'Gemini Models',
-      description: 'Gemini',
-      buckets: [
-        { id: 'gemini', window: '5h', remainingFraction: 0.8, resetTime },
-      ],
+  groups: liveGroups(claudeRemaining, resetTime),
+})
+
+const usageOutput = (items) => ({
+  code: 0,
+  stderr: '',
+  stdout: JSON.stringify({
+    command: {
+      data: {
+        groups: items.map((g) => ({
+          name: g.name,
+          description: g.description ?? '',
+          buckets: g.buckets.map((b) => ({
+            id: b.id,
+            name: b.name ?? '',
+            window: b.window,
+            remaining_fraction: b.remainingFraction,
+            reset_time: b.resetTime ?? '',
+          })),
+        })),
+      },
     },
-    {
-      name: 'Claude/GPT Models',
-      description: 'Claude and GPT',
-      buckets: [
-        {
-          id: 'claude',
-          window: 'weekly',
-          remainingFraction: remaining,
-          resetTime,
-        },
-      ],
-    },
-  ],
+  }),
 })
 
 function restoreEnv(key, value) {
@@ -47,44 +90,56 @@ function restoreEnv(key, value) {
 
 function isolateHome(t) {
   const home = mkdtempSync(join(tmpdir(), 'pi-events-'))
+  // Seed tier so explicit quota commands test QuotaReader without triggering ACP warmup.
+  writeFileSync(
+    join(home, 'catalog.json'),
+    JSON.stringify({ tier: { name: 'Google AI Pro' } }),
+  )
   const prevHome = process.env.PI_AGY_HOME
+  const prevCommand = process.env.PI_AGY_COMMAND
   const prevDisplay = process.env.PI_AGY_QUOTA_DISPLAY
   process.env.PI_AGY_HOME = home
+  process.env.PI_AGY_COMMAND = process.execPath
   delete process.env.PI_AGY_QUOTA_DISPLAY
   t.after(() => {
     restoreEnv('PI_AGY_HOME', prevHome)
+    restoreEnv('PI_AGY_COMMAND', prevCommand)
     restoreEnv('PI_AGY_QUOTA_DISPLAY', prevDisplay)
     rmSync(home, { recursive: true, force: true })
   })
   return home
 }
 
-function mountExtension(
-  t,
-  modelId = 'claude-opus-5-5',
-  onRegister = () => {},
-) {
+function mountExtension(t, options = {}) {
   const handlers = new Map()
   const registrations = []
   const notices = []
   const statuses = []
   let command
-  extension({
-    registerProvider(_name, definition) {
-      registrations.push(definition)
-      onRegister()
+  const onRegister = options.onRegister ?? (() => {})
+  extension(
+    {
+      registerProvider(_name, definition) {
+        registrations.push(definition)
+        onRegister()
+      },
+      registerCommand(_name, definition) {
+        command = definition
+      },
+      on(event, handler) {
+        handlers.set(event, handler)
+      },
     },
-    registerCommand(_name, definition) {
-      command = definition
-    },
-    on(event, handler) {
-      handlers.set(event, handler)
-    },
-  })
+    { runCommand: options.runCommand },
+  )
   const ctx = {
     sessionManager: { getSessionId: () => 'events-session' },
     hasUI: true,
-    model: { provider, id: modelId },
+    model: options.model ?? {
+      provider,
+      id: 'claude-opus-5-5',
+      name: 'Claude Opus 5.5',
+    },
     ui: {
       setStatus(key, text) {
         assert.equal(key, provider)
@@ -101,9 +156,9 @@ function mountExtension(
   return { handlers, registrations, command, ctx, statuses, notices }
 }
 
-function harness(t, onRegister = () => {}) {
+function harness(t, options = {}) {
   isolateHome(t)
-  return mountExtension(t, 'claude-opus-5-5', onRegister)
+  return mountExtension(t, options)
 }
 
 test('refresh does not re-register and abort itself, forwards force/signal, and releases its guard after failure', async (t) => {
@@ -122,7 +177,7 @@ test('refresh does not re-register and abort itself, forwards force/signal, and 
       this.host.onModelsChanged()
     },
   )
-  const h = harness(t, () => onRegister())
+  const h = harness(t, { onRegister: () => onRegister() })
   const controller = new AbortController()
   onRegister = () => controller.abort()
   const refreshed = await h.registrations[0].refreshModels({
@@ -155,6 +210,8 @@ test('refresh does not re-register and abort itself, forwards force/signal, and 
 })
 
 test('lifecycle uses light resets, cache warming stops only for this provider, and selecting models only reads fresh memory', async (t) => {
+  let now = 1_000_000
+  t.mock.method(Date, 'now', () => now)
   const light = t.mock.method(
     AntigravityRuntime.prototype,
     'resetConversations',
@@ -165,12 +222,9 @@ test('lifecycle uses light resets, cache warming stops only for this provider, a
     'dispose',
     async () => {},
   )
-  const read = t.mock.method(QuotaReader.prototype, 'read', () => {
-    throw new Error('Must not query quota')
-  })
-  let cached = snapshot()
-  t.mock.method(QuotaReader.prototype, 'peek', () => cached)
-  const h = harness(t)
+  const runCommand = t.mock.fn(async () => usageOutput(liveGroups()))
+  const h = harness(t, { runCommand })
+
   assert.deepEqual(h.handlers.get('cache_warming_decision')({}, h.ctx), {
     action: 'stop',
   })
@@ -188,6 +242,7 @@ test('lifecycle uses light resets, cache warming stops only for this provider, a
     ),
     undefined,
   )
+
   await h.handlers.get('session_start')({ reason: 'startup' }, h.ctx)
   assert.equal(light.mock.callCount(), 0)
   await h.handlers.get('session_start')({ reason: 'resume' }, h.ctx)
@@ -195,16 +250,23 @@ test('lifecycle uses light resets, cache warming stops only for this provider, a
   await h.handlers.get('session_compact')({ willRetry: true }, h.ctx)
   assert.equal(light.mock.callCount(), 3)
   assert.equal(dispose.mock.callCount(), 0)
+
+  // Seed fresh in-memory cache via explicit /agy-acp quota command.
+  await h.command.handler('quota', h.ctx)
+  assert.equal(runCommand.mock.callCount(), 1)
+  assert.equal(h.statuses.at(-1), 'AGY 90%')
+
   h.handlers.get('model_select')(
     { model: { provider: 'other', id: 'other' } },
     h.ctx,
   )
   assert.equal(h.statuses.at(-1), undefined)
   h.handlers.get('model_select')(
-    { model: { provider, id: 'gemini-4-argon' } },
+    { model: { provider, id: 'gemini-4-argon', name: 'Gemini 4 Argon' } },
     h.ctx,
   )
   assert.equal(h.statuses.at(-1), 'AGY 20%')
+
   const foreign = {
     ...h.ctx,
     model: {
@@ -218,39 +280,47 @@ test('lifecycle uses light resets, cache warming stops only for this provider, a
   const foreignStatusCount = h.statuses.length
   await h.command.handler('status', foreign)
   assert.equal(h.statuses.length, foreignStatusCount)
-  assert.equal(h.statuses.at(-1), undefined)
-  cached = undefined
+
+  // Expired TTL clears memory peek without starting a subprocess.
+  now += 120_000
   h.handlers.get('model_select')({ model: h.ctx.model }, h.ctx)
   assert.equal(h.statuses.at(-1), undefined)
   await h.command.handler('status', h.ctx)
-  assert.equal(read.mock.callCount(), 0)
+  assert.equal(runCommand.mock.callCount(), 1)
+
   await h.command.handler('reset', h.ctx)
   assert.equal(h.statuses.at(-1), undefined)
   assert.equal(dispose.mock.callCount(), 1)
 })
 
-test('settled checks are nonblocking, coalesced, and warn once per bucket reset and waterline', async (t) => {
+test('settled checks are nonblocking, coalesced, deduplicate waterlines, and retarget across intra-provider model switches', async (t) => {
+  let now = 1_000_000
+  t.mock.method(Date, 'now', () => now)
   const pending = Promise.withResolvers()
-  let value = pending.promise
-  const read = t.mock.method(QuotaReader.prototype, 'read', () => value)
-  const h = harness(t)
+  const runCommand = t.mock.fn(() => pending.promise)
+  const h = harness(t, { runCommand })
   const settled = h.handlers.get('agent_settled')
+
   settled({}, { ...h.ctx, hasUI: false })
-  assert.equal(read.mock.callCount(), 0)
+  assert.equal(runCommand.mock.callCount(), 0)
   assert.equal(settled({}, h.ctx), undefined)
   settled({}, h.ctx)
-  assert.equal(read.mock.callCount(), 1)
-  assert.deepEqual(read.mock.calls[0].arguments, [false])
+  assert.equal(runCommand.mock.callCount(), 1)
   assert.equal(h.statuses.length, 0)
-  pending.resolve(snapshot())
+
+  pending.resolve(usageOutput(liveGroups()))
   await tick()
   assert.equal(h.statuses.at(-1), 'AGY 90%')
   assert.equal(h.notices.length, 1)
   assert.equal(h.notices[0].level, 'warning')
-  assert.match(h.notices[0].text, /Claude\/GPT/)
+  assert.match(h.notices[0].text, /Claude and GPT models/)
   assert.match(h.notices[0].text, /90% used/)
+
   const checkNotice = async (fraction, cycle, warnings) => {
-    value = Promise.resolve(snapshot(fraction, cycle))
+    now += 120_000
+    runCommand.mock.mockImplementationOnce(async () =>
+      usageOutput(liveGroups(fraction, cycle)),
+    )
     settled({}, h.ctx)
     await tick()
     assert.equal(h.notices.length, warnings)
@@ -260,62 +330,79 @@ test('settled checks are nonblocking, coalesced, and warn once per bucket reset 
   await checkNotice(0.05, 'cycle-1', 3)
   await checkNotice(0.04, 'cycle-1', 3)
   await checkNotice(0.05, 'cycle-2', 4)
+
+  // Intra-provider switch while background read is in flight updates the new model and skips stale warnings.
+  now += 120_000
   const switched = Promise.withResolvers()
-  value = switched.promise
-  const callsBeforeSwitch = read.mock.callCount()
+  runCommand.mock.mockImplementationOnce(() => switched.promise)
+  const callsBeforeSwitch = runCommand.mock.callCount()
   settled({}, h.ctx)
   h.handlers.get('model_select')(
-    { model: { provider, id: 'gemini-4-argon' } },
+    { model: { provider, id: 'gemini-4-argon', name: 'Gemini 4 Argon' } },
     h.ctx,
   )
-  settled({}, { ...h.ctx, model: { provider, id: 'gemini-4-argon' } })
-  assert.equal(read.mock.callCount(), callsBeforeSwitch + 1)
-  switched.resolve(snapshot(0.1, 'cycle-3'))
+  assert.equal(runCommand.mock.callCount(), callsBeforeSwitch + 1)
+  switched.resolve(usageOutput(liveGroups(0.1, 'cycle-3')))
   await tick()
   assert.equal(h.statuses.at(-1), 'AGY 20%')
+  assert.equal(h.notices.length, 4)
+
+  // Foreign active provider ignores settled quota queries.
   h.ctx.model = { provider: 'other', id: 'other' }
-  const calls = read.mock.callCount()
+  const calls = runCommand.mock.callCount()
   settled({}, h.ctx)
-  assert.equal(read.mock.callCount(), calls)
+  assert.equal(runCommand.mock.callCount(), calls)
 })
 
-test('late background results after model switches, reset, or shutdown cannot restore status or warn', async (t) => {
-  let pending
-  const read = t.mock.method(QuotaReader.prototype, 'read', () => pending.promise)
-  const h = harness(t)
-  const expectNoUpdate = async (settle) => {
+test('late background results after foreign switch, reset, error, or shutdown cannot restore status or warn', async (t) => {
+  let now = 1_000_000
+  t.mock.method(Date, 'now', () => now)
+  const runCommand = t.mock.fn()
+  const h = harness(t, { runCommand })
+  const expectNoUpdate = async (finish) => {
     const before = [h.statuses.length, h.notices.length]
-    settle()
+    finish()
     await tick()
     assert.deepEqual([h.statuses.length, h.notices.length], before)
   }
 
-  pending = Promise.withResolvers()
+  const foreignPending = Promise.withResolvers()
+  runCommand.mock.mockImplementationOnce(() => foreignPending.promise)
   h.handlers.get('agent_settled')({}, h.ctx)
   h.handlers.get('model_select')({ model: { provider: 'other' } }, h.ctx)
-  await expectNoUpdate(() => pending.resolve(snapshot()))
+  await expectNoUpdate(() => foreignPending.resolve(usageOutput(liveGroups())))
 
-  pending = Promise.withResolvers()
+  now += 120_000
+  const resetPending = Promise.withResolvers()
+  runCommand.mock.mockImplementationOnce(() => resetPending.promise)
   h.handlers.get('agent_settled')({}, h.ctx)
   await h.command.handler('reset', h.ctx)
-  await expectNoUpdate(() => pending.resolve(snapshot()))
+  await expectNoUpdate(() => resetPending.resolve(usageOutput(liveGroups())))
 
-  pending = Promise.withResolvers()
+  now += 120_000
+  const cliErrorPending = Promise.withResolvers()
+  runCommand.mock.mockImplementationOnce(() => cliErrorPending.promise)
   h.handlers.get('agent_settled')({}, h.ctx)
-  await expectNoUpdate(() => pending.resolve({ ...snapshot(), status: 'error' }))
+  await expectNoUpdate(() =>
+    cliErrorPending.resolve({ code: 1, stdout: '', stderr: 'offline' }),
+  )
 
-  pending = Promise.withResolvers()
+  now += 120_000
+  const rejectedPending = Promise.withResolvers()
+  runCommand.mock.mockImplementationOnce(() => rejectedPending.promise)
   h.handlers.get('agent_settled')({}, h.ctx)
-  await expectNoUpdate(() => pending.reject(new Error('offline')))
+  await expectNoUpdate(() => rejectedPending.reject(new Error('offline')))
 
-  pending = Promise.withResolvers()
+  now += 120_000
+  const shutdownPending = Promise.withResolvers()
+  runCommand.mock.mockImplementationOnce(() => shutdownPending.promise)
   h.handlers.get('agent_settled')({}, h.ctx)
   await h.handlers.get('session_shutdown')({}, h.ctx)
-  await expectNoUpdate(() => pending.resolve(snapshot()))
+  await expectNoUpdate(() => shutdownPending.resolve(usageOutput(liveGroups())))
 
-  const callsAfterShutdown = read.mock.callCount()
+  const callsAfterShutdown = runCommand.mock.callCount()
   h.handlers.get('agent_settled')({}, h.ctx)
-  assert.equal(read.mock.callCount(), callsAfterShutdown)
+  assert.equal(runCommand.mock.callCount(), callsAfterShutdown)
 })
 
 const group = (name, remainingFraction, description = '', extraBuckets = []) => ({
@@ -329,15 +416,46 @@ const groups = (...items) => ({
   groups: items,
 })
 
-test('quota selection matches specific groups, explicit members, and display names without misleading fallbacks', () => {
-  assert.equal(formatQuotaStatus(snapshot(), 'gemini-4-argon'), 'AGY 20%')
-  assert.equal(formatQuotaStatus(snapshot(), 'gpt-oss-120b-medium'), 'AGY 90%')
-  assert.equal(formatQuotaStatus(snapshot(), 'unknown'), undefined)
-  assert.equal(formatQuotaStatus(snapshot(), 'gemini-4-argon', 'remaining'), 'AGY 80%')
-  assert.equal(formatQuotaStatus(snapshot(), 'gpt-oss-120b-medium', 'remaining'), 'AGY 10%')
-  assert.equal(quotaForModel(snapshot(0), 'claude-opus-5-5').fraction, 0)
-  assert.equal(formatQuotaStatus(snapshot(NaN), 'claude-opus-5-5'), undefined)
-  assert.equal(formatQuotaStatus({ ...snapshot(), status: 'error' }), undefined)
+test('quota selection covers live agy 1.5.9 catalog, multi-group minimums, qualifiers, and ambiguity rejection', () => {
+  const liveSnapshot = snapshot()
+  assert.deepEqual(
+    LIVE_CATALOG.map((model) => formatQuotaStatus(liveSnapshot, model)),
+    [
+      'AGY 20%',
+      'AGY 20%',
+      'AGY 20%',
+      'AGY 20%',
+      'AGY 20%',
+      'AGY 20%',
+      'AGY 90%',
+      'AGY 90%',
+      'AGY 90%',
+    ],
+  )
+  assert.equal(
+    formatQuotaStatus(liveSnapshot, { id: 'gemini-4-argon', name: 'Gemini 4 Argon' }, 'remaining'),
+    'AGY 80%',
+  )
+  assert.equal(
+    formatQuotaStatus(liveSnapshot, { id: 'gpt-oss-120b-medium', name: 'GPT-OSS 120B (Medium)' }, 'remaining'),
+    'AGY 10%',
+  )
+  assert.equal(
+    formatQuotaStatus(liveSnapshot, { id: 'unknown' }),
+    undefined,
+  )
+  assert.equal(
+    quotaForModel(snapshot(0), { id: 'claude-opus-5-5' }).fraction,
+    0,
+  )
+  assert.equal(
+    formatQuotaStatus(snapshot(NaN), { id: 'claude-opus-5-5' }),
+    undefined,
+  )
+  assert.equal(
+    formatQuotaStatus({ ...liveSnapshot, status: 'error' }, { id: 'claude-opus-5-5' }),
+    undefined,
+  )
 
   // Picks lowest remaining window within the matched group.
   const multiWindow = groups(
@@ -345,40 +463,74 @@ test('quota selection matches specific groups, explicit members, and display nam
       { id: 'w', window: 'weekly', remainingFraction: 0.25 },
     ]),
   )
-  assert.equal(formatQuotaStatus(multiWindow, 'gemini-4-argon', 'remaining'), 'AGY 25%')
+  assert.equal(
+    formatQuotaStatus(multiWindow, { id: 'gemini-4-argon' }, 'remaining'),
+    'AGY 25%',
+  )
 
-  // Realistic /usage fixture: dedicated group beats shared explicit list, closed lists isolate unlisted models, (Thinking) and Oxford conjunctions match.
-  const realistic = groups(
+  // Multi-group governing minimum across shared umbrella + dedicated group in both directions.
+  const dedicatedExhausted = groups(
     group('Gemini Models', 0.7, 'Models within this group: Gemini 4 Argon, Gemini 3.8 Flash'),
-    group(
-      'Claude and GPT models',
-      0.9,
-      'Models within this group: Claude Opus 5.5 (Thinking), Claude Sonnet 5.5, and GPT-OSS 120B',
-    ),
     group('Gemini 4 Argon Models', 0),
   )
-  assert.equal(formatQuotaStatus(realistic, 'gemini-4-argon', 'remaining'), 'AGY 0%')
   assert.equal(
-    formatQuotaStatus(realistic, { id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash' }, 'remaining'),
+    formatQuotaStatus(dedicatedExhausted, { id: 'gemini-4-argon' }, 'remaining'),
+    'AGY 0%',
+  )
+  assert.equal(
+    formatQuotaStatus(dedicatedExhausted, { id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash' }, 'remaining'),
     'AGY 70%',
   )
-  assert.equal(quotaForModel(realistic, 'gemini-2.5-pro'), undefined)
-  assert.equal(
-    formatQuotaStatus(realistic, { id: 'claude-opus-5-5', name: 'Claude Opus 5.5' }, 'remaining'),
-    'AGY 90%',
+  assert.equal(quotaForModel(dedicatedExhausted, { id: 'gemini-2.5-pro' }), undefined)
+
+  const sharedExhausted = groups(
+    group('Gemini Models', 0, 'Models within this group: Gemini 4 Argon, Gemini 3.8 Flash'),
+    group('Gemini 4 Argon Models', 0.8),
   )
-  assert.equal(formatQuotaStatus(realistic, 'gpt-oss-120b-medium', 'remaining'), 'AGY 90%')
+  const sharedHit = quotaForModel(sharedExhausted, { id: 'gemini-4-argon', name: 'Gemini 4 Argon' })
+  assert.equal(sharedHit.fraction, 0)
+  assert.equal(sharedHit.group.name, 'Gemini Models')
+
+  // Multi-group minimum for display-name-only orchestrator listed in two explicit pools.
+  const orchestratorSplit = groups(
+    group('Gemini Models', 0.72, 'Models within this group: Gemini 4 Carbon, Orchestrator (Argon)'),
+    group('Gemini 4 Argon Pool', 0, 'Models within this group: Gemini 4 Argon, Orchestrator (Argon)'),
+  )
   assert.equal(
-    formatQuotaStatus(realistic, { id: 'opaque-id', name: 'GPT-OSS 120B (Medium)' }, 'remaining'),
-    'AGY 90%',
+    formatQuotaStatus(orchestratorSplit, { id: 'gemini-pro-orchestrator-argon', name: 'Orchestrator (Argon)' }, 'remaining'),
+    'AGY 0%',
   )
 
-  // Specificity and qualifier compatibility: matching effort beats missing/conflicting qualifiers, conflicting effort groups never cross-match, and ISO dates / punctuation parse cleanly.
-  const effortGroups = groups(group('GPT-OSS 120B (Medium)', 0.1), group('GPT-OSS 120B', 0.8))
-  assert.equal(
-    formatQuotaStatus(effortGroups, { id: 'gpt-oss-120b-medium', name: 'GPT-OSS 120B' }, 'remaining'),
-    'AGY 10%',
+  // Issue #9 fixture without explicit lists: generic family fallback stays isolated from dedicated sibling group.
+  const issue9 = groups(
+    group('Gemini Models', 0.7),
+    group('Claude and GPT models', 0.9),
+    group('Gemini 4 Argon', 0),
   )
+  assert.equal(formatQuotaStatus(issue9, { id: 'gemini-3.8-flash' }, 'remaining'), 'AGY 70%')
+  assert.equal(formatQuotaStatus(issue9, { id: 'gemini-4-argon' }, 'remaining'), 'AGY 0%')
+
+  // Closed explicit list excludes its group name; sibling suffixes and version boundaries never cross-match.
+  const closedExplicit = groups(
+    group('Gemini Pro', 0, 'Models within this group: Gemini 2.5 Pro'),
+  )
+  assert.equal(quotaForModel(closedExplicit, { id: 'gemini-3.8-pro' }), undefined)
+  assert.equal(quotaForModel(closedExplicit, { id: 'gemini-pro' }), undefined)
+
+  const dedicatedFlash = groups(
+    group('Gemini Models', 0.7),
+    group('Gemini 3.8 Flash', 0),
+    group('GPT-OSS Models', 0.2),
+  )
+  assert.equal(
+    formatQuotaStatus(dedicatedFlash, { id: 'gemini-3.8-flash-lite', name: 'Gemini 3.8 Flash Lite' }, 'remaining'),
+    'AGY 70%',
+  )
+  assert.equal(formatQuotaStatus(dedicatedFlash, { id: 'gemini-3.8-flash-8b' }, 'remaining'), 'AGY 70%')
+  assert.equal(formatQuotaStatus(dedicatedFlash, { id: 'gpt-oss-120b-medium' }, 'remaining'), 'AGY 20%')
+  assert.equal(quotaForModel(dedicatedFlash, { id: 'gpt-5' }), undefined)
+
+  // Qualifiers, thinking tags, dated suffixes, and ambiguous tie rejection.
   const incompatibleQualifier = groups(
     group('GPT-OSS 120B (High)', 0.1),
     group('Claude and GPT models', 0.9, 'Models within this group: Claude Opus 5.5 (Thinking), GPT-OSS 120B.'),
@@ -387,19 +539,11 @@ test('quota selection matches specific groups, explicit members, and display nam
     formatQuotaStatus(incompatibleQualifier, { id: 'gpt-oss-120b-medium', name: 'GPT-OSS 120B' }, 'remaining'),
     'AGY 90%',
   )
-  assert.equal(formatQuotaStatus(incompatibleQualifier, 'claude-opus-5-5', 'remaining'), 'AGY 90%')
-  const explicitQualifierPriority = groups(
-    group('Claude Opus 5.5 (Low)', 0.9),
-    group('Claude Opus 5.5', 0.8),
-    group('Claude Models', 0.1, 'Models within this group: Claude Opus 5.5 (High)'),
+  assert.equal(
+    formatQuotaStatus(incompatibleQualifier, { id: 'claude-opus-5-5-20260301', name: 'Claude Opus 5.5' }, 'remaining'),
+    'AGY 90%',
   )
-  assert.equal(formatQuotaStatus(explicitQualifierPriority, 'claude-opus-5-5-high', 'remaining'), 'AGY 10%')
-  const variantQualifiers = groups(
-    group('Gemini Flash (High)', 0.1),
-    group('Gemini Flash (Low)', 0.8),
-  )
-  assert.equal(formatQuotaStatus(variantQualifiers, 'gemini-3.8-flash-high', 'remaining'), 'AGY 10%')
-  assert.equal(quotaForModel(variantQualifiers, 'gemini-3.8-flash'), undefined)
+
   const collidingQualifiers = groups(
     group('Claude Opus 5.5 (High)', 0.1),
     group('Claude Opus 5.5 (Low)', 0.8),
@@ -408,127 +552,12 @@ test('quota selection matches specific groups, explicit members, and display nam
     quotaForModel(collidingQualifiers, { id: 'claude-opus-5-5', name: 'Claude Opus 5.5' }),
     undefined,
   )
-  const splitAcrossNameAndExplicit = groups(
-    group('Claude Opus 5.5 (Low)', 0.1),
-    group('Claude and GPT models', 0.9, 'Models within this group: Claude Opus 5.5 (Thinking)'),
-  )
   assert.equal(
-    quotaForModel(splitAcrossNameAndExplicit, { id: 'claude-opus-5-5', name: 'Claude Opus 5.5' }),
+    quotaForModel(groups(group('Gemini Models', 0.2), group('Gemini Models', 0.8)), { id: 'gemini-3.8-flash' }),
     undefined,
   )
   assert.equal(
-    formatQuotaStatus(splitAcrossNameAndExplicit, 'claude-opus-5-5-low', 'remaining'),
-    'AGY 10%',
-  )
-  assert.equal(
-    formatQuotaStatus(splitAcrossNameAndExplicit, 'claude-opus-5-5-thinking', 'remaining'),
-    'AGY 90%',
-  )
-  assert.equal(
-    formatQuotaStatus(splitAcrossNameAndExplicit, 'claude-opus-5-5-20260301 (Thinking)', 'remaining'),
-    'AGY 90%',
-  )
-  const reorderedDated = groups(group('Claude Models', 0.9), group('Claude 5.5 Opus', 0))
-  assert.equal(
-    formatQuotaStatus(reorderedDated, 'claude-opus-5-5-20260301', 'remaining'),
-    'AGY 0%',
-  )
-  assert.equal(
-    formatQuotaStatus(reorderedDated, 'claude-opus-5-5-2026-03-01', 'remaining'),
-    'AGY 0%',
-  )
-  assert.equal(
-    formatQuotaStatus(groups(group('Google Gemini Models', 0.6)), 'gemini-3.8-flash', 'remaining'),
-    'AGY 60%',
-  )
-  assert.equal(
-    formatQuotaStatus(
-      groups(group('Gemini Models', 0.6)),
-      { id: 'opaque-id', name: 'Google Gemini 3.8 Flash' },
-      'remaining',
-    ),
-    'AGY 60%',
-  )
-
-  // Authoritative "Models within this group:" closed lists and slash delimiters.
-  const closedExplicit = groups(group('Gemini Pro', 0, 'Models within this group: Gemini 2.5 Pro'))
-  assert.equal(quotaForModel(closedExplicit, 'gemini-3.8-pro'), undefined)
-  assert.equal(quotaForModel(closedExplicit, 'gemini-pro'), undefined)
-
-  const authoritativeVsNotes = groups(
-    group('Authoritative', 0.4, 'Models within this group: Gemini 3.8 Flash'),
-    group('Notes', 0.9, 'Gemini 3.8 Flash / Gemini 3.8 Pro'),
-  )
-  assert.equal(formatQuotaStatus(authoritativeVsNotes, 'gemini-3.8-flash', 'remaining'), 'AGY 40%')
-  assert.equal(
-    formatQuotaStatus(groups(group('Gemini 3.8 Flash / Gemini 3.8 Pro', 0.5)), 'gemini-3.8-flash', 'remaining'),
-    'AGY 50%',
-  )
-  assert.equal(
-    formatQuotaStatus(groups(group('Tier A', 0.5, 'Gemini 3.8 Flash / Gemini 3.8 Pro')), 'gemini-3.8-flash', 'remaining'),
-    'AGY 50%',
-  )
-
-  // Broader variants and version/size sibling boundaries.
-  const variantExplicit = groups(
-    group('Custom Tier', 0.4, 'Models within this group: Gemini Flash, Claude Opus 5.5'),
-    group('Gemini Pro', 0.1),
-  )
-  assert.equal(formatQuotaStatus(variantExplicit, 'gemini-3.8-flash', 'remaining'), 'AGY 40%')
-  assert.equal(formatQuotaStatus(variantExplicit, 'claude-opus-5-5', 'remaining'), 'AGY 40%')
-  const explicitVariantName = groups(
-    group('Gemini Flash', 0.3, '  Models within this group: Gemini 3.8'),
-    group('Shared Tier', 0.8, 'Models within this group: Gemini Flash'),
-  )
-  assert.equal(formatQuotaStatus(explicitVariantName, 'gemini-3.8-flash', 'remaining'), 'AGY 30%')
-
-  const dedicatedFlash = groups(group('Gemini Models', 0.7), group('Gemini 3.8 Flash', 0))
-  assert.equal(
-    formatQuotaStatus(dedicatedFlash, { id: 'gemini-3.8-flash-lite', name: 'Gemini 3.8 Flash Lite' }, 'remaining'),
-    'AGY 70%',
-  )
-  assert.equal(formatQuotaStatus(dedicatedFlash, 'gemini-3.8-flash-8b', 'remaining'), 'AGY 70%')
-  assert.equal(quotaForModel(groups(group('Gemini 3.8', 0.1)), 'gemini-3-8b'), undefined)
-
-  const versionBounded = groups(group('Gemini 3', 0.1), group('Claude 5', 0))
-  assert.equal(quotaForModel(versionBounded, 'gemini-2.3-pro'), undefined)
-  assert.equal(quotaForModel(versionBounded, 'gemini-2-3-pro'), undefined)
-  assert.equal(quotaForModel(versionBounded, 'gemini-1.5-pro-3'), undefined)
-  assert.equal(quotaForModel(versionBounded, 'claude-sonnet-4-5'), undefined)
-
-  // Generic family fallback and GPT-OSS clause isolation.
-  assert.equal(
-    formatQuotaStatus(
-      groups(group('Gemini Models', 0.7, 'Shared limit across Gemini models')),
-      'gemini-3.8-flash',
-      'remaining',
-    ),
-    'AGY 70%',
-  )
-  const ossOnly = groups(group('GPT-OSS Models', 0))
-  assert.equal(formatQuotaStatus(ossOnly, 'gpt-oss-120b-medium', 'remaining'), 'AGY 0%')
-  assert.equal(quotaForModel(ossOnly, 'gpt-5'), undefined)
-
-  const gptSharedAndOss = groups(group('Claude and GPT models', 0.9), group('GPT-OSS Models', 0))
-  assert.equal(formatQuotaStatus(gptSharedAndOss, 'gpt-5', 'remaining'), 'AGY 90%')
-  assert.equal(formatQuotaStatus(gptSharedAndOss, 'gpt-oss-120b-medium', 'remaining'), 'AGY 0%')
-
-  const mixedClause = groups(group('Claude and GPT-OSS 120B', 0.6))
-  assert.equal(formatQuotaStatus(mixedClause, 'claude-opus-5-5', 'remaining'), 'AGY 60%')
-  assert.equal(formatQuotaStatus(mixedClause, 'gpt-oss-120b-medium', 'remaining'), 'AGY 60%')
-  assert.equal(quotaForModel(mixedClause, 'gpt-5'), undefined)
-
-  // Unmatched and ambiguous group rejection.
-  assert.equal(
-    quotaForModel(groups(group('Gemini 4 Argon', 0), group('Gemini Pro', 0.8)), 'gemini-3.8-flash'),
-    undefined,
-  )
-  assert.equal(
-    quotaForModel(groups(group('Gemini Models', 0.2), group('Gemini Models', 0.8)), 'gemini-3.8-flash'),
-    undefined,
-  )
-  assert.equal(
-    quotaForModel(groups(group('Gemini 3.8', 0.2), group('Gemini Flash', 0.8)), 'gemini-3.8-flash'),
+    quotaForModel(groups(group('Gemini 3.8', 0.2), group('Gemini Flash', 0.8)), { id: 'gemini-3.8-flash' }),
     undefined,
   )
 })
@@ -538,15 +567,15 @@ test('agent_settled during reset or shutdown disposal skips quota reads and does
   const shutdownDisposing = Promise.withResolvers()
   const dispose = t.mock.method(AntigravityRuntime.prototype, 'dispose', async () => {})
   dispose.mock.mockImplementationOnce(() => resetDisposing.promise)
-  const read = t.mock.method(QuotaReader.prototype, 'read', async () => snapshot())
-  const h = harness(t)
+  const runCommand = t.mock.fn(async () => usageOutput(liveGroups()))
+  const h = harness(t, { runCommand })
 
   const reset1 = h.command.handler('reset', h.ctx)
   const reset2 = h.command.handler('reset', h.ctx)
   assert.equal(dispose.mock.callCount(), 1)
   h.handlers.get('agent_settled')({}, h.ctx)
   await tick()
-  assert.equal(read.mock.callCount(), 0)
+  assert.equal(runCommand.mock.callCount(), 0)
   assert.equal(h.statuses.at(-1), undefined)
   assert.equal(h.notices.length, 0)
 
@@ -558,13 +587,15 @@ test('agent_settled during reset or shutdown disposal skips quota reads and does
   await Promise.all([reset1, reset2])
   h.handlers.get('agent_settled')({}, h.ctx)
   await tick()
-  assert.equal(read.mock.callCount(), 1)
+  assert.equal(runCommand.mock.callCount(), 1)
   assert.equal(h.statuses.at(-1), 'AGY 90%')
-  assert.equal(h.notices.length, 4)
-  assert.equal(h.notices.at(-1).level, 'warning')
+  assert.deepEqual(
+    h.notices.map((n) => n.level),
+    ['error', 'info', 'info', 'warning'],
+  )
 
   const staleQuota = Promise.withResolvers()
-  t.mock.method(AntigravityRuntime.prototype, 'readQuota', () => staleQuota.promise)
+  runCommand.mock.mockImplementationOnce(() => staleQuota.promise)
   let notifyImpl = () => {}
   const inFlightQuota = h.command.handler('quota', {
     ...h.ctx,
@@ -578,20 +609,21 @@ test('agent_settled during reset or shutdown disposal skips quota reads and does
   const shutdownDone = h.handlers.get('session_shutdown')({}, h.ctx)
   h.handlers.get('agent_settled')({}, h.ctx)
   await tick()
-  assert.equal(read.mock.callCount(), 1)
+  assert.equal(runCommand.mock.callCount(), 2)
   assert.equal(h.statuses.at(-1), undefined)
 
-  staleQuota.resolve(snapshot())
+  staleQuota.resolve(usageOutput(liveGroups()))
   shutdownDisposing.resolve()
   await Promise.all([inFlightQuota, shutdownDone])
 })
 
-test('cancelled TUI quota check shares in-flight request with agent_settled, and rejected TUI readQuota closes loader', async (t) => {
+test('cancelled TUI quota check shares in-flight request with agent_settled, and failed runCommand closes loader', async (t) => {
+  let now = 1_000_000
+  t.mock.method(Date, 'now', () => now)
   initTheme('dark', false)
   const query = Promise.withResolvers()
-  t.mock.method(AntigravityRuntime.prototype, 'warmup', async () => {})
-  const fetch = t.mock.method(QuotaReader.prototype, 'fetch', () => query.promise)
-  const h = harness(t)
+  const runCommand = t.mock.fn(() => query.promise)
+  const h = harness(t, { runCommand })
   let loader = { dispose() {} }
   t.after(() => loader.dispose())
   const tuiCtx = {
@@ -619,36 +651,45 @@ test('cancelled TUI quota check shares in-flight request with agent_settled, and
   loader.handleInput('\x1b')
   await cancelled
   assert.equal(h.notices.at(-1).text, 'Quota check cancelled')
-  assert.equal(fetch.mock.callCount(), 1)
+  assert.equal(runCommand.mock.callCount(), 1)
 
   h.handlers.get('agent_settled')({}, tuiCtx)
   h.handlers.get('agent_settled')({}, tuiCtx)
-  assert.equal(fetch.mock.callCount(), 1)
+  assert.equal(runCommand.mock.callCount(), 1)
 
-  query.resolve(snapshot(0.1))
+  query.resolve(usageOutput(liveGroups(0.1)))
   await tick()
   assert.equal(h.statuses.at(-1), 'AGY 90%')
   assert.match(h.notices.at(-1).text, /90% used/)
 
-  t.mock.method(AntigravityRuntime.prototype, 'readQuota', async () => {
-    throw new Error('Antigravity ACP runtime is disposed.')
-  })
+  now += 120_000
+  runCommand.mock.mockImplementationOnce(async () => ({
+    code: 1,
+    stdout: '',
+    stderr: 'Antigravity CLI offline',
+  }))
   await h.command.handler('quota', tuiCtx)
   assert.equal(h.notices.at(-1).level, 'error')
-  assert.match(h.notices.at(-1).text, /Antigravity ACP runtime is disposed\./)
+  assert.match(h.notices.at(-1).text, /Antigravity CLI offline/)
 })
 
 test('unmatched or ambiguous quota ownership does not emit a misleading low-quota warning on settle', async (t) => {
-  let current = groups(group('Gemini 4 Argon', 0))
-  t.mock.method(QuotaReader.prototype, 'read', async () => current)
-  const h = harness(t)
-  h.ctx.model = { provider, id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash' }
+  let now = 1_000_000
+  t.mock.method(Date, 'now', () => now)
+  const runCommand = t.mock.fn(async () => usageOutput([group('Gemini 4 Argon', 0)]))
+  const h = harness(t, {
+    runCommand,
+    model: { provider, id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash' },
+  })
   h.handlers.get('agent_settled')({}, h.ctx)
   await tick()
   assert.equal(h.statuses.at(-1), undefined)
   assert.equal(h.notices.length, 0)
 
-  current = groups(group('Gemini Models', 0), group('Gemini Models', 0.1))
+  now += 120_000
+  runCommand.mock.mockImplementationOnce(async () =>
+    usageOutput([group('Gemini Models', 0), group('Gemini Models', 0.1)]),
+  )
   h.handlers.get('agent_settled')({}, h.ctx)
   await tick()
   assert.equal(h.statuses.at(-1), undefined)
@@ -657,15 +698,14 @@ test('unmatched or ambiguous quota ownership does not emit a misleading low-quot
 
 test('quota display mode switches via /agy-acp quota, remembers last choice across reloads, and respects env override', async (t) => {
   const home = isolateHome(t)
-
-  t.mock.method(AntigravityRuntime.prototype, 'readQuota', async () =>
-    snapshot(0.1),
-  )
-  t.mock.method(QuotaReader.prototype, 'peek', () => snapshot(0.1))
+  const runCommand = t.mock.fn(async () => usageOutput(liveGroups(0.1)))
 
   // Malformed settings.json falls back cleanly to "used".
   writeFileSync(join(home, 'settings.json'), '{not-json')
-  const first = mountExtension(t, 'gemini-4-argon')
+  const first = mountExtension(t, {
+    model: { provider, id: 'gemini-4-argon', name: 'Gemini 4 Argon' },
+    runCommand,
+  })
   await first.command.handler('quota', first.ctx)
   assert.equal(first.statuses.at(-1), 'AGY 20%')
   assert.match(first.notices.at(-1).text, /\[██░░░░░░░░░░\]  20%/)
@@ -684,14 +724,17 @@ test('quota display mode switches via /agy-acp quota, remembers last choice acro
   )
 
   // Reload remembers the last queried mode ("remaining").
-  const second = mountExtension(t, 'gemini-4-argon')
+  const second = mountExtension(t, {
+    model: { provider, id: 'gemini-4-argon', name: 'Gemini 4 Argon' },
+    runCommand,
+  })
   await second.command.handler('quota', second.ctx)
   assert.equal(second.statuses.at(-1), 'AGY 80%')
 
   await second.command.handler('quota used', second.ctx)
   assert.equal(second.statuses.at(-1), 'AGY 20%')
 
-  // Cancelled TUI loader on mode switch still refreshes the status bar pill.
+  // Cancelled TUI loader on mode switch still refreshes the status bar pill from in-memory cache.
   await second.command.handler('quota remaining', {
     ...second.ctx,
     mode: 'tui',
@@ -702,7 +745,10 @@ test('quota display mode switches via /agy-acp quota, remembers last choice acro
 
   // Environment variable overrides persisted preference at startup.
   process.env.PI_AGY_QUOTA_DISPLAY = 'remaining'
-  const third = mountExtension(t, 'gemini-4-argon')
+  const third = mountExtension(t, {
+    model: { provider, id: 'gemini-4-argon', name: 'Gemini 4 Argon' },
+    runCommand,
+  })
   await third.command.handler('quota', third.ctx)
   assert.equal(third.statuses.at(-1), 'AGY 80%')
 
@@ -735,7 +781,9 @@ test('quota TTL throttles successes and failures, while force bypasses it', asyn
   assert.equal(run.mock.callCount(), 1)
   now += 100
   assert.equal(reader.peek(), undefined)
-  run.mock.mockImplementationOnce(async () => { throw new Error('offline') })
+  run.mock.mockImplementationOnce(async () => {
+    throw new Error('offline')
+  })
   assert.equal((await reader.read()).status, 'error')
   await reader.read()
   assert.equal(run.mock.callCount(), 2)
@@ -745,7 +793,11 @@ test('quota TTL throttles successes and failures, while force bypasses it', asyn
 })
 
 test('agent settlement releases its session even after provider selection changes', (t) => {
-  const settle = t.mock.method(AntigravityRuntime.prototype, 'settleSession', () => {})
+  const settle = t.mock.method(
+    AntigravityRuntime.prototype,
+    'settleSession',
+    () => {},
+  )
   const h = harness(t)
   h.ctx.model = { provider: 'other', id: 'other' }
   h.handlers.get('agent_settled')({}, h.ctx)
