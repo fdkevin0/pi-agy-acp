@@ -65,6 +65,7 @@ function fixture(t, version = '1.2.3') {
           CALLS_FILE: calls,
           GITHUB_REF_TYPE: 'tag',
           GITHUB_REF_NAME: 'v1.2.3',
+          RELEASE_TAG: '',
           HTTP_STATUS: '404',
           VIEW_EXIT: '0',
           CREATE_EXIT: '0',
@@ -150,4 +151,23 @@ test('release recovery reuses the existing tag and never creates a tag at the cu
       .status,
     0,
   )
+})
+
+test('release-please tag handoff validates and checks GitHub Release on main push', (t) => {
+  const run = fixture(t)
+  const validated = run('Validate release tag and check npm registry', {
+    GITHUB_REF_TYPE: 'branch',
+    GITHUB_REF_NAME: 'main',
+    RELEASE_TAG: 'v1.2.3',
+  })
+  assert.equal(validated.status, 0, validated.stderr)
+  assert.equal(validated.output, 'published=false\n')
+
+  const checked = run('Ensure GitHub Release exists', {
+    GITHUB_REF_TYPE: 'branch',
+    GITHUB_REF_NAME: 'main',
+    RELEASE_TAG: 'v1.2.3',
+  })
+  assert.equal(checked.status, 0, checked.stderr)
+  assert.equal(checked.calls, 'release view v1.2.3\n')
 })
