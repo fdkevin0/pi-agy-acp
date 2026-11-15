@@ -37,6 +37,7 @@ import { deferred, digest } from '../src/util.ts'
 import {
   bridgeSystemPrompt,
   EMPTY_INPUT_CONTINUATION,
+  renderSessionInstructions,
   REPLAY_BUDGET_BYTES,
 } from '../src/history.ts'
 import {
@@ -1069,7 +1070,10 @@ test('bounded replay drops the oldest history, closes the block, and keeps the l
   )
   const replay = prompts().at(-1)
   assert.notEqual(replay.session, prompts()[0].session)
-  assert.match(replay.text, /^<pi_history>\n/)
+  assert.match(
+    replay.text,
+    /^<system_instructions>\nYou are Pi\.\n<\/system_instructions>\n\n<pi_history>\n/,
+  )
   assert.match(replay.text, /\n<\/pi_history>\n\nLATEST /)
   assert.ok(replay.text.endsWith(latest))
   assert.ok(!replay.text.includes('OLD-1'))
@@ -3314,7 +3318,10 @@ test('dynamic tool updates distinguish restored vs modified schemas and preserve
   ])
   const compacted = initialRaw.map(compactBridgeTool)
   assert.notEqual(digest(compacted[0]), digest(initialRaw[0]))
-  const promptText = bridgeSystemPrompt('base', initialRaw)
+  assert.doesNotMatch(bridgeSystemPrompt(), /<\/harness_tool_instructions>/)
+  assert.doesNotMatch(bridgeSystemPrompt(), /UNIQUE_TAIL_MARKER/)
+  const promptText = renderSessionInstructions('base', initialRaw)
+  assert.match(promptText, /<system_instructions>\nbase\n<\/system_instructions>/)
   assert.match(promptText, /<harness_tool_instructions>/)
   assert.match(promptText, /UNIQUE_TAIL_MARKER/)
 
@@ -3339,4 +3346,118 @@ test('dynamic tool updates distinguish restored vs modified schemas and preserve
   const schemaDelta = consumeToolDelta(conv, schemaChanged)
   assert.match(schemaDelta, /pi_call_tool/)
   assert.match(schemaDelta, /"script"/)
+})
+
+test('session/new keeps a static bridge system prompt while opening and rebuilt prompts carry harness instructions within budget', async (t) => {
+  const { adapter, prompts } = makeRuntime(t)
+  const oversizedTool = {
+    name: 'bash',
+    description: `${'Detailed bash instructions. '.repeat(90)}COMPACTED_TOOL_TAIL_MARKER`,
+    parameters: {
+      type: 'object',
+      properties: { command: { type: 'string' } },
+      required: ['command'],
+    },
+  }
+  assert.ok(
+    Buffer.byteLength(JSON.stringify(oversizedTool), 'utf8') >
+      MAX_EAGER_BRIDGE_TOOL_BYTES,
+  )
+  const piSys = {
+    id: 'sys-pi',
+    role: 'system',
+    content: [
+      {
+        type: 'text',
+        text: 'You are a coding assistant running inside pi, a coding agent harness.\n\n<docs>\nPi self-documentation\n</docs>',
+      },
+    ],
+    source: { kind: 'system-prompt' },
+  }
+  const base = {
+    provider: 'antigravity',
+    model: 'gemini-4-argon',
+    sessionId: 'S-SYSTEM-SPLIT',
+    tools: [oversizedTool],
+  }
+
+  // Turn 1: fresh session delivers caller system + compacted tool instructions in the opening prompt.
+  const step1 = await collect(
+    adapter.stream({
+      ...base,
+      messages: [piSys, user('u1', 'first question')],
+    }),
+  )
+  assert.equal(finishOf(step1).reason.kind, 'stop')
+  const firstPrompt = prompts()[0]
+  assert.equal(firstPrompt.system, bridgeSystemPrompt())
+  assert.doesNotMatch(
+    firstPrompt.system,
+    /running inside pi|<docs>|COMPACTED_TOOL_TAIL_MARKER/,
+  )
+  assert.match(
+    firstPrompt.text,
+    /^<system_instructions>\nYou are a coding assistant running inside pi/,
+  )
+  assert.match(firstPrompt.text, /<harness_tool_instructions>/)
+  assert.match(firstPrompt.text, /COMPACTED_TOOL_TAIL_MARKER/)
+  assert.ok(firstPrompt.text.endsWith('\n\nfirst question'))
+
+  // Turn 2: reusing the session omits the opening instruction blocks.
+  const step2 = await collect(
+    adapter.stream({
+      ...base,
+      messages: [
+        piSys,
+        user('u1', 'first question'),
+        assistantFrom('a1', step1),
+        user('u2', 'follow-up question'),
+      ],
+    }),
+  )
+  assert.equal(finishOf(step2).reason.kind, 'stop')
+  const secondPrompt = prompts()[1]
+  assert.equal(secondPrompt.session, firstPrompt.session)
+  assert.equal(secondPrompt.text, 'follow-up question')
+
+  // Turn 3: rebuilding after a system prompt update budgets <system_instructions> + <harness_tool_instructions> + <pi_history> inside REPLAY_BUDGET_BYTES.
+  const largeSys = {
+    id: 'sys-updated',
+    role: 'system',
+    content: [
+      { type: 'text', text: `Updated harness rules ${'r'.repeat(60_000)}` },
+    ],
+    source: { kind: 'system-prompt' },
+  }
+  const history = [
+    largeSys,
+    user('h1', `HIST-1 ${'a'.repeat(55_000)}`),
+    assistant('ha1', [{ type: 'text', text: 'reply 1' }]),
+    user('h2', `HIST-2 ${'b'.repeat(55_000)}`),
+    assistant('ha2', [{ type: 'text', text: 'reply 2' }]),
+    user('h3', `HIST-3 ${'c'.repeat(55_000)}`),
+    assistant('ha3', [{ type: 'text', text: 'reply 3' }]),
+    user('u9', 'after system update'),
+  ]
+  const step3 = await collect(
+    adapter.stream({
+      ...base,
+      messages: history,
+    }),
+  )
+  assert.equal(finishOf(step3).reason.kind, 'stop')
+  const rebuiltPrompt = prompts()[2]
+  assert.notEqual(rebuiltPrompt.session, firstPrompt.session)
+  assert.equal(rebuiltPrompt.system, bridgeSystemPrompt())
+  assert.match(
+    rebuiltPrompt.text,
+    /^<system_instructions>\nUpdated harness rules /,
+  )
+  assert.match(rebuiltPrompt.text, /<harness_tool_instructions>/)
+  assert.match(rebuiltPrompt.text, /COMPACTED_TOOL_TAIL_MARKER/)
+  assert.match(rebuiltPrompt.text, /<pi_history>\n\[Earlier /)
+  assert.ok(rebuiltPrompt.text.endsWith('after system update'))
+  assert.ok(
+    Buffer.byteLength(rebuiltPrompt.text, 'utf8') <= REPLAY_BUDGET_BYTES,
+  )
 })

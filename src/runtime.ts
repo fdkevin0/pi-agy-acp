@@ -521,16 +521,20 @@ export class AntigravityRuntime {
       const plan = this.plan(conv, split.system, split.messages)
       if (plan.rebuild) await this.resetSession(conv)
       this.assertOwner(proc, conv)
+      let supplementalTools: readonly BridgeTool[] = []
       if (conv.sessionId === undefined) {
         conv.systemHash = digest(split.system)
-        await this.openSession(conv, split.system, tools, proc)
+        supplementalTools = await this.openSession(conv, tools, proc)
       }
       this.assertOwner(proc, conv, conv.sessionId)
       await this.select(conv, proc, options.model, effort)
       this.assertOwner(proc, conv, conv.sessionId)
       let blocks: AcpPromptBlock[]
       if (plan.rebuild) {
-        blocks = replayPrompt(plan.history, plan.input)
+        blocks = replayPrompt(plan.history, plan.input, {
+          system: split.system,
+          supplementalTools,
+        })
       } else {
         blocks = inputPrompt(plan.input)
         const toolDelta = consumeToolDelta(conv, tools)
@@ -746,10 +750,9 @@ export class AntigravityRuntime {
 
   private async openSession(
     conv: Conversation,
-    system: string,
     tools: readonly BridgeTool[],
     proc: AcpProcess,
-  ): Promise<void> {
+  ): Promise<readonly BridgeTool[]> {
     this.assertOwner(proc, conv)
     syncOAuthToken(this.home)
     conv.reportedToolCalls.clear()
@@ -781,7 +784,7 @@ export class AntigravityRuntime {
           _meta: {
             antigravity: {
               systemPrompt: {
-                append: bridgeSystemPrompt(system, supplementalTools),
+                append: bridgeSystemPrompt(),
               },
             },
           },
@@ -835,6 +838,7 @@ export class AntigravityRuntime {
         )
       )
         this.host.onModelsChanged()
+      return supplementalTools
     } catch (error) {
       this.clearSession(conv)
       throw mapError(error)

@@ -16,9 +16,11 @@ pi -e ./index.ts
 
 1. The extension registers `antigravity-acp` with Pi. The first request starts
    `agy acp --process-per-session` and a loopback MCP bridge.
-2. Pi messages and tool definitions are converted into an ACP prompt. The runtime
-   reuses a session when its history prefix still matches; otherwise it replays
-   the available history into a new session.
+2. Session creation appends only a static MCP tool-routing preamble to `agy`'s
+   system prompt; Pi's system prompt, compacted initial tool schemas, and any
+   replayed history travel in the session's opening prompt within the 160 KB
+   replay budget. Later turns on an intact history prefix reuse the session and
+   send only new input (plus any dynamic tool deltas).
 3. Model tool calls reach the bridge and remain pending while Pi executes them.
    Pi receives a `toolUse` result, then supplies tool results on its next request.
 4. Those results resolve the pending MCP requests, allowing the same ACP turn to
