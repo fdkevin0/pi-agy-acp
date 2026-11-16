@@ -349,7 +349,13 @@ export default function (
       }
       const notice = snapshot
         ? formatQuota(snapshot, undefined, quotaDisplay)
-        : formatStatus(runtime.status())
+        : formatStatus(
+            runtime.status(
+              ctx.model?.provider === config.provider
+                ? ctx.model.id
+                : undefined,
+            ),
+          )
       if (epoch === uiEpoch)
         updateStatus(ctx, snapshot ?? activeRuntime?.quota.peek())
       ctx.ui.notify(notice.text, notice.level)

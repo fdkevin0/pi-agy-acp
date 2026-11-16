@@ -9,6 +9,7 @@
 //   USAGEUPD <n>            emit a session/update usage_update notification
 //   MAXCTX <n>              record max_context_tokens = <n> in gen_metadata
 //   NOMAXCTX                skip writing gen_metadata for this prompt
+//   PROMPT_ERR              fail session/prompt after recording gen_metadata
 //   DENYCALL <tool> <json>  native tool whose rawInput merely embeds "mcp_pi_<tool>"
 //   SPOOFCALL <tool> <json> title fakes "mcp_pi_<tool>" but no structured metadata
 //   STALECALL <tool> <json> permission claims structured metadata never reported
@@ -598,6 +599,7 @@ async function runPrompt(s, text) {
       await new Promise((r) => setTimeout(r, Number(line.slice(6))))
     }
   }
+  if (text.includes('PROMPT_ERR')) throw new Error('synthetic prompt error')
   if (s.cancelled) return { stopReason: 'cancelled' }
   if (text.includes('MAXTOK') && !s.continued) {
     s.continued = true

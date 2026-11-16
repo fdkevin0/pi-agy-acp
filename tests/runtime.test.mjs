@@ -3763,6 +3763,9 @@ test('contextWindow starts at 0 without static fallbacks and updates dynamically
   )
   assert.equal(finishOf(turn2).reason.kind, 'stop')
   assert.equal(runtime.contextWindowFor('claude-opus-5-5'), 0)
+  assert.equal(runtime.status().contextWindow, undefined)
+  assert.equal(runtime.status('gemini-4-argon').contextWindow, 512_000)
+  assert.equal(runtime.status('claude-opus-5-5').contextWindow, undefined)
 
   const turn3 = await collect(
     adapter.stream({
@@ -3787,4 +3790,53 @@ test('contextWindow starts at 0 without static fallbacks and updates dynamically
   assert.equal(finishOf(turn4).reason.kind, 'stop')
   assert.equal(runtime.contextWindowFor('claude-opus-5-5'), 1_048_576)
   assert.equal(runtime.status().contextWindow, 1_048_576)
+})
+
+test('switching models in a reused session isolates gen_metadata rows and thrown turns still harvest current-turn metadata', async (t) => {
+  const { runtime, adapter, prompts } = makeRuntime(t)
+  const turn1 = await collect(
+    adapter.stream({
+      provider: 'antigravity',
+      model: 'gemini-4-argon',
+      sessionId: 'S-ISO',
+      messages: [sys, user('u1', 'turn one')],
+    }),
+  )
+  assert.equal(finishOf(turn1).reason.kind, 'stop')
+  assert.equal(runtime.contextWindowFor('gemini-4-argon'), 512_000)
+
+  await assert.rejects(
+    collect(
+      adapter.stream({
+        provider: 'antigravity',
+        model: 'gpt-oss-120b-medium',
+        sessionId: 'S-ISO',
+        messages: [
+          sys,
+          user('u1', 'turn one'),
+          assistantFrom('a1', turn1),
+          user('u2', 'NOMAXCTX\nUSAGEUPD 0\nPROMPT_ERR'),
+        ],
+      }),
+    ),
+    /synthetic prompt error/,
+  )
+  assert.equal(prompts().at(-1).session, prompts()[0].session)
+  assert.equal(runtime.contextWindowFor('gpt-oss-120b-medium'), 0)
+
+  await runtime.resetConversations()
+  assert.equal(runtime.contextWindowFor('gpt-oss-120b-medium'), 0)
+
+  await assert.rejects(
+    collect(
+      adapter.stream({
+        provider: 'antigravity',
+        model: 'claude-sonnet-5-5',
+        sessionId: 'S-ERR-HARVEST',
+        messages: [sys, user('u3', 'MAXCTX 300000\nPROMPT_ERR')],
+      }),
+    ),
+    /synthetic prompt error/,
+  )
+  assert.equal(runtime.contextWindowFor('claude-sonnet-5-5'), 300_000)
 })

@@ -19,6 +19,7 @@ import {
   removeSessionArtifacts,
   extractMaxContextTokens,
   readSessionMaxContextTokens,
+  readSessionNextMetadataIndex,
 } from '../src/preflight.ts'
 import { defaults } from '../src/config.ts'
 import { AntigravityRuntime } from '../src/runtime.ts'
@@ -1110,16 +1111,23 @@ test('readSessionMaxContextTokens reads WAL SQLite metadata safely and rejects s
   const blob128k = genMetadataBlob([0x80, 0x80, 0x08])
   insert.run(3, blob128k, blob128k.length)
   assert.equal(readSessionMaxContextTokens(home, 'sess-1'), 131_072)
+  assert.equal(readSessionMaxContextTokens(home, 'sess-1', 0), 131_072)
+  assert.equal(readSessionMaxContextTokens(home, 'sess-1', 4), undefined)
+  assert.equal(readSessionMaxContextTokens(home, 'sess-1', -1), undefined)
+  assert.equal(readSessionNextMetadataIndex(home, 'sess-1'), 4)
   db.close()
 
   assert.equal(readSessionMaxContextTokens(home, 'missing'), undefined)
+  assert.equal(readSessionNextMetadataIndex(home, 'missing'), 0)
   assert.equal(readSessionMaxContextTokens(home, ''), undefined)
   assert.equal(readSessionMaxContextTokens(home, '.'), undefined)
   assert.equal(readSessionMaxContextTokens(home, '../outside'), undefined)
+  assert.equal(readSessionNextMetadataIndex(home, '../outside'), null)
   assert.equal(readSessionMaxContextTokens(home, 'a/b'), undefined)
 
   writeFileSync(join(convDir, 'corrupt.db'), 'not-a-sqlite-file')
   assert.equal(readSessionMaxContextTokens(home, 'corrupt'), undefined)
+  assert.equal(readSessionNextMetadataIndex(home, 'corrupt'), null)
 
   const outside = join(home, 'outside')
   mkdirSync(outside)
@@ -1131,10 +1139,12 @@ test('readSessionMaxContextTokens reads WAL SQLite metadata safely and rejects s
 
   symlinkSync(outsideDbPath, join(convDir, 'sym-file.db'))
   assert.equal(readSessionMaxContextTokens(home, 'sym-file'), undefined)
+  assert.equal(readSessionNextMetadataIndex(home, 'sym-file'), null)
 
   rmSync(convDir, { recursive: true, force: true })
   symlinkSync(outside, convDir, 'junction')
   assert.equal(readSessionMaxContextTokens(home, 'ext'), undefined)
+  assert.equal(readSessionNextMetadataIndex(home, 'ext'), null)
 })
 
 test('ModelCatalog persists contextWindows in catalog.json and ignores invalid values', (t) => {

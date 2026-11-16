@@ -68,6 +68,7 @@ import {
   defaultHome,
   prepareHome,
   readSessionMaxContextTokens,
+  readSessionNextMetadataIndex,
   removeSessionArtifacts,
   readVersion,
   resolveAgyBinary,
@@ -154,6 +155,8 @@ interface Conversation {
   dirty: boolean
   lastUsed: number
   model: string | undefined
+  /** Lower `gen_metadata.idx` bound for `model`, or `null` when unobservable after a failed cursor read. */
+  metaFloorIdx: number | null
   effort: Effort | undefined
 }
 
@@ -220,9 +223,17 @@ export class AntigravityRuntime {
   private observeSessionContextWindow(
     sessionId: string | undefined,
     model: string | undefined,
+    minIdx: number | null,
   ): void {
-    if (this.lifecycle !== 'active' || !sessionId || !model) return
-    const tokens = readSessionMaxContextTokens(this.home, sessionId)
+    if (
+      this.lifecycle !== 'active' ||
+      !sessionId ||
+      !model ||
+      minIdx === null
+    ) {
+      return
+    }
+    const tokens = readSessionMaxContextTokens(this.home, sessionId, minIdx)
     if (this.catalog.observeContextWindow(model, tokens)) {
       this.host.onModelsChanged()
     }
@@ -243,17 +254,15 @@ export class AntigravityRuntime {
 
   /**
    * Current status for diagnostics surfaces.
+   * @param modelId - optional active provider model id.
    * @returns the status snapshot.
    */
-  status(): RuntimeStatus {
+  status(modelId?: string): RuntimeStatus {
+    const targetModel = modelId ?? this.lastTurn?.model
     const activeContextWindow =
-      (this.lastTurn !== undefined
-        ? this.catalog.contextWindowFor(this.lastTurn.model)
-        : undefined) ??
-      this.catalog
-        .list()
-        .map((m) => this.catalog.contextWindowFor(m.id))
-        .find((w): w is number => w !== undefined)
+      targetModel !== undefined
+        ? this.catalog.contextWindowFor(targetModel)
+        : undefined
     return {
       state: this.state,
       ...(this.lastError !== undefined ? { error: this.lastError } : {}),
@@ -666,6 +675,7 @@ export class AntigravityRuntime {
       dirty: false,
       lastUsed: Date.now(),
       model: undefined,
+      metaFloorIdx: 0,
       effort: undefined,
     }
     this.conversations.set(key, conv)
@@ -827,7 +837,11 @@ export class AntigravityRuntime {
                 this.host.onModelsChanged()
             }
             if (update.sessionUpdate === 'usage_update') {
-              this.observeSessionContextWindow(conv.sessionId, conv.model)
+              this.observeSessionContextWindow(
+                conv.sessionId,
+                conv.model,
+                conv.metaFloorIdx,
+              )
             }
             if (recordReportedToolCall(conv, update) === 'conflict') {
               this.host.log.warn(
@@ -852,6 +866,7 @@ export class AntigravityRuntime {
       conv.process = proc
       conv.configOptions = result.configOptions ?? []
       conv.model = undefined
+      conv.metaFloorIdx = 0
       conv.effort = undefined
 
       conv.dirty = false
@@ -1002,6 +1017,12 @@ export class AntigravityRuntime {
         'UNKNOWN_MODEL',
       )
     }
+    const previousModel = conv.model
+    const previousFloor = conv.metaFloorIdx
+    if (previousModel !== undefined && previousModel !== model) {
+      this.observeSessionContextWindow(sessionId, previousModel, previousFloor)
+      conv.metaFloorIdx = null
+    }
     if (conv.model !== model && modelOption?.currentValue !== model) {
       await this.applyConfigOption(
         conv,
@@ -1010,6 +1031,13 @@ export class AntigravityRuntime {
         modelOption?.id ?? 'model',
         model,
       )
+    }
+    if (previousModel !== undefined && previousModel !== model) {
+      const nextIdx = readSessionNextMetadataIndex(this.home, sessionId)
+      conv.metaFloorIdx =
+        previousFloor === null || nextIdx === null
+          ? null
+          : Math.max(previousFloor, nextIdx)
     }
     conv.model = model
     const levelOption = conv.configOptions.find(
@@ -1133,7 +1161,7 @@ export class AntigravityRuntime {
   }
 
   private async resetSession(conv: Conversation): Promise<void> {
-    this.observeSessionContextWindow(conv.sessionId, conv.model)
+    this.observeSessionContextWindow(conv.sessionId, conv.model, conv.metaFloorIdx)
     let closing: Promise<void> | undefined
     if (conv.sessionId !== undefined && conv.process !== undefined) {
       closing = this.closeAndCleanSession(conv.process, conv.sessionId)
@@ -1150,6 +1178,7 @@ export class AntigravityRuntime {
     conv.tenantKey = undefined
     conv.tenantSecret = undefined
     conv.process = undefined
+    conv.metaFloorIdx = null
     conv.advertisedTools = []
     conv.advertisedToolDigests.clear()
     conv.knownTools.clear()
@@ -1183,6 +1212,7 @@ export class AntigravityRuntime {
     effort: Effort,
   ): AsyncGenerator<StreamChunk> {
     const sessionId = conv.sessionId as string
+    const metaFloorIdx = conv.metaFloorIdx
     let finishKind: string | undefined
     let drained = false
     const cancel = () => {
@@ -1237,7 +1267,7 @@ export class AntigravityRuntime {
           conv.issuedIds.add(chunk.block.id)
         if (chunk.type === 'finish') {
           finishKind = chunk.reason.kind
-          this.observeSessionContextWindow(sessionId, options.model)
+          this.observeSessionContextWindow(sessionId, options.model, metaFloorIdx)
         }
         yield chunk
         if (chunk.type === 'finish' && chunk.reason.kind === 'aborted') break
@@ -1245,11 +1275,13 @@ export class AntigravityRuntime {
       const interrupted = turn.guard(undefined, signal)
       if (interrupted !== undefined && finishKind !== 'aborted') {
         finishKind = 'aborted'
+        this.observeSessionContextWindow(sessionId, options.model, metaFloorIdx)
         yield interrupted
       }
       drained = true
     } catch (error) {
       finishKind = 'error'
+      this.observeSessionContextWindow(sessionId, options.model, metaFloorIdx)
       throw mapError(error)
     } finally {
       // Only a fully consumed tool handoff keeps the turn and its cancellation owner.

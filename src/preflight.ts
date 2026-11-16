@@ -20,6 +20,7 @@ import {
   lstatSync,
   readdirSync,
   rmSync,
+  type Stats,
 } from 'node:fs'
 import { homedir } from 'node:os'
 import { delimiter, isAbsolute, join, relative } from 'node:path'
@@ -320,43 +321,84 @@ export function extractMaxContextTokens(blob: Uint8Array): number | undefined {
   )
 }
 
-/**
- * Read server-issued `max_context_tokens` from one ACP session's SQLite database.
- * @param home - isolated `--gemini-dir` root.
- * @param sessionId - ACP session id.
- * @returns positive `max_context_tokens`, or `undefined` when unavailable.
- */
-export function readSessionMaxContextTokens(
+function lstatOrMissing(path: string): Stats | 'missing' | 'invalid' {
+  try {
+    return lstatSync(path)
+  } catch (error) {
+    return (error as NodeJS.ErrnoException)?.code === 'ENOENT'
+      ? 'missing'
+      : 'invalid'
+  }
+}
+
+function resolveSessionDbPath(
   home: string,
   sessionId: string,
-): number | undefined {
-  if (!isValidSessionId(sessionId)) return undefined
+): { kind: 'ok'; dbPath: string } | { kind: 'missing' } | { kind: 'invalid' } {
+  if (!isValidSessionId(sessionId)) return { kind: 'invalid' }
   const appData = join(home, 'agy')
-  if (!isRealDirectory(appData)) return undefined
+  const appStat = lstatOrMissing(appData)
+  if (appStat === 'missing') return { kind: 'missing' }
+  if (
+    appStat === 'invalid' ||
+    appStat.isSymbolicLink() ||
+    !appStat.isDirectory()
+  )
+    return { kind: 'invalid' }
+
   const convDir = join(appData, 'conversations')
-  if (!isRealDirectory(convDir)) return undefined
+  const convStat = lstatOrMissing(convDir)
+  if (convStat === 'missing') return { kind: 'missing' }
+  if (
+    convStat === 'invalid' ||
+    convStat.isSymbolicLink() ||
+    !convStat.isDirectory()
+  )
+    return { kind: 'invalid' }
+
   let realHome: string
   let realConvDir: string
   try {
     realHome = realpathSync(home)
     realConvDir = realpathSync(convDir)
   } catch {
-    return undefined
+    return { kind: 'invalid' }
   }
   const rel = relative(realHome, realConvDir)
-  if (rel.startsWith('..') || isAbsolute(rel)) return undefined
+  if (rel.startsWith('..') || isAbsolute(rel)) return { kind: 'invalid' }
+
   const dbPath = join(convDir, `${sessionId}.db`)
-  try {
-    const st = lstatSync(dbPath)
-    if (st.isSymbolicLink() || !st.isFile()) return undefined
-  } catch {
+  const dbStat = lstatOrMissing(dbPath)
+  if (dbStat === 'missing') return { kind: 'missing' }
+  if (dbStat === 'invalid' || dbStat.isSymbolicLink() || !dbStat.isFile())
+    return { kind: 'invalid' }
+
+  return { kind: 'ok', dbPath }
+}
+
+/**
+ * Read server-issued `max_context_tokens` from one ACP session's SQLite database.
+ * @param home - isolated `--gemini-dir` root.
+ * @param sessionId - ACP session id.
+ * @param minIdx - lowest `gen_metadata.idx` owned by the current model.
+ * @returns positive `max_context_tokens`, or `undefined` when unavailable.
+ */
+export function readSessionMaxContextTokens(
+  home: string,
+  sessionId: string,
+  minIdx = 0,
+): number | undefined {
+  if (typeof minIdx !== 'number' || !Number.isSafeInteger(minIdx) || minIdx < 0)
     return undefined
-  }
+  const resolved = resolveSessionDbPath(home, sessionId)
+  if (resolved.kind !== 'ok') return undefined
   let db: DatabaseSync | undefined
   try {
-    db = new DatabaseSync(dbPath, { readOnly: true, timeout: 50 })
-    const stmt = db.prepare('SELECT data FROM gen_metadata ORDER BY idx DESC')
-    for (const row of stmt.iterate() as Iterable<{ data?: unknown }>) {
+    db = new DatabaseSync(resolved.dbPath, { readOnly: true, timeout: 50 })
+    const stmt = db.prepare(
+      'SELECT data FROM gen_metadata WHERE idx >= ? ORDER BY idx DESC',
+    )
+    for (const row of stmt.iterate(minIdx) as Iterable<{ data?: unknown }>) {
       if (!(row.data instanceof Uint8Array)) continue
       const tokens = extractMaxContextTokens(row.data)
       if (tokens !== undefined) return tokens
@@ -364,6 +406,43 @@ export function readSessionMaxContextTokens(
     return undefined
   } catch {
     return undefined
+  } finally {
+    db?.close()
+  }
+}
+
+/**
+ * Compute the next `gen_metadata.idx` floor (`MAX(idx) + 1`, or `0` when no rows exist)
+ * before switching models inside a reused ACP session. Returns `null` when the
+ * session database path is invalid, symlinked, corrupt, or unreadable (fail-closed).
+ */
+export function readSessionNextMetadataIndex(
+  home: string,
+  sessionId: string,
+): number | null {
+  const resolved = resolveSessionDbPath(home, sessionId)
+  if (resolved.kind === 'missing') return 0
+  if (resolved.kind === 'invalid') return null
+  let db: DatabaseSync | undefined
+  try {
+    db = new DatabaseSync(resolved.dbPath, { readOnly: true, timeout: 50 })
+    const hasTable = db
+      .prepare(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'gen_metadata'",
+      )
+      .get()
+    if (hasTable === undefined) return 0
+    const row = db
+      .prepare('SELECT MAX(idx) AS maxIdx FROM gen_metadata')
+      .get() as { maxIdx?: unknown } | undefined
+    if (row?.maxIdx === null || row?.maxIdx === undefined) return 0
+    if (typeof row.maxIdx === 'number' && Number.isSafeInteger(row.maxIdx)) {
+      const next = row.maxIdx + 1
+      return Number.isSafeInteger(next) ? Math.max(0, next) : null
+    }
+    return null
+  } catch {
+    return null
   } finally {
     db?.close()
   }
