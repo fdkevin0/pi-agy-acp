@@ -145,15 +145,19 @@ The fallback families are:
 - `claude-sonnet-5-5`
 - `gpt-oss-120b-medium`
 
-These entries are defaults, not a guarantee of account access. Context declarations
-are 256,000 tokens, or 131,072 for GPT-OSS. The history replay budget is 160,000 bytes;
-older history can be omitted to fit, and historical images become text placeholders.
+These entries are defaults, not a guarantee of account access. Model context windows
+start at `0` until learned dynamically from the server-issued `max_context_tokens`
+metadata in the session database and cached per model in `catalog.json`. The history
+replay budget is 160,000 bytes; older history can be omitted to fit, and historical
+images become text placeholders.
 
 ## Usage and costs
 
 Usage comes from the ACP session rather than per-step API headers. Parked `toolUse`
 steps emit zero usage; statistics arrive on the final step when the full ACP turn
-finishes (accumulated across any automatic `max_tokens` continuations).
+finishes (accumulated across any automatic `max_tokens` continuations). `max_context_tokens`
+recorded in the session SQLite metadata supplies the model's context window, while
+`usage_update` supplies live token occupancy.
 
 The extension separates cumulative token consumption from final-call context
 occupancy:
@@ -174,8 +178,9 @@ buckets accurately; tiered `inputTokensAbove` rules evaluate against cumulative
 turn prompt tokens rather than per-call prompt sizes. These estimates are not
 an invoice amount or a promise of free access.
 
-The extension does not inspect agy's private databases or invoke or distribute
-binary patch scripts.
+The extension reads only session-scoped `max_context_tokens` metadata inside `PI_AGY_HOME`;
+it never inspects your global `agy` databases or invokes or distributes binary patch
+scripts.
 
 ## Compatibility limits
 

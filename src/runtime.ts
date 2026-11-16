@@ -66,9 +66,8 @@ import {
   assertSupportedAgyVersion,
   BRIDGE_AGENT,
   defaultHome,
-  GPT_OSS_CONTEXT_WINDOW,
-  DEFAULT_CONTEXT_WINDOW,
   prepareHome,
+  readSessionMaxContextTokens,
   removeSessionArtifacts,
   readVersion,
   resolveAgyBinary,
@@ -108,13 +107,14 @@ export interface RuntimeStatus {
   version?: string
   home: string
   account?: AccountInfo
-  contextWindow: number
+  contextWindow?: number
   defaultEffort: Effort
   models: {
     id: string
     name: string
     efforts: readonly Effort[]
     fixedEffort?: Effort
+    contextWindow?: number
   }[]
   efforts: string[]
   liveSessions: number
@@ -214,9 +214,18 @@ export class AntigravityRuntime {
   }
 
   contextWindowFor(model: string): number {
-    return model.startsWith('gpt-oss')
-      ? GPT_OSS_CONTEXT_WINDOW
-      : DEFAULT_CONTEXT_WINDOW
+    return this.catalog.contextWindowFor(model) ?? 0
+  }
+
+  private observeSessionContextWindow(
+    sessionId: string | undefined,
+    model: string | undefined,
+  ): void {
+    if (this.lifecycle !== 'active' || !sessionId || !model) return
+    const tokens = readSessionMaxContextTokens(this.home, sessionId)
+    if (this.catalog.observeContextWindow(model, tokens)) {
+      this.host.onModelsChanged()
+    }
   }
 
   /**
@@ -237,6 +246,14 @@ export class AntigravityRuntime {
    * @returns the status snapshot.
    */
   status(): RuntimeStatus {
+    const activeContextWindow =
+      (this.lastTurn !== undefined
+        ? this.catalog.contextWindowFor(this.lastTurn.model)
+        : undefined) ??
+      this.catalog
+        .list()
+        .map((m) => this.catalog.contextWindowFor(m.id))
+        .find((w): w is number => w !== undefined)
     return {
       state: this.state,
       ...(this.lastError !== undefined ? { error: this.lastError } : {}),
@@ -248,13 +265,19 @@ export class AntigravityRuntime {
         : {}),
       home: this.home,
       account: this.accountInfo(),
-      contextWindow: DEFAULT_CONTEXT_WINDOW,
+      ...(activeContextWindow !== undefined
+        ? { contextWindow: activeContextWindow }
+        : {}),
       defaultEffort: this.host.config.defaultEffort,
-      models: this.catalog.list().map((m) => ({
-        ...m,
-        efforts: this.catalog.effortsFor(m.id),
-        fixedEffort: this.catalog.fixedEffort(m.id),
-      })),
+      models: this.catalog.list().map((m) => {
+        const contextWindow = this.catalog.contextWindowFor(m.id)
+        return {
+          ...m,
+          efforts: this.catalog.effortsFor(m.id),
+          fixedEffort: this.catalog.fixedEffort(m.id),
+          ...(contextWindow !== undefined ? { contextWindow } : {}),
+        }
+      }),
       efforts: [...this.catalog.effortList()],
       liveSessions: [...this.conversations.values()].filter(
         (c) => c.sessionId !== undefined,
@@ -803,6 +826,9 @@ export class AntigravityRuntime {
               if (this.catalog.observe(update.configOptions))
                 this.host.onModelsChanged()
             }
+            if (update.sessionUpdate === 'usage_update') {
+              this.observeSessionContextWindow(conv.sessionId, conv.model)
+            }
             if (recordReportedToolCall(conv, update) === 'conflict') {
               this.host.log.warn(
                 `antigravity-acp: agent reported conflicting identity for tool call ${String(update.toolCallId)}`,
@@ -1107,6 +1133,7 @@ export class AntigravityRuntime {
   }
 
   private async resetSession(conv: Conversation): Promise<void> {
+    this.observeSessionContextWindow(conv.sessionId, conv.model)
     let closing: Promise<void> | undefined
     if (conv.sessionId !== undefined && conv.process !== undefined) {
       closing = this.closeAndCleanSession(conv.process, conv.sessionId)
@@ -1208,7 +1235,10 @@ export class AntigravityRuntime {
         const chunk = turn.guard(emitted, signal) as StreamChunk
         if (chunk.type === 'block-end' && chunk.block.type === 'tool-call')
           conv.issuedIds.add(chunk.block.id)
-        if (chunk.type === 'finish') finishKind = chunk.reason.kind
+        if (chunk.type === 'finish') {
+          finishKind = chunk.reason.kind
+          this.observeSessionContextWindow(sessionId, options.model)
+        }
         yield chunk
         if (chunk.type === 'finish' && chunk.reason.kind === 'aborted') break
       }

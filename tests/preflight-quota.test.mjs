@@ -11,11 +11,14 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, delimiter } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import {
   resolveAgyBinary,
   assertSupportedAgyVersion,
   prepareHome,
   removeSessionArtifacts,
+  extractMaxContextTokens,
+  readSessionMaxContextTokens,
 } from '../src/preflight.ts'
 import { defaults } from '../src/config.ts'
 import { AntigravityRuntime } from '../src/runtime.ts'
@@ -790,6 +793,26 @@ test('status panel distinguishes lazy startup, live resources, model efforts and
   })
   assert.match(aborted.text, /aborted · 450ms/)
   assert.doesNotMatch(aborted.text, /retries/)
+  const unprobed = formatStatus({
+    ...statusSnapshot,
+    contextWindow: undefined,
+    models: [
+      {
+        id: 'gemini-4-argon',
+        name: 'Gemini 4 Argon',
+        efforts: ['low', 'high'],
+        contextWindow: 512_000,
+      },
+    ],
+  })
+  assert.match(
+    unprobed.text,
+    /Context:\s+dynamic \(unprobed\) · default effort: high/,
+  )
+  assert.match(
+    unprobed.text,
+    /gemini-4-argon \(Gemini 4 Argon\) — \[low, high\] · 500K/,
+  )
 })
 
 test('commands route formatted notices and reject unknown arguments without querying quota', async (t) => {
@@ -1015,4 +1038,128 @@ test('quota queries directly outside TUI or when custom UI is unavailable', asyn
     assert.equal(notice.level, 'info')
     assert.match(notice.text, /25%/)
   }
+})
+
+function pbField(tagByte, payload) {
+  return Uint8Array.from([tagByte, payload.length, ...payload])
+}
+
+function genMetadataBlob(varintBytes) {
+  const ctxWindow = Uint8Array.from([0x20, ...varintBytes])
+  return pbField(0x0a, pbField(0x4a, pbField(0x52, ctxWindow)))
+}
+
+test('extractMaxContextTokens decodes GeneratorMetadata protobuf blobs and ignores unknown or malformed fields', () => {
+  const blob512k = genMetadataBlob([0x80, 0xa0, 0x1f])
+  assert.equal(extractMaxContextTokens(blob512k), 512_000)
+
+  const blob128k = genMetadataBlob([0x80, 0x80, 0x08])
+  assert.equal(extractMaxContextTokens(blob128k), 131_072)
+
+  // Unknown fields across wire types 0, 1, 2, 5 before match + empty trailing field 1 after match.
+  const padded = Uint8Array.from([
+    0x10, 0x01,
+    0x19, 1, 2, 3, 4, 5, 6, 7, 8,
+    0x22, 0x02, 0xaa, 0xbb,
+    0x2d, 1, 2, 3, 4,
+    ...blob512k,
+    0x0a, 0x02, 0x10, 0x00,
+  ])
+  assert.equal(extractMaxContextTokens(padded), 512_000)
+
+  // Last-wins across repeated field 4 entries.
+  const repeated = pbField(
+    0x0a,
+    pbField(0x4a, pbField(0x52, Uint8Array.from([0x20, 0x80, 0xa0, 0x1f, 0x20, 0x80, 0x80, 0x08]))),
+  )
+  assert.equal(extractMaxContextTokens(repeated), 131_072)
+
+  assert.equal(extractMaxContextTokens(new Uint8Array(0)), undefined)
+  assert.equal(extractMaxContextTokens(genMetadataBlob([0x00])), undefined)
+  assert.equal(
+    extractMaxContextTokens(
+      genMetadataBlob([0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01]),
+    ),
+    undefined,
+  )
+  assert.equal(extractMaxContextTokens(Uint8Array.from([0x0a, 0x10, 0x4a])), undefined)
+  assert.equal(extractMaxContextTokens(Uint8Array.from([0x0b, 0x01])), undefined)
+  assert.equal(extractMaxContextTokens(null), undefined)
+})
+
+test('readSessionMaxContextTokens reads WAL SQLite metadata safely and rejects symlinks or invalid session ids', (t) => {
+  const home = isolateHome(t)
+  const convDir = join(home, 'agy', 'conversations')
+  mkdirSync(convDir, { recursive: true })
+  const dbPath = join(convDir, 'sess-1.db')
+  const db = new DatabaseSync(dbPath)
+  db.exec(
+    'PRAGMA journal_mode=WAL; CREATE TABLE gen_metadata (idx integer PRIMARY KEY, data blob, size integer NOT NULL DEFAULT 0);',
+  )
+  const insert = db.prepare(
+    'INSERT INTO gen_metadata (idx, data, size) VALUES (?, ?, ?)',
+  )
+  const blob512k = genMetadataBlob([0x80, 0xa0, 0x1f])
+  const unrelated = Uint8Array.from([0x12, 0x01, 0x00])
+  insert.run(1, blob512k, blob512k.length)
+  insert.run(2, unrelated, unrelated.length)
+
+  // Skips newer row 2 lacking ContextWindowMetadata and finds row 1 from WAL while writer stays open.
+  assert.equal(readSessionMaxContextTokens(home, 'sess-1'), 512_000)
+
+  const blob128k = genMetadataBlob([0x80, 0x80, 0x08])
+  insert.run(3, blob128k, blob128k.length)
+  assert.equal(readSessionMaxContextTokens(home, 'sess-1'), 131_072)
+  db.close()
+
+  assert.equal(readSessionMaxContextTokens(home, 'missing'), undefined)
+  assert.equal(readSessionMaxContextTokens(home, ''), undefined)
+  assert.equal(readSessionMaxContextTokens(home, '.'), undefined)
+  assert.equal(readSessionMaxContextTokens(home, '../outside'), undefined)
+  assert.equal(readSessionMaxContextTokens(home, 'a/b'), undefined)
+
+  writeFileSync(join(convDir, 'corrupt.db'), 'not-a-sqlite-file')
+  assert.equal(readSessionMaxContextTokens(home, 'corrupt'), undefined)
+
+  const outside = join(home, 'outside')
+  mkdirSync(outside)
+  const outsideDbPath = join(outside, 'ext.db')
+  const outsideDb = new DatabaseSync(outsideDbPath)
+  outsideDb.exec('CREATE TABLE gen_metadata (idx integer PRIMARY KEY, data blob);')
+  outsideDb.prepare('INSERT INTO gen_metadata (idx, data) VALUES (?, ?)').run(1, blob512k)
+  outsideDb.close()
+
+  symlinkSync(outsideDbPath, join(convDir, 'sym-file.db'))
+  assert.equal(readSessionMaxContextTokens(home, 'sym-file'), undefined)
+
+  rmSync(convDir, { recursive: true, force: true })
+  symlinkSync(outside, convDir, 'junction')
+  assert.equal(readSessionMaxContextTokens(home, 'ext'), undefined)
+})
+
+test('ModelCatalog persists contextWindows in catalog.json and ignores invalid values', (t) => {
+  const root = isolateHome(t)
+  const path = join(root, 'catalog.json')
+  const catalog = new ModelCatalog(path)
+  assert.equal(catalog.contextWindowFor('gemini-4-argon'), undefined)
+  assert.equal(catalog.observeContextWindow('', 512_000), false)
+  assert.equal(catalog.observeContextWindow('gemini-4-argon', 0), false)
+  assert.equal(catalog.observeContextWindow('gemini-4-argon', -1), false)
+  assert.equal(catalog.observeContextWindow('gemini-4-argon', 1.5), false)
+  assert.equal(catalog.observeContextWindow('gemini-4-argon', Number.NaN), false)
+  assert.equal(catalog.observeContextWindow('gemini-4-argon', undefined), false)
+
+  assert.equal(catalog.observeContextWindow('gemini-4-argon', 512_000), true)
+  assert.equal(catalog.observeContextWindow('gemini-4-argon', 512_000), false)
+  assert.equal(catalog.observeContextWindow('gpt-oss-120b-medium', 131_072), true)
+  assert.equal(catalog.contextWindowFor('gemini-4-argon'), 512_000)
+  assert.equal(catalog.contextWindowFor('gpt-oss-120b-medium'), 131_072)
+
+  const reloaded = new ModelCatalog(path)
+  assert.equal(reloaded.contextWindowFor('gemini-4-argon'), 512_000)
+  assert.equal(reloaded.contextWindowFor('gpt-oss-120b-medium'), 131_072)
+  assert.deepEqual(JSON.parse(readFileSync(path, 'utf8')).contextWindows, {
+    'gemini-4-argon': 512_000,
+    'gpt-oss-120b-medium': 131_072,
+  })
 })

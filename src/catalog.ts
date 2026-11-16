@@ -64,6 +64,10 @@ export function nearestEffort(
   return best ?? wanted
 }
 
+function isValidContextWindow(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0
+}
+
 /** Observed catalog with a disk cache. */
 export class ModelCatalog {
   private models: CatalogModel[]
@@ -71,6 +75,8 @@ export class ModelCatalog {
   private efforts: Effort[] = [...EFFORTS]
   /** Efforts per model family; an empty array marks a fixed-effort model. */
   private byModel = new Map<string, Effort[]>()
+  /** Server-reported `max_context_tokens` keyed by model id. */
+  private readonly contextWindows = new Map<string, number>()
   /** Latest `availableModels` snapshot, kept for later option updates. */
   private available: readonly AvailableModel[] | undefined
   /** Whether a live ACP session has reported the catalog. */
@@ -81,6 +87,38 @@ export class ModelCatalog {
   constructor(cachePath: string) {
     this.cachePath = cachePath
     this.models = this.load() ?? [...FALLBACK_MODELS]
+  }
+
+  /**
+   * Cached server-issued context window (`max_context_tokens`) for one model.
+   * @param modelId - family id.
+   * @returns positive token limit, or `undefined` when never observed.
+   */
+  contextWindowFor(modelId: string): number | undefined {
+    return this.contextWindows.get(modelId)
+  }
+
+  /**
+   * Persist one observed context window if it is valid and changed.
+   * @param modelId - family id.
+   * @param contextWindow - observed `max_context_tokens`.
+   * @returns whether the stored window changed.
+   */
+  observeContextWindow(
+    modelId: string,
+    contextWindow: number | undefined,
+  ): boolean {
+    if (
+      typeof modelId !== 'string' ||
+      modelId.length === 0 ||
+      !isValidContextWindow(contextWindow)
+    ) {
+      return false
+    }
+    if (this.contextWindows.get(modelId) === contextWindow) return false
+    this.contextWindows.set(modelId, contextWindow)
+    this.save()
+    return true
   }
 
   /** Current families. */
@@ -215,6 +253,7 @@ export class ModelCatalog {
             models: this.models,
             efforts: this.efforts,
             byModel: Object.fromEntries(this.byModel),
+            contextWindows: Object.fromEntries(this.contextWindows),
             tier: this.tierInfo,
           },
           null,
@@ -233,8 +272,10 @@ export class ModelCatalog {
         models?: CatalogModel[]
         efforts?: string[]
         byModel?: Record<string, string[]>
+        contextWindows?: Record<string, unknown>
         tier?: AcpTierInfo
-      }
+      } | null
+      if (parsed === null || typeof parsed !== 'object') return undefined
       this.tierInfo = normalizeTier(parsed.tier)
       if (Array.isArray(parsed.efforts)) {
         const efforts = parsed.efforts.filter((v): v is Effort =>
@@ -249,6 +290,15 @@ export class ModelCatalog {
             (EFFORTS as readonly string[]).includes(v),
           )
           this.byModel.set(id, efforts)
+        }
+      }
+      if (
+        parsed.contextWindows !== null &&
+        typeof parsed.contextWindows === 'object'
+      ) {
+        for (const [id, value] of Object.entries(parsed.contextWindows)) {
+          if (id.length > 0 && isValidContextWindow(value))
+            this.contextWindows.set(id, value)
         }
       }
       const models = Array.isArray(parsed.models)

@@ -18,6 +18,7 @@ import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { AntigravityRuntime } from '../src/runtime.ts'
+import { ModelCatalog } from '../src/catalog.ts'
 import {
   compactBridgeTool,
   consumeToolDelta,
@@ -3708,4 +3709,82 @@ test('permission probes fail closed during session/new and pre-/post-turn window
   assert.deepEqual(permPreTurn, { outcome: { outcome: 'selected', optionId: 'reject-once' } })
   assert.deepEqual(permLiveTurn, { outcome: { outcome: 'selected', optionId: 'allow-once' } })
   assert.deepEqual(permPostTurn, { outcome: { outcome: 'selected', optionId: 'reject-once' } })
+})
+
+test('contextWindow starts at 0 without static fallbacks and updates dynamically from session metadata before turn finish', async (t) => {
+  const modelUpdates = []
+  const { home, runtime, adapter } = makeRuntime(t, {
+    host: {
+      onModelsChanged: () => {
+        modelUpdates.push({
+          argon: runtime.contextWindowFor('gemini-4-argon'),
+          gpt: runtime.contextWindowFor('gpt-oss-120b-medium'),
+          opus: runtime.contextWindowFor('claude-opus-5-5'),
+        })
+      },
+    },
+  })
+
+  assert.equal(runtime.contextWindowFor('gemini-4-argon'), 0)
+  assert.equal(runtime.contextWindowFor('gpt-oss-120b-medium'), 0)
+  assert.equal(runtime.status().contextWindow, undefined)
+
+  const turn1 = await collect(
+    adapter.stream({
+      provider: 'antigravity',
+      model: 'gemini-4-argon',
+      sessionId: 'S-CTX-1',
+      messages: [sys, user('u1', 'hello')],
+    }),
+  )
+  assert.equal(finishOf(turn1).reason.kind, 'stop')
+  assert.equal(runtime.contextWindowFor('gemini-4-argon'), 512_000)
+  assert.equal(runtime.status().contextWindow, 512_000)
+  assert.equal(
+    runtime.status().models.find((m) => m.id === 'gemini-4-argon')?.contextWindow,
+    512_000,
+  )
+  assert.deepEqual(
+    modelUpdates.map((u) => u.argon),
+    [0, 512_000],
+  )
+  assert.equal(
+    new ModelCatalog(join(home, 'catalog.json')).contextWindowFor('gemini-4-argon'),
+    512_000,
+  )
+
+  const turn2 = await collect(
+    adapter.stream({
+      provider: 'antigravity',
+      model: 'claude-opus-5-5',
+      sessionId: 'S-CTX-2',
+      messages: [sys, user('u2', 'NOMAXCTX hello')],
+    }),
+  )
+  assert.equal(finishOf(turn2).reason.kind, 'stop')
+  assert.equal(runtime.contextWindowFor('claude-opus-5-5'), 0)
+
+  const turn3 = await collect(
+    adapter.stream({
+      provider: 'antigravity',
+      model: 'gpt-oss-120b-medium',
+      sessionId: 'S-CTX-3',
+      messages: [sys, user('u3', 'hello')],
+    }),
+  )
+  assert.equal(finishOf(turn3).reason.kind, 'stop')
+  assert.equal(runtime.contextWindowFor('gpt-oss-120b-medium'), 131_072)
+  assert.equal(runtime.status().contextWindow, 131_072)
+
+  const turn4 = await collect(
+    adapter.stream({
+      provider: 'antigravity',
+      model: 'claude-opus-5-5',
+      sessionId: 'S-CTX-4',
+      messages: [sys, user('u4', 'MAXCTX 1048576 hello')],
+    }),
+  )
+  assert.equal(finishOf(turn4).reason.kind, 'stop')
+  assert.equal(runtime.contextWindowFor('claude-opus-5-5'), 1_048_576)
+  assert.equal(runtime.status().contextWindow, 1_048_576)
 })

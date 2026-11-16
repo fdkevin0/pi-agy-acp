@@ -447,7 +447,7 @@ export function formatStatus(status: RuntimeStatus): FormattedNotice {
     `  Home:     ${status.home}`,
     ...(account ? [`  Account:  ${account}`] : []),
     `  Sessions: ${status.liveSessions} live · ${status.activeTurns} active turn(s)`,
-    `  Context:  ${Math.round(status.contextWindow / 1024)}K tokens · default effort: ${status.defaultEffort} (${status.efforts.join(', ')})`,
+    `  Context:  ${status.contextWindow ? `${Math.round(status.contextWindow / 1024)}K tokens` : 'dynamic (unprobed)'} · default effort: ${status.defaultEffort} (${status.efforts.join(', ')})`,
     '  Models:',
   ]
   if (status.models.length === 0) lines.push('    No models available.')
@@ -458,7 +458,10 @@ export function formatStatus(status: RuntimeStatus): FormattedNotice {
         : model.fixedEffort
           ? `[${model.fixedEffort}] (fixed)`
           : 'no effort selector'
-    lines.push(`    ${model.id} (${model.name}) — ${efforts}`)
+    const ctx = model.contextWindow
+      ? ` · ${Math.round(model.contextWindow / 1024)}K`
+      : ''
+    lines.push(`    ${model.id} (${model.name}) — ${efforts}${ctx}`)
   }
   if (status.lastTurn) {
     const turn = status.lastTurn

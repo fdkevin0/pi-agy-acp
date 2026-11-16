@@ -243,6 +243,55 @@ test('lifecycle uses light resets, cache warming stops only for this provider, a
     undefined,
   )
 
+  assert.deepEqual(
+    h.handlers.get('session_before_compact')(
+      { reason: 'threshold' },
+      { ...h.ctx, model: { provider, id: 'gemini-4-argon', contextWindow: 0 } },
+    ),
+    { cancel: true },
+  )
+  assert.deepEqual(
+    h.handlers.get('session_before_compact')(
+      { reason: 'threshold' },
+      { ...h.ctx, model: { provider, id: 'gemini-4-argon' } },
+    ),
+    { cancel: true },
+  )
+  assert.equal(
+    h.handlers.get('session_before_compact')(
+      { reason: 'threshold' },
+      {
+        ...h.ctx,
+        model: { provider, id: 'gemini-4-argon', contextWindow: 512_000 },
+      },
+    ),
+    undefined,
+  )
+  assert.equal(
+    h.handlers.get('session_before_compact')(
+      { reason: 'overflow' },
+      { ...h.ctx, model: { provider, id: 'gemini-4-argon', contextWindow: 0 } },
+    ),
+    undefined,
+  )
+  assert.equal(
+    h.handlers.get('session_before_compact')(
+      { reason: 'manual' },
+      { ...h.ctx, model: { provider, id: 'gemini-4-argon', contextWindow: 0 } },
+    ),
+    undefined,
+  )
+  assert.equal(
+    h.handlers.get('session_before_compact')(
+      { reason: 'threshold' },
+      {
+        ...h.ctx,
+        model: { provider: 'anthropic', id: 'claude-sonnet-4', contextWindow: 0 },
+      },
+    ),
+    undefined,
+  )
+
   await h.handlers.get('session_start')({ reason: 'startup' }, h.ctx)
   assert.equal(light.mock.callCount(), 0)
   await h.handlers.get('session_start')({ reason: 'resume' }, h.ctx)
