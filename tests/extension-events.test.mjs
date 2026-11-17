@@ -243,6 +243,55 @@ test('lifecycle uses light resets, cache warming stops only for this provider, a
     undefined,
   )
 
+  assert.deepEqual(
+    h.handlers.get('session_before_compact')(
+      { reason: 'threshold' },
+      { ...h.ctx, model: { provider, id: 'gemini-4-argon', contextWindow: 0 } },
+    ),
+    { cancel: true },
+  )
+  assert.deepEqual(
+    h.handlers.get('session_before_compact')(
+      { reason: 'threshold' },
+      { ...h.ctx, model: { provider, id: 'gemini-4-argon' } },
+    ),
+    { cancel: true },
+  )
+  assert.equal(
+    h.handlers.get('session_before_compact')(
+      { reason: 'threshold' },
+      {
+        ...h.ctx,
+        model: { provider, id: 'gemini-4-argon', contextWindow: 512_000 },
+      },
+    ),
+    undefined,
+  )
+  assert.equal(
+    h.handlers.get('session_before_compact')(
+      { reason: 'overflow' },
+      { ...h.ctx, model: { provider, id: 'gemini-4-argon', contextWindow: 0 } },
+    ),
+    undefined,
+  )
+  assert.equal(
+    h.handlers.get('session_before_compact')(
+      { reason: 'manual' },
+      { ...h.ctx, model: { provider, id: 'gemini-4-argon', contextWindow: 0 } },
+    ),
+    undefined,
+  )
+  assert.equal(
+    h.handlers.get('session_before_compact')(
+      { reason: 'threshold' },
+      {
+        ...h.ctx,
+        model: { provider: 'anthropic', id: 'claude-sonnet-4', contextWindow: 0 },
+      },
+    ),
+    undefined,
+  )
+
   await h.handlers.get('session_start')({ reason: 'startup' }, h.ctx)
   assert.equal(light.mock.callCount(), 0)
   await h.handlers.get('session_start')({ reason: 'resume' }, h.ctx)
@@ -967,4 +1016,33 @@ test('agent settlement releases its session even after provider selection change
   h.ctx.model = { provider: 'other', id: 'other' }
   h.handlers.get('agent_settled')({}, h.ctx)
   assert.deepEqual(settle.mock.calls[0].arguments, ['events-session'])
+})
+
+test('/agy-acp status scopes context window summary to active antigravity-acp model', async (t) => {
+  const home = isolateHome(t)
+  writeFileSync(
+    join(home, 'catalog.json'),
+    JSON.stringify({
+      tier: { name: 'Google AI Pro' },
+      contextWindows: { 'gemini-4-argon': 512_000 },
+    }),
+  )
+  const h = mountExtension(t, {
+    model: { provider, id: 'claude-opus-5-5', name: 'Claude Opus 5.5' },
+  })
+
+  await h.command.handler('status', h.ctx)
+  assert.match(h.notices.at(-1).text, /Context:\s+dynamic \(unprobed\)/)
+
+  await h.command.handler('status', {
+    ...h.ctx,
+    model: { provider, id: 'gemini-4-argon', name: 'Gemini 4 Argon' },
+  })
+  assert.match(h.notices.at(-1).text, /Context:\s+500K tokens/)
+
+  await h.command.handler('status', {
+    ...h.ctx,
+    model: { provider: 'anthropic', id: 'gemini-4-argon', name: 'Foreign' },
+  })
+  assert.match(h.notices.at(-1).text, /Context:\s+dynamic \(unprobed\)/)
 })

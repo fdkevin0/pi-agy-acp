@@ -7,6 +7,9 @@
 //   SLEEP <ms>              wait before ending the turn
 //   MAXTOK                  end the first segment with max_tokens
 //   USAGEUPD <n>            emit a session/update usage_update notification
+//   MAXCTX <n>              record max_context_tokens = <n> in gen_metadata
+//   NOMAXCTX                skip writing gen_metadata for this prompt
+//   PROMPT_ERR              fail session/prompt after recording gen_metadata
 //   DENYCALL <tool> <json>  native tool whose rawInput merely embeds "mcp_pi_<tool>"
 //   SPOOFCALL <tool> <json> title fakes "mcp_pi_<tool>" but no structured metadata
 //   STALECALL <tool> <json> permission claims structured metadata never reported
@@ -23,6 +26,7 @@
 import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { createInterface } from 'node:readline'
+import { DatabaseSync } from 'node:sqlite'
 
 const log = process.env.FAKE_AGY_LOG
 const initLog = process.env.FAKE_AGY_INIT
@@ -277,7 +281,63 @@ async function runToolCall(s, name, args, opts = {}) {
   return text
 }
 
+function encodeVarint(n) {
+  const out = []
+  let v = BigInt(n)
+  while (v >= 0x80n) {
+    out.push(Number((v & 0x7fn) | 0x80n))
+    v >>= 7n
+  }
+  out.push(Number(v))
+  return Uint8Array.from(out)
+}
+
+function encodeBytesField(fieldNum, payload) {
+  return Buffer.concat([
+    encodeVarint((fieldNum << 3) | 2),
+    encodeVarint(payload.length),
+    payload,
+  ])
+}
+
+function encodeGenMetadataMaxContextTokens(tokens) {
+  const ctxWindow = Buffer.concat([
+    encodeVarint((4 << 3) | 0),
+    encodeVarint(tokens),
+  ])
+  const chatStart = encodeBytesField(10, ctxWindow)
+  const chatModel = encodeBytesField(9, chatStart)
+  return encodeBytesField(1, chatModel)
+}
+
+function contextWindowForFakeModel(modelId, text) {
+  if (text.includes('NOMAXCTX')) return undefined
+  const match = /\bMAXCTX\s+(\d+)/.exec(text)
+  if (match !== null) return Number(match[1])
+  if (modelId.startsWith('gpt-oss')) return 131_072
+  if (
+    modelId === 'gemini-4-argon' ||
+    modelId === 'gemini-4-carbon' ||
+    modelId === 'gemini-4-hydrogen' ||
+    modelId.startsWith('gemini-pro-orchestrator')
+  ) {
+    return 512_000
+  }
+  return 256_000
+}
+
+function recordGenMetadata(s, text) {
+  if (!s.db) return
+  const tokens = contextWindowForFakeModel(s.model, text)
+  if (tokens === undefined) return
+  const blob = encodeGenMetadataMaxContextTokens(tokens)
+  s.db
+    .prepare('INSERT INTO gen_metadata (idx, data, size) VALUES (?, ?, ?)')
+    .run(s.metaSeq++, blob, blob.length)
+}
+
 async function runPrompt(s, text) {
+  recordGenMetadata(s, text)
   update(s.id, {
     sessionUpdate: 'agent_thought_chunk',
     content: { type: 'text', text: `thinking(${s.level})` },
@@ -539,6 +599,7 @@ async function runPrompt(s, text) {
       await new Promise((r) => setTimeout(r, Number(line.slice(6))))
     }
   }
+  if (text.includes('PROMPT_ERR')) throw new Error('synthetic prompt error')
   if (s.cancelled) return { stopReason: 'cancelled' }
   if (text.includes('MAXTOK') && !s.continued) {
     s.continued = true
@@ -601,6 +662,8 @@ rl.on('line', async (line) => {
         mcp: params.mcpServers?.[0],
         system: params._meta?.antigravity?.systemPrompt?.append ?? '',
         tools: [],
+        metaSeq: 0,
+        db: undefined,
       }
       sessions.set(s.id, s)
       if (home) {
@@ -608,8 +671,11 @@ rl.on('line', async (line) => {
         const brain = join(home, 'agy', 'brain', s.id)
         mkdirSync(conversations, { recursive: true })
         mkdirSync(brain, { recursive: true })
-        for (const suffix of ['.db', '.db-wal', '.db-shm'])
-          writeFileSync(join(conversations, `${s.id}${suffix}`), 'fake session')
+        const db = new DatabaseSync(join(conversations, `${s.id}.db`))
+        db.exec(
+          'PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS gen_metadata (idx integer PRIMARY KEY, data blob, size integer NOT NULL DEFAULT 0);',
+        )
+        s.db = db
         writeFileSync(join(brain, 'note.md'), 'fake session')
       }
       if (s.mcp && !process.env.FAKE_AGY_NO_HANDSHAKE) {
@@ -694,6 +760,7 @@ rl.on('line', async (line) => {
       return send({ jsonrpc: '2.0', id, result })
     }
     if (method === 'session/close') {
+      s?.db?.close()
       sessions.delete(params.sessionId)
       return send({ jsonrpc: '2.0', id, result: {} })
     }
@@ -710,8 +777,18 @@ rl.on('line', async (line) => {
     })
   }
 })
-rl.on('close', () => process.exit(0))
-process.stdin.on('end', () => process.exit(0))
+function shutdown() {
+  for (const s of sessions.values()) {
+    try {
+      s.db?.close()
+    } catch {
+      // Best-effort DB close on exit.
+    }
+  }
+  process.exit(0)
+}
+rl.on('close', shutdown)
+process.stdin.on('end', shutdown)
 // session/cancel notification
 rl.on('line', (line) => {
   const msg = JSON.parse(line)

@@ -172,6 +172,13 @@ export default function (
   pi.on('cache_warming_decision', (_event, ctx) =>
     ctx.model?.provider === config.provider ? { action: 'stop' } : undefined,
   )
+  pi.on('session_before_compact', (event, ctx) =>
+    ctx.model?.provider === config.provider &&
+    event.reason === 'threshold' &&
+    (ctx.model.contextWindow ?? 0) <= 0
+      ? { cancel: true }
+      : undefined,
+  )
   pi.on('model_select', (event, ctx) => {
     const retarget =
       pendingSettle &&
@@ -342,7 +349,13 @@ export default function (
       }
       const notice = snapshot
         ? formatQuota(snapshot, undefined, quotaDisplay)
-        : formatStatus(runtime.status())
+        : formatStatus(
+            runtime.status(
+              ctx.model?.provider === config.provider
+                ? ctx.model.id
+                : undefined,
+            ),
+          )
       if (epoch === uiEpoch)
         updateStatus(ctx, snapshot ?? activeRuntime?.quota.peek())
       ctx.ui.notify(notice.text, notice.level)

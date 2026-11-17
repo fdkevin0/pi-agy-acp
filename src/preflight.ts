@@ -15,23 +15,22 @@ import {
   mkdirSync,
   writeFileSync,
   readFileSync,
+  realpathSync,
   statSync,
   lstatSync,
   readdirSync,
   rmSync,
+  type Stats,
 } from 'node:fs'
 import { homedir } from 'node:os'
-import { delimiter, isAbsolute, join } from 'node:path'
+import { delimiter, isAbsolute, join, relative } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { readJson } from './config.ts'
 
 /** Agent id installed in the isolated home. */
 export const BRIDGE_AGENT = 'pi-bridge'
 /** Minimum official CLI version supporting `agy acp --process-per-session`. */
 export const MIN_AGY_VERSION: readonly [number, number, number] = [1, 4, 12]
-/** Default context window for the official CLI. */
-export const DEFAULT_CONTEXT_WINDOW = 256_000
-/** GPT-OSS 120B has its own 128K-class window. */
-export const GPT_OSS_CONTEXT_WINDOW = 131_072
 
 /** Output of one finished helper command. */
 export interface CommandOutput {
@@ -212,16 +211,246 @@ export function syncOAuthToken(
   }
 }
 
+const EMPTY_BYTES = new Uint8Array(0)
+const MAX_VARINT_SHIFT = 63n
+
+function isValidSessionId(sessionId: string): boolean {
+  return (
+    typeof sessionId === 'string' &&
+    sessionId.length > 0 &&
+    !/[^A-Za-z0-9._-]/.test(sessionId) &&
+    sessionId !== '.' &&
+    !sessionId.includes('..')
+  )
+}
+
+function readVarint(
+  buf: Uint8Array,
+  start: number,
+): { value: bigint; next: number } | undefined {
+  let value = 0n
+  let shift = 0n
+  let pos = start
+  while (pos < buf.length && shift <= MAX_VARINT_SHIFT) {
+    const byte = buf[pos++] as number
+    value |= BigInt(byte & 0x7f) << shift
+    if ((byte & 0x80) === 0) return { value, next: pos }
+    shift += 7n
+  }
+  return undefined
+}
+
+function skipField(
+  buf: Uint8Array,
+  pos: number,
+  wireType: number,
+): number | undefined {
+  if (wireType === 0) return readVarint(buf, pos)?.next
+  if (wireType === 1) return pos + 8 <= buf.length ? pos + 8 : undefined
+  if (wireType === 2) {
+    const len = readVarint(buf, pos)
+    if (len === undefined) return undefined
+    const byteLen = Number(len.value)
+    if (!Number.isSafeInteger(byteLen) || byteLen < 0) return undefined
+    const end = len.next + byteLen
+    return end <= buf.length ? end : undefined
+  }
+  if (wireType === 5) return pos + 4 <= buf.length ? pos + 4 : undefined
+  return undefined
+}
+
+function scanMessage<T>(
+  buf: Uint8Array,
+  targetField: number,
+  expectedWireType: 0 | 2,
+  onMatch: (payload: Uint8Array, varint: bigint) => T | undefined,
+): T | undefined {
+  let pos = 0
+  let result: T | undefined
+  while (pos < buf.length) {
+    const tag = readVarint(buf, pos)
+    if (tag === undefined) break
+    pos = tag.next
+    const fieldNumber = Number(tag.value >> 3n)
+    const wireType = Number(tag.value & 7n)
+    if (fieldNumber <= 0) break
+    if (fieldNumber === targetField && wireType === expectedWireType) {
+      if (wireType === 0) {
+        const val = readVarint(buf, pos)
+        if (val === undefined) break
+        pos = val.next
+        const matched = onMatch(EMPTY_BYTES, val.value)
+        if (matched !== undefined) result = matched
+        continue
+      }
+      const len = readVarint(buf, pos)
+      if (len === undefined) break
+      const byteLen = Number(len.value)
+      if (!Number.isSafeInteger(byteLen) || byteLen < 0) break
+      const end = len.next + byteLen
+      if (end > buf.length) break
+      const matched = onMatch(buf.subarray(len.next, end), 0n)
+      if (matched !== undefined) result = matched
+      pos = end
+      continue
+    }
+    const next = skipField(buf, pos, wireType)
+    if (next === undefined) break
+    pos = next
+  }
+  return result
+}
+
+/**
+ * Decode `max_context_tokens` from `gen_metadata.data` along protobuf wire path
+ * `1 (bytes) -> 9 (bytes) -> 10 (bytes) -> 4 (varint)`.
+ * @param blob - raw protobuf bytes from `gen_metadata.data`.
+ * @returns positive token count, or `undefined` when absent or malformed.
+ */
+export function extractMaxContextTokens(blob: Uint8Array): number | undefined {
+  if (!(blob instanceof Uint8Array) || blob.length === 0) return undefined
+  return scanMessage(blob, 1, 2, (chatModel) =>
+    scanMessage(chatModel, 9, 2, (chatStart) =>
+      scanMessage(chatStart, 10, 2, (ctxWindow) =>
+        scanMessage(ctxWindow, 4, 0, (_empty, value) => {
+          const num = Number(value)
+          return value > 0n && Number.isSafeInteger(num) ? num : undefined
+        }),
+      ),
+    ),
+  )
+}
+
+function lstatOrMissing(path: string): Stats | 'missing' | 'invalid' {
+  try {
+    return lstatSync(path)
+  } catch (error) {
+    return (error as NodeJS.ErrnoException)?.code === 'ENOENT'
+      ? 'missing'
+      : 'invalid'
+  }
+}
+
+function resolveSessionDbPath(
+  home: string,
+  sessionId: string,
+): { kind: 'ok'; dbPath: string } | { kind: 'missing' } | { kind: 'invalid' } {
+  if (!isValidSessionId(sessionId)) return { kind: 'invalid' }
+  const appData = join(home, 'agy')
+  const appStat = lstatOrMissing(appData)
+  if (appStat === 'missing') return { kind: 'missing' }
+  if (
+    appStat === 'invalid' ||
+    appStat.isSymbolicLink() ||
+    !appStat.isDirectory()
+  )
+    return { kind: 'invalid' }
+
+  const convDir = join(appData, 'conversations')
+  const convStat = lstatOrMissing(convDir)
+  if (convStat === 'missing') return { kind: 'missing' }
+  if (
+    convStat === 'invalid' ||
+    convStat.isSymbolicLink() ||
+    !convStat.isDirectory()
+  )
+    return { kind: 'invalid' }
+
+  let realHome: string
+  let realConvDir: string
+  try {
+    realHome = realpathSync(home)
+    realConvDir = realpathSync(convDir)
+  } catch {
+    return { kind: 'invalid' }
+  }
+  const rel = relative(realHome, realConvDir)
+  if (rel.startsWith('..') || isAbsolute(rel)) return { kind: 'invalid' }
+
+  const dbPath = join(convDir, `${sessionId}.db`)
+  const dbStat = lstatOrMissing(dbPath)
+  if (dbStat === 'missing') return { kind: 'missing' }
+  if (dbStat === 'invalid' || dbStat.isSymbolicLink() || !dbStat.isFile())
+    return { kind: 'invalid' }
+
+  return { kind: 'ok', dbPath }
+}
+
+/**
+ * Read server-issued `max_context_tokens` from one ACP session's SQLite database.
+ * @param home - isolated `--gemini-dir` root.
+ * @param sessionId - ACP session id.
+ * @param minIdx - lowest `gen_metadata.idx` owned by the current model.
+ * @returns positive `max_context_tokens`, or `undefined` when unavailable.
+ */
+export function readSessionMaxContextTokens(
+  home: string,
+  sessionId: string,
+  minIdx = 0,
+): number | undefined {
+  if (typeof minIdx !== 'number' || !Number.isSafeInteger(minIdx) || minIdx < 0)
+    return undefined
+  const resolved = resolveSessionDbPath(home, sessionId)
+  if (resolved.kind !== 'ok') return undefined
+  let db: DatabaseSync | undefined
+  try {
+    db = new DatabaseSync(resolved.dbPath, { readOnly: true, timeout: 50 })
+    const stmt = db.prepare(
+      'SELECT data FROM gen_metadata WHERE idx >= ? ORDER BY idx DESC',
+    )
+    for (const row of stmt.iterate(minIdx) as Iterable<{ data?: unknown }>) {
+      if (!(row.data instanceof Uint8Array)) continue
+      const tokens = extractMaxContextTokens(row.data)
+      if (tokens !== undefined) return tokens
+    }
+    return undefined
+  } catch {
+    return undefined
+  } finally {
+    db?.close()
+  }
+}
+
+/**
+ * Compute the next `gen_metadata.idx` floor (`MAX(idx) + 1`, or `0` when no rows exist)
+ * before switching models inside a reused ACP session. Returns `null` when the
+ * session database path is invalid, symlinked, corrupt, or unreadable (fail-closed).
+ */
+export function readSessionNextMetadataIndex(
+  home: string,
+  sessionId: string,
+): number | null {
+  const resolved = resolveSessionDbPath(home, sessionId)
+  if (resolved.kind === 'missing') return 0
+  if (resolved.kind === 'invalid') return null
+  let db: DatabaseSync | undefined
+  try {
+    db = new DatabaseSync(resolved.dbPath, { readOnly: true, timeout: 50 })
+    const hasTable = db
+      .prepare(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'gen_metadata'",
+      )
+      .get()
+    if (hasTable === undefined) return 0
+    const row = db
+      .prepare('SELECT MAX(idx) AS maxIdx FROM gen_metadata')
+      .get() as { maxIdx?: unknown } | undefined
+    if (row?.maxIdx === null || row?.maxIdx === undefined) return 0
+    if (typeof row.maxIdx === 'number' && Number.isSafeInteger(row.maxIdx)) {
+      const next = row.maxIdx + 1
+      return Number.isSafeInteger(next) ? Math.max(0, next) : null
+    }
+    return null
+  } catch {
+    return null
+  } finally {
+    db?.close()
+  }
+}
+
 /** Remove only one closed ACP session's files; session ids come from the agent. */
 export function removeSessionArtifacts(home: string, sessionId: string): void {
-  if (
-    typeof sessionId !== 'string' ||
-    sessionId.length === 0 ||
-    /[^A-Za-z0-9._-]/.test(sessionId) ||
-    sessionId === '.' ||
-    sessionId.includes('..')
-  )
-    return
+  if (!isValidSessionId(sessionId)) return
   const appData = join(home, 'agy')
   if (!isRealDirectory(appData)) return
   removeArtifacts(join(appData, 'conversations'), [
