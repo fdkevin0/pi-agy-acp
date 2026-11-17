@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/fdkevin0/pi-agy-acp/compare/v0.1.4...v0.2.0) (2026-11-17)
+
+
+### Features
+
+* discover model context windows dynamically from session metadata ([#29](https://github.com/fdkevin0/pi-agy-acp/issues/29)) ([c29277f](https://github.com/fdkevin0/pi-agy-acp/commit/c29277ff3e8c64b9549444b14177bcfd283ef50a))
+
 ## [0.1.4](https://github.com/fdkevin0/pi-agy-acp/compare/v0.1.3...v0.1.4) (2026-11-15)
 
 
