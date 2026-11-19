@@ -40,20 +40,27 @@ const rl = createInterface({ input: process.stdin })
 const send = (m) => process.stdout.write(`${JSON.stringify(m)}\n`)
 const MODELS = [
   { value: 'gemini-4-argon', name: 'Gemini 4 Argon' },
+  { value: 'gemini-4-neon', name: 'Gemini 4 Neon' },
   { value: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash' },
   { value: 'claude-opus-5-5', name: 'Claude Opus 5.5' },
   { value: 'claude-sonnet-5-5', name: 'Claude Sonnet 5.5' },
   { value: 'gpt-oss-120b-medium', name: 'GPT-OSS 120B (Medium)' },
 ]
 // One entry per effort variant, exactly like a live ACP session.
+// Only Neon offers xhigh, like a Google AI Pro account.
+const levelsFor = (id) =>
+  id === 'gemini-4-neon'
+    ? ['low', 'medium', 'high', 'xhigh']
+    : ['low', 'medium', 'high']
 const availableModels = () => [
   ...[
     'gemini-4-argon',
+    'gemini-4-neon',
     'gemini-3.8-flash',
     'claude-opus-5-5',
     'claude-sonnet-5-5',
   ].flatMap((id) =>
-    ['low', 'medium', 'high'].map((level) => ({
+    levelsFor(id).map((level) => ({
       modelId: `${id}-${level}`,
       name: `${id} (${level})`,
     })),
@@ -728,6 +735,16 @@ rl.on('line', async (line) => {
       if (params.configId === 'thought_level') {
         // Fixed-variant families do not expose a thinking-level selector.
         if (s.model.startsWith('gpt-oss')) {
+          return send({
+            jsonrpc: '2.0',
+            id,
+            error: {
+              code: -32602,
+              message: `Thinking level "${params.value}" is not offered for model "${s.model}"`,
+            },
+          })
+        }
+        if (!levelsFor(s.model).includes(params.value)) {
           return send({
             jsonrpc: '2.0',
             id,

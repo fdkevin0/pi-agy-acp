@@ -443,3 +443,18 @@ test('streamPi preserves cumulative turn pricing while feeding live context occu
     rmSync(home, { recursive: true, force: true })
   }
 })
+
+test('Pi xhigh and max reach the runtime as xhigh, and the lower levels are unchanged', async () => {
+  const seen = []
+  const runtime = {
+    async *stream(request) {
+      seen.push(request.reasoningEffort)
+      yield { type: 'finish', reason: { kind: 'stop' } }
+    },
+  }
+  const ctx = context(system, user('hi'))
+  for (const reasoning of ['minimal', 'low', 'medium', 'high', 'xhigh', 'max']) {
+    await result(runtime, ctx, { sessionId: 'effort', reasoning })
+  }
+  assert.deepEqual(seen, ['low', 'low', 'medium', 'high', 'xhigh', 'xhigh'])
+})

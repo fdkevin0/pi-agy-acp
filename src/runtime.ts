@@ -496,10 +496,9 @@ export class AntigravityRuntime {
       const split = splitSystem(options)
       const tools = toBridgeTools(options.tools)
       conv.toolNames = new Set(tools.map((t) => t.name))
-      const effort = this.effectiveEffort(
-        options.model,
-        asEffort(options.reasoningEffort) ?? this.host.config.defaultEffort,
-      )
+      const requestedEffort =
+        asEffort(options.reasoningEffort) ?? this.host.config.defaultEffort
+      let effort = this.effectiveEffort(options.model, requestedEffort)
 
       if (options.signal?.aborted) {
         this.dropTurn(conv, 'The harness cancelled this request.')
@@ -557,6 +556,8 @@ export class AntigravityRuntime {
       if (conv.sessionId === undefined) {
         conv.systemHash = digest(split.system)
         supplementalTools = await this.openSession(conv, tools, proc)
+        // The new session may report efforts the cached catalog did not know.
+        effort = this.effectiveEffort(options.model, requestedEffort)
       }
       this.assertOwner(proc, conv, conv.sessionId)
       await this.select(conv, proc, options.model, effort)
