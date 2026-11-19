@@ -33,7 +33,7 @@ export const FALLBACK_MODELS: readonly CatalogModel[] = [
 ]
 
 /** An id that already names one fixed effort instead of a selectable family. */
-const FIXED_EFFORT = /-(low|medium|high)$/
+const FIXED_EFFORT = /-(low|medium|high|xhigh)$/
 
 function normalizeTier(
   tier: AcpTierInfo | undefined,
@@ -72,7 +72,8 @@ function isValidContextWindow(value: unknown): value is number {
 export class ModelCatalog {
   private models: CatalogModel[]
   private tierInfo: { id?: string; name: string } | undefined
-  private efforts: Effort[] = [...EFFORTS]
+  /** Until a live session reports otherwise, a family is assumed to offer these. */
+  private efforts: Effort[] = ['low', 'medium', 'high']
   /** Efforts per model family; an empty array marks a fixed-effort model. */
   private byModel = new Map<string, Effort[]>()
   /** Server-reported `max_context_tokens` keyed by model id. */

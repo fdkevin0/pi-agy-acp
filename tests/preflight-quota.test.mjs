@@ -23,7 +23,7 @@ import {
 } from '../src/preflight.ts'
 import { defaults } from '../src/config.ts'
 import { AntigravityRuntime } from '../src/runtime.ts'
-import { ModelCatalog, FALLBACK_MODELS } from '../src/catalog.ts'
+import { ModelCatalog, FALLBACK_MODELS, nearestEffort } from '../src/catalog.ts'
 import extension from '../index.ts'
 import { formatQuota, formatStatus } from '../src/format.ts'
 import { parseUsage, QuotaReader, readLoggedEmail } from '../src/quota.ts'
@@ -126,6 +126,55 @@ test('session cleanup is scoped, idempotent, and refuses path traversal or linke
   assert.equal(readFileSync(join(outside, 'linked.db'), 'utf8'), 'untouched')
   prepareHome(home, join(home, 'no-user-auth'))
   assert.equal(readFileSync(join(outside, 'linked.db'), 'utf8'), 'untouched')
+})
+
+test('the catalog offers xhigh only for families whose inventory lists it', (t) => {
+  const root = isolateHome(t)
+  const path = join(root, 'catalog.json')
+  const catalog = new ModelCatalog(path)
+  const available = [
+    ...['low', 'medium', 'high', 'xhigh'].map((e) => ({
+      modelId: `gemini-4-neon-${e}`,
+      name: `Gemini 4 Neon (${e})`,
+    })),
+    ...['low', 'medium', 'high'].map((e) => ({
+      modelId: `gemini-4-argon-${e}`,
+      name: `Gemini 4 Argon (${e})`,
+    })),
+    { modelId: 'gpt-oss-120b-medium', name: 'GPT-OSS 120B' },
+  ]
+  // Before a live session reports, no fallback family advertises xhigh.
+  assert.deepEqual(catalog.effortsFor('gemini-4-argon'), [
+    'low',
+    'medium',
+    'high',
+  ])
+  catalog.observe(
+    [
+      {
+        id: 'model',
+        options: [
+          { value: 'gemini-4-neon', name: 'Gemini 4 Neon' },
+          { value: 'gemini-4-argon', name: 'Gemini 4 Argon' },
+          { value: 'gpt-oss-120b-medium', name: 'GPT-OSS 120B' },
+        ],
+      },
+    ],
+    available,
+  )
+  const full = ['low', 'medium', 'high', 'xhigh']
+  assert.deepEqual(catalog.effortsFor('gemini-4-neon'), full)
+  assert.deepEqual(catalog.effortsFor('gemini-4-argon'), [
+    'low',
+    'medium',
+    'high',
+  ])
+  assert.equal(catalog.fixedEffort('gemini-4-neon-xhigh'), 'xhigh')
+  assert.equal(catalog.fixedEffort('gemini-4-neon'), undefined)
+  assert.equal(catalog.fixedEffort('gpt-oss-120b-medium'), 'medium')
+  assert.deepEqual(new ModelCatalog(path).effortsFor('gemini-4-neon'), full)
+  assert.equal(nearestEffort('xhigh', ['low', 'medium', 'high']), 'high')
+  assert.equal(nearestEffort('xhigh', full), 'xhigh')
 })
 
 test('tier-only metadata is validated and persisted without model changes', (t) => {

@@ -67,7 +67,7 @@ export default function (
                 low: efforts.includes('low') ? 'low' : null,
                 medium: efforts.includes('medium') ? 'medium' : null,
                 high: efforts.includes('high') ? 'high' : null,
-                xhigh: null,
+                xhigh: efforts.includes('xhigh') ? 'xhigh' : null,
                 max: null,
               }
             : undefined,

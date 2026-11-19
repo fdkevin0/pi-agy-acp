@@ -134,8 +134,9 @@ Loading the extension uses the cached catalog, or five fallback model families,
 without starting agy. Model refresh or the first request updates available models
 and reasoning levels from ACP. A forced refresh queries again; refreshes can be
 cancelled. The selector exposes only the reasoning levels offered for each model.
-Direct requests map `minimal` to `low` and `xhigh` or `max` to `high`; `off` uses
-the runtime default.
+Direct requests map `minimal` to `low` and `max` to `xhigh`; `off` uses the
+runtime default. A family that does not offer the requested effort runs at the
+nearest one it offers, so `xhigh` or `max` runs at `high` on families without `xhigh`.
 
 The fallback families are:
 

@@ -1224,6 +1224,40 @@ test('Claude honors the requested thinking level', async (t) => {
   assert.equal(prompts()[0].level, 'high')
 })
 
+test('xhigh runs on a family that offers it and falls back to high on one that does not', async (t) => {
+  const { adapter, prompts } = makeRuntime(t)
+  for (const [model, session] of [
+    ['gemini-4-neon', 'S14-neon'],
+    ['gemini-4-argon', 'S14-argon'],
+  ]) {
+    const chunks = await collect(
+      adapter.stream({
+        provider: 'antigravity',
+        model,
+        reasoningEffort: 'xhigh',
+        sessionId: session,
+        messages: [sys, user('u1', 'hello')],
+      }),
+    )
+    assert.equal(finishOf(chunks).reason.kind, 'stop')
+  }
+  assert.equal(prompts()[0].model, 'gemini-4-neon')
+  assert.equal(prompts()[0].level, 'xhigh')
+  assert.equal(prompts()[1].model, 'gemini-4-argon')
+  assert.equal(prompts()[1].level, 'high')
+  assert.deepEqual(adapter.catalog.effortsFor('gemini-4-neon'), [
+    'low',
+    'medium',
+    'high',
+    'xhigh',
+  ])
+  assert.deepEqual(adapter.catalog.effortsFor('gemini-4-argon'), [
+    'low',
+    'medium',
+    'high',
+  ])
+})
+
 test('a fixed-effort family still runs at medium without a thought_level write', async (t) => {
   const { adapter, prompts } = makeRuntime(t)
   const chunks = await collect(
