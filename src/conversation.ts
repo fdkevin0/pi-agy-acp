@@ -19,7 +19,11 @@ import type {
   AcpPermissionRequest,
   AcpToolCallMeta,
 } from './acp-process.ts'
-import type { BridgeTool, BridgeToolResult } from './mcp-bridge.ts'
+import type {
+  BridgeCallRequest,
+  BridgeTool,
+  BridgeToolResult,
+} from './mcp-bridge.ts'
 import {
   AGENT_TOOL_PREFIX,
   CALL_TOOL_NAME,
@@ -67,8 +71,10 @@ export function classifyOutputLimitNotice(
 ): 'drop' | 'hold' | 'emit' {
   const text = noticeText(raw)
   if (text.length === 0) return raw.includes('⚠') ? 'hold' : 'emit'
+  // Terminal exhaustion (`Retries remaining: 0`) must surface immediately instead of being dropped or held.
+  if (/\bretries remaining:\s*0+$/i.test(text)) return 'emit'
   if (/^there was a problem\b/.test(text)) {
-    if (/\bretries remaining:\s*\d+$/.test(text)) return 'drop'
+    if (/\bretries remaining:\s*[1-9]\d*$/.test(text)) return 'drop'
     return text.length <= MAX_PROBLEM_NOTICE_CHARS ? 'hold' : 'emit'
   }
   if (PROBLEM_RETRY_PREFIX.startsWith(text) && text.startsWith('there was'))
@@ -78,7 +84,7 @@ export function classifyOutputLimitNotice(
   if (retry.length > 0 && !/^retries remaining:\s*\d*$/i.test(retry))
     return 'emit'
   if (stripped.length === 0) {
-    if (/^retries remaining:\s*\d+$/i.test(text)) return 'drop'
+    if (/^retries remaining:\s*[1-9]\d*$/i.test(text)) return 'drop'
     return /^retries remaining:\s*$/i.test(text) ? 'hold' : 'emit'
   }
   const full = `${OUTPUT_LIMIT_HEAD} ${OUTPUT_LIMIT_TAIL}`
@@ -89,8 +95,11 @@ export function classifyOutputLimitNotice(
     stripped === STREAM_INTERRUPTED ||
     stripped === EMPTY_MODEL_OUTPUT ||
     stripped === EMPTY_MODEL_OUTPUT_BODY
-  )
-    return 'drop'
+  ) {
+    if (retry.length === 0 || /^retries remaining:\s*[1-9]\d*$/i.test(retry))
+      return 'drop'
+    return /^retries remaining:\s*$/i.test(retry) ? 'hold' : 'emit'
+  }
   if (full.startsWith(stripped) && stripped.startsWith('your previous'))
     return 'hold'
   if (
@@ -216,6 +225,8 @@ export class AcpTurn {
   lastStepIdx: number | null = -1
   /** Per-call relay lifecycle: waiting (gating `relayBuffer`) -> unawaited -> notified. */
   private readonly relays = new Map<string, RelayEntry>()
+  /** Per-call MCP delivery ownership: absent (idle), waiting (active MCP handler), or delivered (committed). */
+  private readonly callDelivery = new Map<string, 'waiting' | 'delivered'>()
   /** Tool deltas and steering text deferred until an active MCP call returns a real result. */
   private readonly pendingSuffix: string[] = []
   /** Bounded output buffered while one or more calls are relayed. */
@@ -298,8 +309,9 @@ export class AcpTurn {
     args: Record<string, unknown>,
     relayAfterMs: number,
     signal: AbortSignal,
+    commit?: BridgeCallRequest['commit'],
   ): Promise<BridgeToolResult> {
-    return this.awaitCall(this.park(name, args), relayAfterMs, signal)
+    return this.awaitCall(this.park(name, args), relayAfterMs, signal, commit)
   }
 
   /** Resume waiting on a previously parked call via `pi_await_result`, or return undefined if unknown. */
@@ -307,11 +319,40 @@ export class AcpTurn {
     callId: string,
     relayAfterMs: number,
     signal: AbortSignal,
+    commit?: BridgeCallRequest['commit'],
   ): Promise<BridgeToolResult> | undefined {
     const call = this.calls.get(callId)
     if (call === undefined) return undefined
+    const status = this.callDelivery.get(callId)
+    if (status === 'delivered') {
+      return Promise.resolve({
+        content: [
+          {
+            type: 'text',
+            text: `Tool call ${callId} result was already delivered.`,
+          },
+        ],
+      })
+    }
+    if (status === 'waiting') {
+      return Promise.resolve({
+        content: [
+          {
+            type: 'text',
+            text: `Tool call ${callId} is already being awaited.`,
+          },
+        ],
+        isError: true,
+      })
+    }
+    if (signal.aborted) {
+      return Promise.resolve({
+        content: [{ type: 'text', text: 'The tool call was cancelled.' }],
+        isError: true,
+      })
+    }
     this.resumeRelay(callId)
-    return this.awaitCall(call, relayAfterMs, signal)
+    return this.awaitCall(call, relayAfterMs, signal, commit)
   }
 
   get isRelaying(): boolean {
@@ -399,7 +440,9 @@ export class AcpTurn {
     call: ParkedCall,
     relayAfterMs: number,
     signal: AbortSignal,
+    commit?: BridgeCallRequest['commit'],
   ): Promise<BridgeToolResult> {
+    this.callDelivery.set(call.id, 'waiting')
     let timer: ReturnType<typeof setTimeout> | undefined
     const relay = new Promise<'relay'>((resolve) => {
       timer = setTimeout(() => resolve('relay'), relayAfterMs)
@@ -414,18 +457,24 @@ export class AcpTurn {
     })
     try {
       const outcome = await Promise.race([call.result.promise, relay, aborted])
-      if (outcome === 'relay') {
-        this.markRelayed(call.id)
-        return relayNotice(call)
-      }
-      if (outcome === 'aborted') {
+      // Check signal.aborted first to close the same-tick Promise.race tie where
+      // call.result.promise precedes aborted.
+      if (signal.aborted || outcome === 'aborted') {
         return {
           content: [{ type: 'text', text: 'The tool call was cancelled.' }],
           isError: true,
         }
       }
-      return this.deliverCallResult(call.id, outcome)
+      if (outcome === 'relay') {
+        this.markRelayed(call.id)
+        return relayNotice(call)
+      }
+      return commit !== undefined
+        ? commit(() => this.deliverCallResult(call.id, outcome))
+        : this.deliverCallResult(call.id, outcome)
     } finally {
+      if (this.callDelivery.get(call.id) === 'waiting')
+        this.callDelivery.delete(call.id)
       if (timer !== undefined) clearTimeout(timer)
       if (onAbort !== undefined) signal.removeEventListener('abort', onAbort)
     }
@@ -447,6 +496,7 @@ export class AcpTurn {
     callId: string,
     result: BridgeToolResult,
   ): BridgeToolResult {
+    this.callDelivery.set(callId, 'delivered')
     this.relays.delete(callId)
     this.releaseRelayWait()
     const notes: string[] = []
@@ -904,6 +954,7 @@ async function* stepChunks(
         const stop = event.result.stopReason
         if (
           stop === 'max_tokens' &&
+          !turn.isRelaying &&
           turn.continuations < host.maxContinuations
         ) {
           turn.continuations++

@@ -1950,3 +1950,68 @@ test('extractContextWindowMetadata decodes estimated_tokens_used and SQLite reje
   )
   assert.equal(readSessionCursors(home, 'dir-wal'), null)
 })
+
+test('ModelCatalog uses exact modelId matching in deriveEfforts and preserves global effort union across active models', (t) => {
+  const root = isolateHome(t)
+  const catalog = new ModelCatalog(join(root, 'catalog.json'))
+
+  catalog.observe(
+    [
+      {
+        id: 'model',
+        options: [
+          { value: 'gemini-3-pro', name: 'Gemini 3 Pro' },
+          { value: 'gemini-4-argon', name: 'Gemini 4 Argon' },
+          { value: 'claude-opus-5-5', name: 'Claude Opus 5.5' },
+          { value: 'gpt-oss-120b-medium', name: 'GPT-OSS 120B (Medium)' },
+        ],
+      },
+      {
+        id: 'thought_level',
+        options: [{ value: 'low' }, { value: 'high' }],
+      },
+    ],
+    [
+      // Unrelated sibling sharing prefix must NOT classify gemini-3-pro as fixed-effort.
+      { modelId: 'gemini-3-pro-image' },
+      { modelId: 'gemini-4-argon-low-effort' },
+      { modelId: 'gemini-4-argon-high-effort' },
+      { modelId: 'claude-opus-5-5-high-effort' },
+      { modelId: 'claude-opus-5-5-xhigh-effort' },
+      { modelId: 'claude-opus-5-5-max-effort' },
+      { modelId: 'gpt-oss-120b-medium' },
+    ],
+  )
+
+  assert.equal(catalog.supportsEffortSelection('gemini-3-pro'), true)
+  assert.equal(catalog.supportsEffortSelection('gpt-oss-120b-medium'), false)
+  assert.deepEqual(catalog.effortList(), ['low', 'high', 'xhigh', 'max'])
+  assert.deepEqual(catalog.effortsFor('gemini-3-pro'), ['low', 'high', 'xhigh', 'max'])
+
+  // A subsequent config_option_update with restricted thought_level keeps the global union.
+  catalog.observe([
+    {
+      id: 'thought_level',
+      options: [{ value: 'low' }, { value: 'high' }],
+    },
+  ])
+  assert.deepEqual(catalog.effortList(), ['low', 'high', 'xhigh', 'max'])
+
+  // Removing claude-opus-5-5 from model options prunes its byModel entry and recomputes global union.
+  const prunedChanged = catalog.observe([
+    {
+      id: 'model',
+      options: [
+        { value: 'gemini-3-pro', name: 'Gemini 3 Pro' },
+        { value: 'gemini-4-argon', name: 'Gemini 4 Argon' },
+        { value: 'gpt-oss-120b-medium', name: 'GPT-OSS 120B (Medium)' },
+      ],
+    },
+    {
+      id: 'thought_level',
+      options: [{ value: 'low' }, { value: 'high' }],
+    },
+  ])
+  assert.equal(prunedChanged, true)
+  assert.deepEqual(catalog.effortList(), ['low', 'high'])
+})
