@@ -194,6 +194,27 @@ export interface QuotaSnapshot {
   account?: AccountInfo
 }
 
+function parseBucket(raw: unknown): QuotaBucket | undefined {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw))
+    return undefined
+  const bucket = raw as Record<string, unknown>
+  if (bucket.disabled === true) return undefined
+  const id = String(bucket.id ?? '').trim()
+  const window = String(bucket.window ?? '').trim()
+  if (id.length === 0 || window.length === 0) return undefined
+  return {
+    id,
+    name: String(bucket.name ?? ''),
+    window,
+    remainingFraction:
+      typeof bucket.remaining_fraction === 'number' &&
+      Number.isFinite(bucket.remaining_fraction)
+        ? bucket.remaining_fraction
+        : undefined,
+    resetTime: String(bucket.reset_time ?? ''),
+  }
+}
+
 /**
  * Parse `agy -p /usage --output-format json` output.
  * @param stdout - command stdout.
@@ -215,20 +236,9 @@ export function parseUsage(stdout: string): QuotaGroup[] {
     return {
       name: String(group.name ?? ''),
       description: String(group.description ?? ''),
-      buckets: (Array.isArray(group.buckets) ? group.buckets : []).map((b) => {
-        const bucket = b as Record<string, unknown>
-        return {
-          id: String(bucket.id ?? ''),
-          name: String(bucket.name ?? ''),
-          window: String(bucket.window ?? ''),
-          remainingFraction:
-            typeof bucket.remaining_fraction === 'number' &&
-            Number.isFinite(bucket.remaining_fraction)
-              ? bucket.remaining_fraction
-              : undefined,
-          resetTime: String(bucket.reset_time ?? ''),
-        }
-      }),
+      buckets: (Array.isArray(group.buckets) ? group.buckets : [])
+        .map(parseBucket)
+        .filter((bucket): bucket is QuotaBucket => bucket !== undefined),
     }
   })
 }
@@ -236,27 +246,36 @@ export function parseUsage(stdout: string): QuotaGroup[] {
 /** Cached quota reader with request coalescing. */
 export class QuotaReader {
   private cached: QuotaSnapshot | undefined
-  private cachedAt = 0
+  // Monotonic `performance.now()` starts near 0, so `-Infinity` guarantees an empty cache is never fresh.
+  private cachedAt = -Infinity
   private inflight: Promise<QuotaSnapshot> | undefined
   private readonly binary: () => string
   private readonly run: CommandRunner
   private readonly ttlMs: number
+  private readonly now: () => number
 
   /**
    * @param binary - returns the agy executable.
    * @param run - helper command runner.
    * @param ttlMs - cache lifetime.
+   * @param now - monotonic clock in milliseconds.
    */
-  constructor(binary: () => string, run: CommandRunner, ttlMs: number) {
+  constructor(
+    binary: () => string,
+    run: CommandRunner,
+    ttlMs: number,
+    now: () => number = () => performance.now(),
+  ) {
     this.binary = binary
     this.run = run
     this.ttlMs = ttlMs
+    this.now = now
   }
 
   /** Fresh successful data only; never starts a command. */
   peek(): QuotaSnapshot | undefined {
     return this.cached?.status === 'ok' &&
-      Date.now() - this.cachedAt < this.ttlMs
+      this.now() - this.cachedAt < this.ttlMs
       ? this.cached
       : undefined
   }
@@ -274,7 +293,7 @@ export class QuotaReader {
     if (
       !force &&
       this.cached !== undefined &&
-      Date.now() - this.cachedAt < this.ttlMs
+      this.now() - this.cachedAt < this.ttlMs
     )
       return this.cached
     this.inflight ??= this.fetch().finally(() => {
@@ -317,7 +336,7 @@ export class QuotaReader {
         groups: parseUsage(result.stdout),
       }
       this.cached = snapshot
-      this.cachedAt = Date.now()
+      this.cachedAt = this.now()
       return snapshot
     } catch (error) {
       const snapshot: QuotaSnapshot = {
@@ -328,7 +347,7 @@ export class QuotaReader {
       }
       // Apply the same TTL to failures so settled events cannot hammer an unavailable CLI.
       this.cached = snapshot
-      this.cachedAt = Date.now()
+      this.cachedAt = this.now()
       return snapshot
     }
   }

@@ -26,7 +26,7 @@ import type { QuotaSnapshot } from './src/quota.ts'
 
 export default function (
   pi: ExtensionAPI,
-  host: Partial<Pick<RuntimeHost, 'runCommand' | 'spawnAcp'>> = {},
+  host: Partial<Pick<RuntimeHost, 'runCommand' | 'spawnAcp' | 'quotaNow'>> = {},
 ) {
   const envQuotaDisplay = asQuotaDisplay(process.env.PI_AGY_QUOTA_DISPLAY)
   const config = {
@@ -40,6 +40,7 @@ export default function (
       config,
       spawnAcp: host.spawnAcp ?? spawnAcp,
       runCommand: host.runCommand ?? runCommand,
+      quotaNow: host.quotaNow,
       log: { info: () => {}, warn: () => {} },
       onModelsChanged: () => {
         if (refreshDepth === 0) register()

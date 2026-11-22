@@ -36,9 +36,11 @@ will not appear after cancellation. Non-TUI modes query directly without a loade
 
 Quota is read through `agy -p /usage --output-format json`. Each model group has
 one row per quota window, with a 12-cell bar, a rounded percentage, and a relative
-reset time. By default (`used` mode), bars and percentages count up from `0%`; pass
-`remaining` (`/agy-acp quota remaining`) to count down from `100%`. The last
-selected mode is saved in `settings.json` inside `PI_AGY_HOME`. For example:
+reset time (omitted for untouched rolling windows at `0%` used / `100%` remaining
+whose reset time is still a full window away). By default (`used` mode), bars and
+percentages count up from `0%`; pass `remaining` (`/agy-acp quota remaining`) to
+count down from `100%`. The last selected mode is saved in `settings.json` inside
+`PI_AGY_HOME`. For example:
 
 ```text
 Antigravity Quota
@@ -46,7 +48,7 @@ Antigravity Quota
 
   Gemini Models
     Gemini Flash, Gemini Pro
-    5h      [░░░░░░░░░░░░]   0% · resets in 4h 59m
+    5h      [░░░░░░░░░░░░]   0%
     weekly  [█░░░░░░░░░░░]   9% · resets in 6d 7h
 ```
 

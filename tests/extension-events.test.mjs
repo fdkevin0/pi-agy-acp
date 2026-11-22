@@ -75,6 +75,7 @@ const usageOutput = (items) => ({
             window: b.window,
             remaining_fraction: b.remainingFraction,
             reset_time: b.resetTime ?? '',
+            disabled: b.disabled,
           })),
         })),
       },
@@ -132,7 +133,11 @@ function mountExtension(t, options = {}) {
         handlers.set(event, handler)
       },
     },
-    { runCommand: options.runCommand, spawnAcp: options.spawnAcp },
+    {
+      runCommand: options.runCommand,
+      spawnAcp: options.spawnAcp,
+      quotaNow: options.quotaNow,
+    },
   )
   const ctx = {
     sessionManager: { getSessionId: () => 'events-session' },
@@ -213,7 +218,6 @@ test('refresh does not re-register and abort itself, forwards force/signal, and 
 
 test('lifecycle uses light resets, cache warming stops only for this provider, and selecting models only reads fresh memory', async (t) => {
   let now = 1_000_000
-  t.mock.method(Date, 'now', () => now)
   const light = t.mock.method(
     AntigravityRuntime.prototype,
     'resetConversations',
@@ -225,7 +229,7 @@ test('lifecycle uses light resets, cache warming stops only for this provider, a
     async () => {},
   )
   const runCommand = t.mock.fn(async () => usageOutput(liveGroups()))
-  const h = harness(t, { runCommand })
+  const h = harness(t, { runCommand, quotaNow: () => now })
 
   assert.deepEqual(h.handlers.get('cache_warming_decision')({}, h.ctx), {
     action: 'stop',
@@ -346,10 +350,9 @@ test('lifecycle uses light resets, cache warming stops only for this provider, a
 
 test('settled checks are nonblocking, coalesced, deduplicate waterlines, and retarget across intra-provider model switches', async (t) => {
   let now = 1_000_000
-  t.mock.method(Date, 'now', () => now)
   const pending = Promise.withResolvers()
   const runCommand = t.mock.fn(() => pending.promise)
-  const h = harness(t, { runCommand })
+  const h = harness(t, { runCommand, quotaNow: () => now })
   const settled = h.handlers.get('agent_settled')
 
   settled({}, { ...h.ctx, hasUI: false })
@@ -407,9 +410,8 @@ test('settled checks are nonblocking, coalesced, deduplicate waterlines, and ret
 
 test('late background results after foreign switch, reset, error, or shutdown cannot restore status or warn', async (t) => {
   let now = 1_000_000
-  t.mock.method(Date, 'now', () => now)
   const runCommand = t.mock.fn()
-  const h = harness(t, { runCommand })
+  const h = harness(t, { runCommand, quotaNow: () => now })
   const expectNoUpdate = async (finish) => {
     const before = [h.statuses.length, h.notices.length]
     finish()
@@ -753,6 +755,158 @@ test('quota selection covers live agy 1.5.9 catalog, multi-group minimums, quali
   )
 })
 
+test('extra-low effort qualifiers match accurately without triggering thinking-mode fallback', () => {
+  const sharedPool = groups(
+    group(
+      'Gemini Models',
+      0.8,
+      'Models within this group: Gemini 4 Argon',
+    ),
+  )
+  assert.equal(
+    formatQuotaStatus(sharedPool, { id: 'gemini-4-argon-extra-low' }),
+    'AGY 20%',
+  )
+  assert.equal(
+    formatQuotaStatus(sharedPool, { id: 'gemini-4-argon-extra_low' }),
+    'AGY 20%',
+  )
+  assert.equal(
+    formatQuotaStatus(sharedPool, {
+      id: 'gemini-4-argon-extra-low',
+      name: 'Gemini 4 Argon (Extra-Low)',
+    }),
+    'AGY 20%',
+  )
+  assert.equal(
+    formatQuotaStatus(sharedPool, {
+      id: 'gemini-4-argon-extra_low',
+      name: 'Gemini 4 Argon (Extra-Low)',
+    }),
+    'AGY 20%',
+  )
+
+  // Dedicated (Extra-Low) pool isolates from (High) and does not masquerade as (Thinking).
+  const effortCappedPools = groups(
+    group('Gemini 4 Argon (Extra-Low)', 0.1),
+    group('Gemini 4 Argon (High)', 0.8),
+  )
+  assert.equal(
+    formatQuotaStatus(effortCappedPools, { id: 'gemini-4-argon-extra-low' }),
+    'AGY 90%',
+  )
+  assert.equal(
+    formatQuotaStatus(effortCappedPools, { id: 'gemini-4-argon-extra_low' }),
+    'AGY 90%',
+  )
+  assert.equal(
+    formatQuotaStatus(effortCappedPools, {
+      id: 'gemini-4-argon',
+      name: 'Gemini 4 Argon (Extra-Low)',
+    }),
+    'AGY 90%',
+  )
+  assert.equal(
+    formatQuotaStatus(effortCappedPools, {
+      id: 'gemini-4-argon-high',
+      name: 'Gemini 4 Argon (High)',
+    }),
+    'AGY 20%',
+  )
+  assert.equal(
+    quotaForModel(effortCappedPools, {
+      id: 'gemini-4-argon',
+      name: 'Gemini 4 Argon',
+    }),
+    undefined,
+  )
+
+  // Thinking-only model must not cross-match an (Extra-Low) effort-capped pool.
+  const extraLowAndShared = groups(
+    group('Gemini 4 Argon (Extra-Low)', 0.1),
+    group('Gemini Models', 0.8),
+  )
+  assert.equal(
+    quotaForModel(extraLowAndShared, {
+      id: 'gemini-4-argon-thinking',
+      name: 'Gemini 4 Argon (Thinking)',
+    }),
+    undefined,
+  )
+
+  // Conflicting extra-low vs low qualifiers reject cleanly as ambiguous.
+  const extraLowAndLow = groups(
+    group('Gemini 4 Argon (Extra-Low)', 0.1),
+    group('Gemini 4 Argon (Low)', 0.8),
+  )
+  assert.equal(
+    quotaForModel(extraLowAndLow, {
+      id: 'gemini-4-argon-extra-low',
+      name: 'Gemini 4 Argon (Low)',
+    }),
+    undefined,
+  )
+})
+
+test('disabled zero-fraction buckets do not trigger AGY 100% status or low-quota warnings', async (t) => {
+  let now = 1_000_000
+  const responses = [
+    usageOutput([
+      {
+        name: 'Gemini Models',
+        description: 'Models within this group: Gemini 4 Argon',
+        buckets: [
+          {
+            id: 'disabled-5h',
+            window: '5h',
+            disabled: true,
+            remainingFraction: 0,
+            resetTime: '2030-01-01T00:00:00Z',
+          },
+          {
+            id: 'active-weekly',
+            window: 'weekly',
+            remainingFraction: 0.8,
+            resetTime: '2030-01-01T00:00:00Z',
+          },
+        ],
+      },
+    ]),
+    usageOutput([
+      {
+        name: 'Gemini Models',
+        description: 'Models within this group: Gemini 4 Argon',
+        buckets: [
+          {
+            id: 'disabled-only',
+            window: '5h',
+            disabled: true,
+            remainingFraction: 0,
+            resetTime: '2030-01-01T00:00:00Z',
+          },
+        ],
+      },
+    ]),
+  ]
+  let idx = 0
+  const h = harness(t, {
+    runCommand: async () => responses[idx++],
+    quotaNow: () => now,
+    model: { provider, id: 'gemini-4-argon', name: 'Gemini 4 Argon' },
+  })
+
+  h.handlers.get('agent_settled')({}, h.ctx)
+  await tick()
+  assert.equal(h.statuses.at(-1), 'AGY 20%')
+  assert.equal(h.notices.length, 0)
+
+  now += 120_000
+  h.handlers.get('agent_settled')({}, h.ctx)
+  await tick()
+  assert.equal(h.statuses.at(-1), undefined)
+  assert.equal(h.notices.length, 0)
+})
+
 test('agent_settled during reset or shutdown disposal skips quota reads and does not block replacement runtime', async (t) => {
   const resetDisposing = Promise.withResolvers()
   const shutdownDisposing = Promise.withResolvers()
@@ -817,11 +971,10 @@ test('agent_settled during reset or shutdown disposal skips quota reads and does
 
 test('cancelled TUI quota check shares in-flight request with agent_settled, and failed runCommand closes loader', async (t) => {
   let now = 1_000_000
-  t.mock.method(Date, 'now', () => now)
   initTheme('dark', false)
   const query = Promise.withResolvers()
   const runCommand = t.mock.fn(() => query.promise)
-  const h = harness(t, { runCommand })
+  const h = harness(t, { runCommand, quotaNow: () => now })
   let loader = { dispose() {} }
   t.after(() => loader.dispose())
   const tuiCtx = {
@@ -873,10 +1026,10 @@ test('cancelled TUI quota check shares in-flight request with agent_settled, and
 
 test('unmatched or ambiguous quota ownership does not emit a misleading low-quota warning on settle', async (t) => {
   let now = 1_000_000
-  t.mock.method(Date, 'now', () => now)
   const runCommand = t.mock.fn(async () => usageOutput([group('Gemini 4 Argon', 0)]))
   const h = harness(t, {
     runCommand,
+    quotaNow: () => now,
     model: { provider, id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash' },
   })
   h.handlers.get('agent_settled')({}, h.ctx)
@@ -982,14 +1135,13 @@ test('quota display mode switches via /agy-acp quota, remembers last choice acro
 
 test('quota TTL throttles successes and failures, while force bypasses it', async (t) => {
   let now = 1000
-  t.mock.method(Date, 'now', () => now)
   const ok = async () => ({
     code: 0,
     stderr: '',
     stdout: JSON.stringify({ command: { data: { groups: [] } } }),
   })
   const run = t.mock.fn(ok)
-  const reader = new QuotaReader(() => 'fake', run, 100)
+  const reader = new QuotaReader(() => 'fake', run, 100, () => now)
   assert.equal(reader.peek(), undefined)
   await reader.read()
   assert.equal(reader.peek().status, 'ok')
