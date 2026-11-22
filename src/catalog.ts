@@ -40,13 +40,14 @@ export function flattenConfigOptions(
   options: AcpConfigOption['options'],
 ): AcpConfigOptionValue[] {
   if (!Array.isArray(options)) return []
-  return options.flatMap((entry) =>
-    'group' in entry
+  return options.flatMap((entry) => {
+    if (entry === null || typeof entry !== 'object') return []
+    return 'group' in entry
       ? Array.isArray(entry.options)
         ? entry.options
         : []
-      : [entry],
-  )
+      : [entry]
+  })
 }
 
 /** Effort suffixes ordered longest-first so `-<effort>-effort` beats `-<effort>`. */

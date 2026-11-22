@@ -254,9 +254,10 @@ export class AntigravityRuntime {
     }
     if (
       this.process?.alive &&
+      this.starting === undefined &&
       this.processFingerprint !== undefined &&
       this.processFingerprint !== fp &&
-      ![...this.conversations.values()].some((c) => c.turn !== undefined)
+      [...this.conversations.values()].every((c) => this.isIdle(c))
     ) {
       // Restart an idle ACP process after an on-disk `agy` upgrade so discovery probes the new binary.
       const stale = this.process
@@ -286,24 +287,22 @@ export class AntigravityRuntime {
   ): void {
     if (this.lifecycle !== 'active' || !sessionId) return
     const turnFloor = turn?.metaFloorIdx ?? null
-    const readModelMeta = Boolean(model && minIdx !== null)
-    const modelMeta = readModelMeta
-      ? readSessionContextMetadata(this.home, sessionId, minIdx as number)
-      : undefined
-    if (
-      model &&
-      this.catalog.observeContextWindow(model, modelMeta?.maxContextTokens)
-    ) {
-      this.host.onModelsChanged()
+    const turnMeta =
+      turn !== undefined && turnFloor !== null
+        ? readSessionContextMetadata(this.home, sessionId, turnFloor)
+        : undefined
+    if (turn !== undefined && turnMeta?.estimatedTokensUsed !== undefined) {
+      turn.estimatedContextUsed = turnMeta.estimatedTokensUsed
     }
-    if (turn !== undefined && turnFloor !== null) {
-      const turnMeta =
-        readModelMeta && turnFloor === minIdx
-          ? modelMeta
-          : readSessionContextMetadata(this.home, sessionId, turnFloor)
-      if (turnMeta?.estimatedTokensUsed !== undefined) {
-        turn.estimatedContextUsed = turnMeta.estimatedTokensUsed
-      }
+    if (!model || minIdx === null) return
+    const maxContextTokens =
+      turnMeta?.maxContextTokens ??
+      (turn !== undefined && turnFloor === minIdx
+        ? undefined
+        : readSessionContextMetadata(this.home, sessionId, minIdx)
+            ?.maxContextTokens)
+    if (this.catalog.observeContextWindow(model, maxContextTokens)) {
+      this.host.onModelsChanged()
     }
   }
 

@@ -1249,6 +1249,7 @@ test('ModelCatalog flattens grouped configOptions and handles xhigh, max, and -e
 
   assert.deepEqual(
     flattenConfigOptions([
+      null,
       {
         group: 'google',
         options: [

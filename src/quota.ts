@@ -88,6 +88,11 @@ function resolveContainedLog(
   }
 }
 
+function compareLogCandidates(a: LogCandidate, b: LogCandidate): number {
+  if (b.mtimeMs !== a.mtimeMs) return b.mtimeMs - a.mtimeMs
+  return a.name < b.name ? 1 : a.name > b.name ? -1 : 0
+}
+
 function collectDirectoryLogs(dir: string): string[] {
   let realRoot: string
   try {
@@ -109,15 +114,11 @@ function collectDirectoryLogs(dir: string): string[] {
   } catch {
     // Missing or unreadable rotated log directory.
   }
-  rotated.sort(
-    (a, b) => b.mtimeMs - a.mtimeMs || b.name.localeCompare(a.name),
-  )
+  rotated.sort(compareLogCandidates)
   const candidates: LogCandidate[] = rotated.slice(0, MAX_ROTATED_LOGS)
   const direct = resolveContainedLog(realRoot, join(realRoot, 'cli.log'), 'cli.log')
   if (direct !== undefined) candidates.push(direct)
-  candidates.sort(
-    (a, b) => b.mtimeMs - a.mtimeMs || b.name.localeCompare(a.name),
-  )
+  candidates.sort(compareLogCandidates)
   const seen = new Set<string>()
   const unique: string[] = []
   for (const item of candidates) {
