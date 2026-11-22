@@ -8,22 +8,37 @@
  * @module pi-agy-acp/preflight
  */
 
+import { randomBytes } from 'node:crypto'
 import {
+  accessSync,
   chmodSync,
-  copyFileSync,
-  existsSync,
+  closeSync,
+  constants as fsConstants,
+  fstatSync,
   mkdirSync,
+  openSync,
   writeFileSync,
   readFileSync,
   realpathSync,
+  renameSync,
   statSync,
   lstatSync,
   readdirSync,
   rmSync,
+  unlinkSync,
+  type BigIntStats,
   type Stats,
 } from 'node:fs'
 import { homedir } from 'node:os'
-import { delimiter, isAbsolute, join, relative, resolve } from 'node:path'
+import {
+  basename,
+  delimiter,
+  dirname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+} from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { readJson } from './config.ts'
 
@@ -74,11 +89,24 @@ export interface ResolveBinaryOptions {
   home?: string
 }
 
+function getEnvCaseInsensitive(
+  env: NodeJS.ProcessEnv,
+  key: string,
+): string | undefined {
+  const direct = env[key]
+  if (direct !== undefined) return direct
+  const lower = key.toLowerCase()
+  for (const [entryKey, value] of Object.entries(env)) {
+    if (entryKey.toLowerCase() === lower && value !== undefined) return value
+  }
+  return undefined
+}
+
 function splitPathDirs(
   env: NodeJS.ProcessEnv,
   platform: NodeJS.Platform,
 ): string[] {
-  const raw = env.PATH ?? env.Path ?? ''
+  const raw = getEnvCaseInsensitive(env, 'PATH') ?? ''
   const sep = platform === 'win32' ? ';' : delimiter
   const dirs: string[] = []
   for (const part of raw.split(sep)) {
@@ -86,6 +114,22 @@ function splitPathDirs(
     if (cleaned.length > 0) dirs.push(cleaned)
   }
   return dirs
+}
+
+function winPathExtensions(env: NodeJS.ProcessEnv): string[] {
+  const raw = getEnvCaseInsensitive(env, 'PATHEXT') ?? '.COM;.EXE;.BAT;.CMD'
+  const seen = new Set<string>()
+  const exts: string[] = []
+  for (const part of raw.split(';')) {
+    const trimmed = part.trim().toLowerCase()
+    if (trimmed.length === 0) continue
+    const ext = trimmed.startsWith('.') ? trimmed : `.${trimmed}`
+    if (seen.has(ext)) continue
+    seen.add(ext)
+    exts.push(ext)
+  }
+  if (!seen.has('.exe')) exts.unshift('.exe')
+  return exts
 }
 
 /**
@@ -98,36 +142,47 @@ export function resolveAgyBinary(
   configured: string,
   options: ResolveBinaryOptions = {},
 ): string {
+  const platform = options.platform ?? process.platform
   if (configured.length > 0) {
     if (!isAbsolute(configured))
       throw new Error(
         `antigravity-acp: command must be an absolute path, got ${configured}`,
       )
-    if (!isFile(configured))
+    if (!isExecutableFile(configured, platform))
       throw new Error(
         `antigravity-acp: configured agy binary not found at ${configured}`,
       )
     return configured
   }
-  const platform = options.platform ?? process.platform
   const env = options.env ?? process.env
   const home = options.home ?? homedir()
-  const exeName = platform === 'win32' ? 'agy.exe' : 'agy'
   const candidates: string[] = []
   if (platform === 'win32') {
     const localAppData =
-      env.LOCALAPPDATA && env.LOCALAPPDATA.length > 0
-        ? env.LOCALAPPDATA
-        : join(home, 'AppData', 'Local')
+      getEnvCaseInsensitive(env, 'LOCALAPPDATA') ||
+      join(home, 'AppData', 'Local')
     candidates.push(join(localAppData, 'agy', 'bin', 'agy.exe'))
     candidates.push(join(home, '.local', 'bin', 'agy.exe'))
+    const pathDirs = splitPathDirs(env, platform)
+    const exts = winPathExtensions(env)
+    // Prefer native agy.exe across PATH before PATHEXT wrapper shims (such as IDE agy.cmd).
+    for (const dir of pathDirs) {
+      candidates.push(join(dir, 'agy.exe'))
+    }
+    for (const dir of pathDirs) {
+      for (const ext of exts) {
+        if (ext !== '.exe') candidates.push(join(dir, `agy${ext}`))
+      }
+    }
   } else {
     candidates.push(join(home, '.local', 'bin', 'agy'))
+    for (const dir of splitPathDirs(env, platform)) {
+      candidates.push(join(dir, 'agy'))
+    }
   }
-  for (const dir of splitPathDirs(env, platform)) {
-    candidates.push(join(dir, exeName))
-  }
-  const found = candidates.find((candidate) => isFile(candidate))
+  const found = candidates.find((candidate) =>
+    isExecutableFile(candidate, platform),
+  )
   if (found === undefined) {
     throw new Error(
       'antigravity-acp: the Antigravity CLI (agy) was not found; install it from https://antigravity.google/docs/install?tab=cli and sign in once with `agy`',
@@ -219,10 +274,131 @@ export function defaultHome(): string {
 }
 
 /**
+ * Whether `home` points to the default isolated Pi Antigravity home
+ * (`~/.pi/agent/cache/antigravity-acp`) rather than a custom `PI_AGY_HOME`.
+ */
+export function isDefaultPiAgyHome(
+  home: string,
+  userHome: string = homedir(),
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  const actual = resolve(home)
+  const expected = resolve(
+    join(userHome, '.pi', 'agent', 'cache', 'antigravity-acp'),
+  )
+  return platform === 'win32'
+    ? actual.toLowerCase() === expected.toLowerCase()
+    : actual === expected
+}
+
+function ensureRealDirectory(
+  root: string,
+  segments: readonly string[],
+): string {
+  let rootStat: Stats | undefined
+  try {
+    rootStat = lstatSync(root)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw error
+  }
+  if (rootStat === undefined) {
+    mkdirSync(root, { recursive: true })
+  } else if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+    throw new Error(`Refusing to use symlink or non-directory path: ${root}`)
+  }
+  let current = root
+  for (const segment of segments) {
+    current = join(current, segment)
+    let st: Stats | undefined
+    try {
+      st = lstatSync(current)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw error
+    }
+    if (st === undefined) {
+      mkdirSync(current)
+    } else if (st.isSymbolicLink() || !st.isDirectory()) {
+      throw new Error(
+        `Refusing to use symlink or non-directory path: ${current}`,
+      )
+    }
+  }
+  return current
+}
+
+/**
+ * Atomically write a regular file in the target directory while rejecting
+ * symlinked or non-regular destination paths.
+ */
+export function atomicWriteFile(
+  path: string,
+  content: string | Uint8Array,
+  options?: { mode?: number },
+): void {
+  let existing: Stats | undefined
+  try {
+    existing = lstatSync(path)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw error
+  }
+  if (
+    existing !== undefined &&
+    (existing.isSymbolicLink() || !existing.isFile())
+  ) {
+    throw new Error(
+      `Refusing to write to symlink or non-regular file: ${path}`,
+    )
+  }
+  const tmpPath = join(
+    dirname(path),
+    `.${basename(path)}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`,
+  )
+  const mode = options?.mode
+  let fd: number | undefined
+  let created = false
+  try {
+    fd = openSync(
+      tmpPath,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL,
+      mode ?? 0o666,
+    )
+    created = true
+    writeFileSync(fd, content)
+    closeSync(fd)
+    fd = undefined
+    if (mode !== undefined) {
+      try {
+        chmodSync(tmpPath, mode)
+      } catch {
+        // Mode bits are advisory on Windows.
+      }
+    }
+    renameSync(tmpPath, path)
+  } catch (error) {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd)
+      } catch {
+        // Ignore close errors during cleanup.
+      }
+    }
+    if (created) {
+      try {
+        unlinkSync(tmpPath)
+      } catch {
+        // Best-effort temp file cleanup.
+      }
+    }
+    throw error
+  }
+}
+
+/**
  * Seed or refresh the isolated `antigravity-oauth-token` file from the user's
  * Antigravity CLI home (`ANTIGRAVITY_CLI_HOME`, `AGY_HOME`, or
- * `~/.gemini/antigravity-cli`) whenever the host uses file-backed token storage
- * (Windows / headless Linux) or the user signed in again from a terminal.
+ * `~/.gemini/antigravity-cli`) whenever the default `PI_AGY_HOME` is in use
+ * and the host uses file-backed token storage. Custom `PI_AGY_HOME` roots stay
+ * strictly isolated.
  * @param home - isolated `--gemini-dir` root.
  * @param userHome - optional user home override for testing.
  * @param env - optional environment override for testing.
@@ -232,34 +408,96 @@ export function syncOAuthToken(
   userHome: string = homedir(),
   env: NodeJS.ProcessEnv = process.env,
 ): void {
+  if (!isDefaultPiAgyHome(home, userHome)) return
   const appData = join(home, 'agy')
   const dst = join(appData, 'antigravity-oauth-token')
-  let chosen: { path: string; mtimeMs: number } | undefined
-  for (const dir of defaultAgyHomes(userHome, env)) {
-    const candidate = join(dir, 'antigravity-oauth-token')
-    try {
-      const st = statSync(candidate)
-      if (st.isFile() && st.size > 0) {
-        chosen = { path: candidate, mtimeMs: st.mtimeMs }
-        break
+  let appStat: Stats | undefined
+  try {
+    appStat = lstatSync(appData)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw error
+  }
+  if (
+    appStat !== undefined &&
+    (appStat.isSymbolicLink() || !appStat.isDirectory())
+  ) {
+    throw new Error(
+      `Refusing to sync OAuth token into symlink or non-directory path: ${appData}`,
+    )
+  }
+  let dstStat: BigIntStats | undefined
+  try {
+    dstStat = lstatSync(dst, { bigint: true })
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw error
+  }
+  if (
+    dstStat !== undefined &&
+    (dstStat.isSymbolicLink() || !dstStat.isFile())
+  ) {
+    throw new Error(
+      `Refusing to overwrite symlink or non-regular OAuth token: ${dst}`,
+    )
+  }
+  let chosenFd: number | undefined
+  let chosenPath: string | undefined
+  let chosenStat: BigIntStats | undefined
+  const openFlags = fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0)
+  try {
+    for (const dir of defaultAgyHomes(userHome, env)) {
+      const candidate = join(dir, 'antigravity-oauth-token')
+      let fd: number | undefined
+      try {
+        // Pre-check symlink for platforms where O_NOFOLLOW is unavailable (Windows).
+        if (lstatSync(candidate).isSymbolicLink()) continue
+        fd = openSync(candidate, openFlags)
+        const st = fstatSync(fd, { bigint: true })
+        if (st.isFile() && st.size > 0n) {
+          chosenFd = fd
+          chosenPath = candidate
+          chosenStat = st
+          fd = undefined
+          break
+        }
+      } catch {
+        // Directory has no usable token file; fall through to the next candidate.
+      } finally {
+        if (fd !== undefined) {
+          try {
+            closeSync(fd)
+          } catch {
+            // Ignore close errors while probing candidates.
+          }
+        }
       }
-    } catch {
-      // Directory has no token file; fall through to the next candidate.
     }
-  }
-  if (chosen === undefined) return
-  try {
-    const dstStat = statSync(dst)
-    if (dstStat.size > 0 && dstStat.mtimeMs >= chosen.mtimeMs) return
-  } catch {
-    // Destination token file does not exist yet.
-  }
-  mkdirSync(appData, { recursive: true })
-  copyFileSync(chosen.path, dst)
-  try {
-    chmodSync(dst, 0o600)
-  } catch {
-    // Mode bits are advisory on Windows.
+    if (
+      chosenFd === undefined ||
+      chosenPath === undefined ||
+      chosenStat === undefined
+    )
+      return
+    if (resolve(chosenPath) === resolve(dst)) return
+    if (dstStat !== undefined) {
+      if (
+        dstStat.ino !== 0n &&
+        dstStat.dev === chosenStat.dev &&
+        dstStat.ino === chosenStat.ino
+      )
+        return
+      if (dstStat.size > 0n && dstStat.mtimeNs >= chosenStat.mtimeNs) return
+    }
+    const content = readFileSync(chosenFd)
+    ensureRealDirectory(home, ['agy'])
+    atomicWriteFile(dst, content, { mode: 0o600 })
+  } finally {
+    if (chosenFd !== undefined) {
+      try {
+        closeSync(chosenFd)
+      } catch {
+        // Ignore close errors after reading.
+      }
+    }
   }
 }
 
@@ -612,11 +850,16 @@ export function prepareHome(
   home: string,
   userHome: string = homedir(),
   env: NodeJS.ProcessEnv = process.env,
+  onWarn?: (message: string) => void,
 ): string {
-  const agentDir = join(home, 'config', 'plugins', BRIDGE_AGENT, 'agents')
-  mkdirSync(agentDir, { recursive: true })
+  const pluginDir = ensureRealDirectory(home, [
+    'config',
+    'plugins',
+    BRIDGE_AGENT,
+  ])
+  const agentDir = ensureRealDirectory(pluginDir, ['agents'])
   writeIfChanged(
-    join(home, 'config', 'plugins', BRIDGE_AGENT, 'plugin.json'),
+    join(pluginDir, 'plugin.json'),
     `${JSON.stringify({ name: BRIDGE_AGENT }, null, 2)}\n`,
   )
   writeIfChanged(
@@ -633,8 +876,7 @@ export function prepareHome(
       '',
     ].join('\n'),
   )
-  const appData = join(home, 'agy')
-  mkdirSync(appData, { recursive: true })
+  const appData = ensureRealDirectory(home, ['agy'])
   // Pi owns conversation history; no ACP session is restored across processes.
   // shortcut: cleanup requires an exclusive home; add locking before supporting shared homes.
   removeArtifacts(appData, [
@@ -653,15 +895,20 @@ export function prepareHome(
   } catch {
     // Log cleanup is best-effort when the home cannot be listed.
   }
-  syncOAuthToken(home, userHome, env)
+  try {
+    syncOAuthToken(home, userHome, env)
+  } catch (error) {
+    onWarn?.(
+      `antigravity-acp: OAuth token sync skipped: ${error instanceof Error ? error.message : String(error)}`,
+    )
+  }
   const settingsPath = join(appData, 'settings.json')
   const settings = readJson(settingsPath)
   writeIfChanged(
     settingsPath,
     `${JSON.stringify({ ...settings, toolPermission: 'request-review', agentMode: '' }, null, 2)}\n`,
   )
-  const workspace = join(home, 'workspace')
-  mkdirSync(workspace, { recursive: true })
+  const workspace = ensureRealDirectory(home, ['workspace'])
   return workspace
 }
 
@@ -687,13 +934,30 @@ export async function readVersion(
 }
 
 function writeIfChanged(path: string, content: string): void {
-  if (existsSync(path) && readFileSync(path, 'utf8') === content) return
-  writeFileSync(path, content)
+  let existing: Stats | undefined
+  try {
+    existing = lstatSync(path)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw error
+  }
+  if (existing !== undefined) {
+    if (existing.isSymbolicLink() || !existing.isFile()) {
+      throw new Error(
+        `Refusing to write to symlink or non-regular file: ${path}`,
+      )
+    }
+    if (readFileSync(path, 'utf8') === content) return
+  }
+  atomicWriteFile(path, content)
 }
 
-function isFile(path: string): boolean {
+function isExecutableFile(path: string, platform: NodeJS.Platform): boolean {
   try {
-    return statSync(path).isFile()
+    if (!statSync(path).isFile()) return false
+    if (platform !== 'win32' && process.platform !== 'win32') {
+      accessSync(path, fsConstants.X_OK)
+    }
+    return true
   } catch {
     return false
   }

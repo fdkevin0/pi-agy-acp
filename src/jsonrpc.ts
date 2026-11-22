@@ -63,6 +63,9 @@ export interface JsonRpcRequestOptions {
   timeoutMs?: number | undefined
 }
 
+/** Maximum characters accepted for a single newline-delimited JSON-RPC frame (16 MiB). */
+export const MAX_LINE_CHARS = 16 * 1024 * 1024
+
 /** Bidirectional newline-delimited JSON-RPC 2.0 endpoint. */
 export class JsonRpcPeer {
   private nextId = 1
@@ -174,6 +177,7 @@ export class JsonRpcPeer {
   close(error: Error): void {
     if (this.closed !== undefined) return
     this.closed = error
+    this.buffer = ''
     for (const [id, pending] of this.pending) {
       this.pending.delete(id)
       pending.reject(
@@ -192,13 +196,43 @@ export class JsonRpcPeer {
   }
 
   private onData(chunk: string): void {
+    if (this.closed !== undefined) return
     this.buffer += chunk
-    let newline = this.buffer.indexOf('\n')
+    let start = 0
+    let newline = this.buffer.indexOf('\n', start)
     while (newline >= 0) {
-      const line = this.buffer.slice(0, newline).trim()
-      this.buffer = this.buffer.slice(newline + 1)
+      if (newline - start > MAX_LINE_CHARS) {
+        this.buffer = ''
+        this.handlers.onProtocolError?.(
+          `frame exceeded ${MAX_LINE_CHARS} character limit`,
+        )
+        this.close(new JsonRpcClosedError('ACP frame exceeded 16 MiB limit'))
+        return
+      }
+      const line = this.buffer.slice(start, newline).trim()
+      start = newline + 1
       if (line.length > 0) this.onLine(line)
-      newline = this.buffer.indexOf('\n')
+      if (this.closed !== undefined) {
+        this.buffer = ''
+        return
+      }
+      newline = this.buffer.indexOf('\n', start)
+    }
+    if (this.buffer.length - start > MAX_LINE_CHARS) {
+      this.buffer = ''
+      this.handlers.onProtocolError?.(
+        `frame exceeded ${MAX_LINE_CHARS} character limit`,
+      )
+      this.close(new JsonRpcClosedError('ACP frame exceeded 16 MiB limit'))
+      return
+    }
+    if (start === this.buffer.length) {
+      this.buffer = ''
+    } else if (start > 0) {
+      // Flatten the remainder to detach V8's SlicedString backing buffer.
+      this.buffer = Buffer.from(this.buffer.slice(start), 'utf16le').toString(
+        'utf16le',
+      )
     }
   }
 
