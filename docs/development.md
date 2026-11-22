@@ -80,8 +80,9 @@ pi -e ./index.ts
   runtime, persisting the tier in `catalog.json`. Email lookup scans `cli.log`
   and the newest 10 contained `log/cli-*.log` and `log/acp-server-*.log` files
   (newest first, deduplicated), checking the tail 64 KiB first and falling back
-  to the head 64 KiB when larger. Runtime warnings stay off stderr to preserve
-  TUI rendering; diagnostics use status and agy's logs.
+  to the head 64 KiB when larger. Runtime warnings stay off stderr by default to
+  preserve TUI rendering (diagnostics use status and agy's logs); set
+  `PI_AGY_DEBUG=1` to print runtime warnings on stderr.
 - **Pi stream and error contracts:** `onPayload` can replace the request, and
   `onProviderStreamEvent` observes events before conversion. At the first stream
   event, `onResponse` receives synthetic status `200` and empty headers before

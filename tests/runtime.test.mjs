@@ -2344,7 +2344,7 @@ test('Windows preflight locates agy.exe in LOCALAPPDATA and PATH while skipping 
 
   // File-backed OAuth token sync seeds isolated home and updates only when source is newer.
   const cliAuthDir = join(root, '.gemini', 'antigravity-cli')
-  const isolatedHome = join(root, '.pi', 'cache', 'antigravity-acp')
+  const isolatedHome = join(root, '.pi', 'agent', 'cache', 'antigravity-acp')
   mkdirSync(cliAuthDir, { recursive: true })
   const srcToken = join(cliAuthDir, 'antigravity-oauth-token')
   const dstToken = join(isolatedHome, 'agy', 'antigravity-oauth-token')

@@ -111,6 +111,7 @@ Set these environment variables before starting Pi:
 | `PI_AGY_COMMAND` | Absolute path to the `agy` executable. | Automatic discovery. |
 | `PI_AGY_HOME` | Dedicated directory for this extension's agy state. | `~/.pi/agent/cache/antigravity-acp` |
 | `PI_AGY_QUOTA_DISPLAY` | Startup quota display mode (`used` or `remaining`), overriding `settings.json` for startup. Invalid values are ignored; `/agy-acp quota <mode>` overrides it for the active session. | `settings.json`, then `used` |
+| `PI_AGY_DEBUG` | Set to `1` to emit runtime warnings on `stderr` (silent by default to protect the TUI). | Unset (silent) |
 
 For example:
 
@@ -129,10 +130,14 @@ are retained; sessions rebuild from Pi's history. Cleanup is best-effort if file
 for each concurrently running Pi instance, since startup cleanup assumes exclusive
 use of the directory.
 
-With file-backed authentication, the extension copies the existing OAuth token
-from your normal agy directory (`ANTIGRAVITY_CLI_HOME`, `AGY_HOME`, or
-`~/.gemini/antigravity-cli`) and sets its permissions to `0600`. Do not commit
-or share this directory. Authentication and token refresh remain agy's responsibility.
+With file-backed authentication and the default `PI_AGY_HOME`, the extension
+atomically syncs the existing OAuth token from your normal agy directory
+(`ANTIGRAVITY_CLI_HOME`, `AGY_HOME`, or `~/.gemini/antigravity-cli`) with `0600`
+permissions while refusing symlinked paths. A custom `PI_AGY_HOME` stays
+isolated and does not copy tokens from default agy directories. Note that quota
+queries (`agy -p /usage`) always query the global `agy` CLI account because
+`agy` does not accept `--gemini-dir` on `/usage`. Do not commit or share this
+directory. Authentication and token refresh remain agy's responsibility.
 
 ## Models and context
 

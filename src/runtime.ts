@@ -8,7 +8,6 @@
  */
 
 import { randomBytes, timingSafeEqual } from 'node:crypto'
-import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { LlmError } from './protocol.ts'
 import type {
@@ -70,6 +69,7 @@ import {
   BRIDGE_AGENT,
   defaultAgyHomes,
   defaultHome,
+  isDefaultPiAgyHome,
   prepareHome,
   readSessionContextMetadata,
   readSessionNextMetadataIndex,
@@ -368,9 +368,7 @@ export class AntigravityRuntime {
 
   private accountInfo(): AccountInfo | undefined {
     const paths = [join(this.home, 'acp.log'), this.home]
-    if (
-      this.home === join(homedir(), '.pi', 'agent', 'cache', 'antigravity-acp')
-    )
+    if (isDefaultPiAgyHome(this.home))
       paths.push(...defaultAgyHomes())
     const email = readLoggedEmail(paths)
     const tier = this.catalog.tier()
@@ -821,8 +819,9 @@ export class AntigravityRuntime {
 
   private runPreflight(): Promise<PreflightResult> {
     this.reconcileBinaryFingerprint()
+    const warn = (message: string) => this.host.log.warn(message)
     if (this.preflight !== undefined) {
-      prepareHome(this.home)
+      prepareHome(this.home, undefined, undefined, warn)
       return Promise.resolve(this.preflight)
     }
     this.preflightPromise ??= (async () => {
@@ -832,7 +831,7 @@ export class AntigravityRuntime {
       const version = await readVersion(binary, this.host.runCommand)
       this.assertActive()
       assertSupportedAgyVersion(version, binary)
-      const workspace = prepareHome(this.home)
+      const workspace = prepareHome(this.home, undefined, undefined, warn)
       const result: PreflightResult = {
         binary,
         version,
@@ -878,7 +877,13 @@ export class AntigravityRuntime {
     proc: AcpProcess,
   ): Promise<readonly BridgeTool[]> {
     this.assertOwner(proc, conv)
-    syncOAuthToken(this.home)
+    try {
+      syncOAuthToken(this.home)
+    } catch (error) {
+      this.host.log.warn(
+        `antigravity-acp: OAuth token sync skipped: ${error instanceof Error ? error.message : String(error)}`,
+      )
+    }
     conv.reportedToolCalls.clear()
     const compacted = tools.map(compactBridgeTool)
     const supplementalTools = tools.filter(

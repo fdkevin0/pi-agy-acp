@@ -167,6 +167,8 @@ export class AcpProcess {
   private readonly listeners = new Map<string, AcpSessionListener>()
   private child: AcpChild | undefined
   private peer: JsonRpcPeer | undefined
+  private childExited = false
+  private childTerminated = false
   private exitError: Error | undefined
   private readonly exitListeners = new Set<(error: Error) => void>()
   private readonly options: AcpProcessOptions
@@ -202,15 +204,21 @@ export class AcpProcess {
   async start(timeoutMs: number): Promise<AcpInitializeResult | undefined> {
     const child = this.options.spawn(this.options.argv, this.options.cwd)
     this.child = child
+    this.childExited = false
+    this.childTerminated = false
     const peer = new JsonRpcPeer(child.stdout, child.stdin, {
       onRequest: (method, params) => this.onRequest(method, params),
       onNotification: (method, params) => this.onNotification(method, params),
-      onClose: (error) => this.fail(error),
+      onClose: (error) => {
+        if (!this.childExited) this.terminateChild()
+        this.fail(error)
+      },
       onProtocolError: (detail) =>
         this.options.log?.(`acp: dropped frame: ${detail}`),
     })
     this.peer = peer
     void child.exited.then(({ code, signal }) => {
+      this.childExited = true
       const tail = child.stderrTail().trim().split('\n').slice(-5).join(' | ')
       const error = new Error(
         `agy acp exited (code=${code ?? 'null'} signal=${signal ?? 'null'})${tail ? `: ${tail}` : ''}`,
@@ -237,6 +245,12 @@ export class AcpProcess {
     const error = new Error('ACP process stopped')
     this.fail(error)
     this.peer?.close(error)
+    this.terminateChild()
+  }
+
+  private terminateChild(): void {
+    if (this.childTerminated || this.childExited) return
+    this.childTerminated = true
     this.child?.terminate()
   }
 

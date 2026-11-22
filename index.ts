@@ -29,6 +29,7 @@ export default function (
   host: Partial<Pick<RuntimeHost, 'runCommand' | 'spawnAcp' | 'quotaNow'>> = {},
 ) {
   const envQuotaDisplay = asQuotaDisplay(process.env.PI_AGY_QUOTA_DISPLAY)
+  const debug = process.env.PI_AGY_DEBUG === '1'
   const config = {
     ...defaults,
     command: process.env.PI_AGY_COMMAND || '',
@@ -41,7 +42,14 @@ export default function (
       spawnAcp: host.spawnAcp ?? spawnAcp,
       runCommand: host.runCommand ?? runCommand,
       quotaNow: host.quotaNow,
-      log: { info: () => {}, warn: () => {} },
+      log: {
+        info: () => {},
+        warn: debug
+          ? (message) => {
+              process.stderr.write(`[pi-agy-acp] ${message}\n`)
+            }
+          : () => {},
+      },
       onModelsChanged: () => {
         if (refreshDepth === 0) register()
       },

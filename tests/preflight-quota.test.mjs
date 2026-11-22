@@ -355,6 +355,7 @@ test('binary discovery skips same-name directories and version error matches min
   mkdirSync(good)
   const binary = join(good, 'agy')
   writeFileSync(binary, '#!/bin/sh\n')
+  chmodSync(binary, 0o755)
   assert.equal(
     resolveAgyBinary('', {
       platform: 'linux',
@@ -375,6 +376,7 @@ test('quota reads without ACP startup, coalesces requests and preserves command 
   const root = mkdtempSync(join(tmpdir(), 'pi-quota-'))
   const command = join(root, 'agy')
   writeFileSync(command, '')
+  chmodSync(command, 0o755)
   let calls = 0,
     result = {
       code: 0,
@@ -1645,7 +1647,7 @@ test('defaultAgyHomes, syncOAuthToken, and accountInfo respect ANTIGRAVITY_CLI_H
   writeFileSync(join(defaultDir, 'antigravity-oauth-token'), 'default-token')
   writeFileSync(join(agyEnvDir, 'antigravity-oauth-token'), 'agy-home-token')
   writeFileSync(join(cliEnvDir, 'antigravity-oauth-token'), 'cli-home-token')
-  const dst1 = join(root, 'iso-1')
+  const dst1 = join(userHome, '.pi', 'agent', 'cache', 'antigravity-acp')
   syncOAuthToken(dst1, userHome, {
     ANTIGRAVITY_CLI_HOME: cliEnvDir,
     AGY_HOME: agyEnvDir,
@@ -1658,8 +1660,9 @@ test('defaultAgyHomes, syncOAuthToken, and accountInfo respect ANTIGRAVITY_CLI_H
   // When ANTIGRAVITY_CLI_HOME has no token, falls back to AGY_HOME.
   const emptyCliDir = join(root, 'empty-cli-home')
   mkdirSync(emptyCliDir, { recursive: true })
-  const dst2 = join(root, 'iso-2')
-  syncOAuthToken(dst2, userHome, {
+  const userHome2 = join(root, 'user-2')
+  const dst2 = join(userHome2, '.pi', 'agent', 'cache', 'antigravity-acp')
+  syncOAuthToken(dst2, userHome2, {
     ANTIGRAVITY_CLI_HOME: emptyCliDir,
     AGY_HOME: agyEnvDir,
   })
@@ -1757,8 +1760,12 @@ setInterval(() => {}, 60000)
     writeFileSync(
       parentScript,
       `import { spawn } from 'node:child_process'
-spawn(process.execPath, [${JSON.stringify(gcScript)}, process.argv[2]], {
+const gc = spawn(process.execPath, [${JSON.stringify(gcScript)}, process.argv[2]], {
   stdio: ['ignore', 'inherit', 'inherit'],
+})
+process.on('SIGTERM', () => {
+  if (gc.exitCode !== null || gc.signalCode !== null) process.exit(0)
+  gc.once('exit', () => process.exit(0))
 })
 setInterval(() => {}, 60000)
 `,
