@@ -25,7 +25,11 @@ import {
   type AcpPromptResult,
   type AcpSpawner,
 } from './acp-process.ts'
-import { ModelCatalog, nearestEffort } from './catalog.ts'
+import {
+  flattenConfigOptions,
+  ModelCatalog,
+  nearestEffort,
+} from './catalog.ts'
 import { asEffort, defaults, type Config, type Effort } from './config.ts'
 import {
   AcpTurn,
@@ -64,10 +68,12 @@ import {
 } from './mcp-bridge.ts'
 import {
   assertSupportedAgyVersion,
+  binaryFingerprint,
   BRIDGE_AGENT,
+  defaultAgyHomes,
   defaultHome,
   prepareHome,
-  readSessionMaxContextTokens,
+  readSessionContextMetadata,
   readSessionNextMetadataIndex,
   removeSessionArtifacts,
   readVersion,
@@ -173,8 +179,10 @@ export class AntigravityRuntime {
   readonly quota: QuotaReader
   private readonly home: string
   private process: AcpProcess | undefined
+  private processFingerprint: string | undefined
   private starting: Promise<AcpProcess> | undefined
   private preflight: PreflightResult | undefined
+  private preflightFingerprint: string | undefined
   private preflightPromise: Promise<PreflightResult> | undefined
   private state: RuntimeStatus['state'] = 'idle'
   private lastError: string | undefined
@@ -196,7 +204,10 @@ export class AntigravityRuntime {
   constructor(host: RuntimeHost) {
     this.host = host
     this.home = host.config.home.length > 0 ? host.config.home : defaultHome()
-    this.catalog = new ModelCatalog(join(this.home, 'catalog.json'))
+    this.catalog = new ModelCatalog(
+      join(this.home, 'catalog.json'),
+      this.currentBinaryFingerprint(),
+    )
     this.bridge = new McpBridge(
       {
         listTools: (tenantKey) => this.listTools(tenantKey),
@@ -220,21 +231,77 @@ export class AntigravityRuntime {
     return this.catalog.contextWindowFor(model) ?? 0
   }
 
+  private currentBinaryFingerprint(binary?: string): string | undefined {
+    try {
+      return binaryFingerprint(
+        binary ?? resolveAgyBinary(this.host.config.command),
+      )
+    } catch {
+      return undefined
+    }
+  }
+
+  private reconcileBinaryFingerprint(binary?: string): void {
+    const fp = this.currentBinaryFingerprint(binary)
+    if (fp === undefined) return
+    if (
+      this.preflight !== undefined &&
+      this.preflightFingerprint !== undefined &&
+      this.preflightFingerprint !== fp
+    ) {
+      this.preflight = undefined
+      this.preflightFingerprint = undefined
+    }
+    if (
+      this.process?.alive &&
+      this.starting === undefined &&
+      this.processFingerprint !== undefined &&
+      this.processFingerprint !== fp &&
+      [...this.conversations.values()].every((c) => this.isIdle(c))
+    ) {
+      // Restart an idle ACP process after an on-disk `agy` upgrade so discovery probes the new binary.
+      const stale = this.process
+      this.process = undefined
+      this.processFingerprint = undefined
+      stale.stop()
+    }
+    if (this.catalog.syncBinaryFingerprint(fp)) {
+      this.host.onModelsChanged()
+    }
+  }
+
+  private nextTurnMetadataFloor(
+    sessionId: string | undefined,
+    modelFloor: number | null,
+  ): number | null {
+    if (!sessionId || modelFloor === null) return null
+    const nextIdx = readSessionNextMetadataIndex(this.home, sessionId)
+    return nextIdx === null ? null : Math.max(modelFloor, nextIdx)
+  }
+
   private observeSessionContextWindow(
     sessionId: string | undefined,
     model: string | undefined,
     minIdx: number | null,
+    turn?: AcpTurn,
   ): void {
-    if (
-      this.lifecycle !== 'active' ||
-      !sessionId ||
-      !model ||
-      minIdx === null
-    ) {
-      return
+    if (this.lifecycle !== 'active' || !sessionId) return
+    const turnFloor = turn?.metaFloorIdx ?? null
+    const turnMeta =
+      turn !== undefined && turnFloor !== null
+        ? readSessionContextMetadata(this.home, sessionId, turnFloor)
+        : undefined
+    if (turn !== undefined && turnMeta?.estimatedTokensUsed !== undefined) {
+      turn.estimatedContextUsed = turnMeta.estimatedTokensUsed
     }
-    const tokens = readSessionMaxContextTokens(this.home, sessionId, minIdx)
-    if (this.catalog.observeContextWindow(model, tokens)) {
+    if (!model || minIdx === null) return
+    const maxContextTokens =
+      turnMeta?.maxContextTokens ??
+      (turn !== undefined && turnFloor === minIdx
+        ? undefined
+        : readSessionContextMetadata(this.home, sessionId, minIdx)
+            ?.maxContextTokens)
+    if (this.catalog.observeContextWindow(model, maxContextTokens)) {
       this.host.onModelsChanged()
     }
   }
@@ -299,11 +366,11 @@ export class AntigravityRuntime {
   }
 
   private accountInfo(): AccountInfo | undefined {
-    const paths = [join(this.home, 'acp.log')]
+    const paths = [join(this.home, 'acp.log'), this.home]
     if (
       this.home === join(homedir(), '.pi', 'agent', 'cache', 'antigravity-acp')
     )
-      paths.push(join(homedir(), '.gemini', 'antigravity-cli', 'cli.log'))
+      paths.push(...defaultAgyHomes())
     const email = readLoggedEmail(paths)
     const tier = this.catalog.tier()
     if (!email && !tier) return undefined
@@ -369,6 +436,7 @@ export class AntigravityRuntime {
     options.signal?.throwIfAborted()
     if (this.warmupPromise !== undefined)
       return abortable(this.warmupPromise, options.signal)
+    this.reconcileBinaryFingerprint()
     if (!options.force && this.catalog.observed) return
     this.warmupPromise = (async () => {
       const proc = await this.ensureReady()
@@ -437,6 +505,7 @@ export class AntigravityRuntime {
     this.tenants.clear()
     this.process?.stop()
     this.process = undefined
+    this.processFingerprint = undefined
     this.disposal = (async () => {
       // Preflight waits are cancellable; binding must finish before closing its listener.
       await this.starting?.catch(() => undefined)
@@ -496,10 +565,9 @@ export class AntigravityRuntime {
       const split = splitSystem(options)
       const tools = toBridgeTools(options.tools)
       conv.toolNames = new Set(tools.map((t) => t.name))
-      const effort = this.effectiveEffort(
-        options.model,
-        asEffort(options.reasoningEffort) ?? this.host.config.defaultEffort,
-      )
+      const requestedEffort =
+        asEffort(options.reasoningEffort) ?? this.host.config.defaultEffort
+      let effort = this.effectiveEffort(options.model, requestedEffort)
 
       if (options.signal?.aborted) {
         this.dropTurn(conv, 'The harness cancelled this request.')
@@ -557,6 +625,7 @@ export class AntigravityRuntime {
       if (conv.sessionId === undefined) {
         conv.systemHash = digest(split.system)
         supplementalTools = await this.openSession(conv, tools, proc)
+        effort = this.effectiveEffort(options.model, requestedEffort)
       }
       this.assertOwner(proc, conv, conv.sessionId)
       await this.select(conv, proc, options.model, effort)
@@ -713,16 +782,31 @@ export class AntigravityRuntime {
         log: (message) => this.host.log.warn(message),
       })
       this.process = proc
+      this.processFingerprint = binaryFingerprint(preflight.binary)
       const started = proc
       proc.onExit((error) => this.onProcessExit(started, error))
-      await proc.start(120_000)
+      const init = await proc.start(120_000)
       this.assertOwner(proc)
+      const agentVersion = init?.agentInfo?.version
+      if (typeof agentVersion === 'string' && agentVersion.trim().length > 0) {
+        assertSupportedAgyVersion(agentVersion, preflight.binary)
+      }
+      if (
+        this.catalog.observeImageSupport(
+          init?.agentCapabilities?.promptCapabilities?.image,
+        )
+      ) {
+        this.host.onModelsChanged()
+      }
       this.state = 'ready'
       this.lastError = undefined
       return proc
     } catch (error) {
       proc?.stop()
-      if (this.process === proc) this.process = undefined
+      if (this.process === proc) {
+        this.process = undefined
+        this.processFingerprint = undefined
+      }
       if (this.lifecycle !== 'active') throw this.shutdown.signal.reason
       await this.bridge.close()
       this.assertActive()
@@ -735,6 +819,7 @@ export class AntigravityRuntime {
   }
 
   private runPreflight(): Promise<PreflightResult> {
+    this.reconcileBinaryFingerprint()
     if (this.preflight !== undefined) {
       prepareHome(this.home)
       return Promise.resolve(this.preflight)
@@ -742,6 +827,7 @@ export class AntigravityRuntime {
     this.preflightPromise ??= (async () => {
       const config = this.host.config
       const binary = resolveAgyBinary(config.command)
+      this.reconcileBinaryFingerprint(binary)
       const version = await readVersion(binary, this.host.runCommand)
       this.assertActive()
       assertSupportedAgyVersion(version, binary)
@@ -754,6 +840,7 @@ export class AntigravityRuntime {
         logFile: join(this.home, 'acp.log'),
       }
       this.preflight = result
+      this.preflightFingerprint = binaryFingerprint(binary)
       return result
     })().finally(() => {
       this.preflightPromise = undefined
@@ -763,7 +850,10 @@ export class AntigravityRuntime {
 
   private onProcessExit(proc: AcpProcess, error: Error): void {
     const current = this.process === proc
-    if (current) this.process = undefined
+    if (current) {
+      this.process = undefined
+      this.processFingerprint = undefined
+    }
     if (current && this.lifecycle === 'active') {
       this.state = 'error'
       this.lastError = error.message
@@ -841,6 +931,7 @@ export class AntigravityRuntime {
                 conv.sessionId,
                 conv.model,
                 conv.metaFloorIdx,
+                conv.turn,
               )
             }
             if (recordReportedToolCall(conv, update) === 'conflict') {
@@ -1008,12 +1099,16 @@ export class AntigravityRuntime {
     const modelOption = conv.configOptions.find(
       (o) => o.id === 'model' || o.category === 'model',
     )
+    const modelValues =
+      modelOption?.options !== undefined
+        ? flattenConfigOptions(modelOption.options)
+        : undefined
     if (
-      modelOption?.options !== undefined &&
-      !modelOption.options.some((o) => o.value === model)
+      modelValues !== undefined &&
+      !modelValues.some((o) => o.value === model)
     ) {
       throw new LlmError(
-        `Antigravity does not offer model "${model}" to this account; available: ${modelOption.options.map((o) => o.value).join(', ')}`,
+        `Antigravity does not offer model "${model}" to this account; available: ${modelValues.map((o) => o.value).join(', ')}`,
         'UNKNOWN_MODEL',
       )
     }
@@ -1043,11 +1138,10 @@ export class AntigravityRuntime {
     const levelOption = conv.configOptions.find(
       (o) => o.id === 'thought_level' || o.category === 'thought_level',
     )
-    // Fixed-variant families (GPT-OSS) reject every thought_level change; the
-    // effort already lives in the model id, so only selectable families write it.
-    const selectable = this.catalog.effortsFor(model)
+    // Fixed-variant families (GPT-OSS) and single-variant orchestrators reject
+    // thought_level writes, so only selectable families write it.
     if (
-      selectable.length > 0 &&
+      this.catalog.supportsEffortSelection(model) &&
       levelOption !== undefined &&
       conv.effort !== effort &&
       levelOption.currentValue !== effort
@@ -1195,9 +1289,19 @@ export class AntigravityRuntime {
     // Queue that failure too, so every allocated turn reaches the pump's cleanup owner.
     try {
       this.assertOwner(proc, conv, conv.sessionId)
-      turn.promptSettled = proc.prompt(conv.sessionId as string, blocks).then(
-        (result) => turn.events.push({ kind: 'done', result }),
-        (error: unknown) => turn.fail(mapError(error)),
+      const sessionId = conv.sessionId as string
+      const model = conv.model
+      const modelFloor = conv.metaFloorIdx
+      turn.metaFloorIdx = this.nextTurnMetadataFloor(sessionId, modelFloor)
+      turn.promptSettled = proc.prompt(sessionId, blocks).then(
+        (result) => {
+          this.observeSessionContextWindow(sessionId, model, modelFloor, turn)
+          turn.events.push({ kind: 'done', result })
+        },
+        (error: unknown) => {
+          this.observeSessionContextWindow(sessionId, model, modelFloor, turn)
+          turn.fail(mapError(error))
+        },
       )
     } catch (error) {
       turn.fail(mapError(error))
@@ -1253,8 +1357,33 @@ export class AntigravityRuntime {
         {
           parkSettleMs: this.host.config.parkSettleMs,
           maxContinuations: this.host.config.longDecodeContinuations,
-          continuePrompt: () =>
-            proc.prompt(sessionId, [{ type: 'text', text: CONTINUE_PROMPT }]),
+          continuePrompt: async () => {
+            turn.metaFloorIdx = this.nextTurnMetadataFloor(
+              sessionId,
+              metaFloorIdx,
+            )
+            turn.estimatedContextUsed = undefined
+            try {
+              const result = await proc.prompt(sessionId, [
+                { type: 'text', text: CONTINUE_PROMPT },
+              ])
+              this.observeSessionContextWindow(
+                sessionId,
+                options.model,
+                metaFloorIdx,
+                turn,
+              )
+              return result
+            } catch (error) {
+              this.observeSessionContextWindow(
+                sessionId,
+                options.model,
+                metaFloorIdx,
+                turn,
+              )
+              throw error
+            }
+          },
           cancel: () => {
             if (conv.turn === turn) proc.cancel(sessionId)
           },

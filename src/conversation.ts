@@ -35,37 +35,60 @@ const OUTPUT_LIMIT_HEAD =
 /** Second sentence of that same notice. */
 const OUTPUT_LIMIT_TAIL =
   'please continue from where you left off, keeping your response shorter'
+/** Internal retry notice agy emits when an upstream stream is interrupted mid-turn. */
+const STREAM_INTERRUPTED =
+  'the stream was interrupted. please continue the task you were working on.'
+/** Internal retry notice agy emits when a model response contains neither text nor tool calls. */
+const EMPTY_MODEL_OUTPUT =
+  'model output error: model output must contain either output text or tool calls, these cannot both be empty, please try again'
+const EMPTY_MODEL_OUTPUT_BODY =
+  'model output must contain either output text or tool calls, these cannot both be empty, please try again'
+/** Generic retry notice prefix paired with a trailing `Retries remaining: <N>`. */
+const PROBLEM_RETRY_PREFIX = 'there was a problem'
+/** Cap on held characters while waiting for `Retries remaining: <N>` after `There was a problem`. */
+const MAX_PROBLEM_NOTICE_CHARS = 512
 
-/** Collapse agy's warning mark and line breaks so the notice can be recognized across chunks. */
+/** Collapse agy's warning mark, line-leading `Error:`, and line breaks so notices match across chunks. */
 function noticeText(raw: string): string {
   return raw
     .replace(/⚠/g, ' ')
-    .replace(/\bError:/gi, ' ')
+    .replace(/(?:^|\n)\s*error:\s*/gi, ' ')
     .replace(/\s+/g, ' ')
     .trim()
     .toLowerCase()
 }
 
 /**
- * Classify text against agy's output-cap continuation notice.
- * `drop` is only that notice, `hold` is still a prefix of it, `emit` is model text.
+ * Classify text against agy's internal retry and output-cap continuation notices.
+ * `drop` is only an internal notice, `hold` is still a prefix of one, `emit` is model text.
  */
 export function classifyOutputLimitNotice(
   raw: string,
 ): 'drop' | 'hold' | 'emit' {
   const text = noticeText(raw)
-  if (text.length === 0) return 'emit'
+  if (text.length === 0) return raw.includes('⚠') ? 'hold' : 'emit'
+  if (/^there was a problem\b/.test(text)) {
+    if (/\bretries remaining:\s*\d+$/.test(text)) return 'drop'
+    return text.length <= MAX_PROBLEM_NOTICE_CHARS ? 'hold' : 'emit'
+  }
+  if (PROBLEM_RETRY_PREFIX.startsWith(text) && text.startsWith('there was'))
+    return 'hold'
   const stripped = text.replace(/\s*retries remaining:\s*\d*\s*$/i, '').trim()
   const retry = text.slice(stripped.length).trim()
   if (retry.length > 0 && !/^retries remaining:\s*\d*$/i.test(retry))
     return 'emit'
-  if (stripped.length === 0)
-    return /^retries remaining:\s*\d+$/i.test(text) ? 'drop' : 'emit'
+  if (stripped.length === 0) {
+    if (/^retries remaining:\s*\d+$/i.test(text)) return 'drop'
+    return /^retries remaining:\s*$/i.test(text) ? 'hold' : 'emit'
+  }
   const full = `${OUTPUT_LIMIT_HEAD} ${OUTPUT_LIMIT_TAIL}`
   if (
     stripped === full ||
     stripped === OUTPUT_LIMIT_HEAD ||
-    stripped === OUTPUT_LIMIT_TAIL
+    stripped === OUTPUT_LIMIT_TAIL ||
+    stripped === STREAM_INTERRUPTED ||
+    stripped === EMPTY_MODEL_OUTPUT ||
+    stripped === EMPTY_MODEL_OUTPUT_BODY
   )
     return 'drop'
   if (full.startsWith(stripped) && stripped.startsWith('your previous'))
@@ -73,6 +96,17 @@ export function classifyOutputLimitNotice(
   if (
     OUTPUT_LIMIT_TAIL.startsWith(stripped) &&
     stripped.startsWith('please continue from where you left off')
+  )
+    return 'hold'
+  if (
+    STREAM_INTERRUPTED.startsWith(stripped) &&
+    stripped.startsWith('the stream')
+  )
+    return 'hold'
+  if (
+    (EMPTY_MODEL_OUTPUT.startsWith(stripped) ||
+      EMPTY_MODEL_OUTPUT_BODY.startsWith(stripped)) &&
+    stripped.startsWith('model output')
   )
     return 'hold'
   if ('retries remaining:'.startsWith(text) && text.startsWith('retries'))
@@ -165,6 +199,10 @@ export class AcpTurn {
   usage?: AcpPromptResult['usage']
   /** Latest positive single-call context occupancy reported via `usage_update.used`. */
   contextUsed?: number
+  /** Fallback single-call context occupancy decoded from same-turn `gen_metadata` (`estimated_tokens_used`). */
+  estimatedContextUsed?: number
+  /** Lower `gen_metadata.idx` bound owned by the active turn segment, or `null` when unobservable. */
+  metaFloorIdx: number | null = 0
   /** Relayed call ids whose results the agent has not yet re-awaited via `pi_await_result`. */
   readonly relayedCalls = new Set<string>()
   /** Bounded output buffered while one or more calls are relayed. */
@@ -285,13 +323,18 @@ export class AcpTurn {
    */
   private consumeMessage(text: string): void {
     const combined = this.noticeHold + text
+    if (AGENT_RETRY_NOTICE.test(combined)) {
+      this.noticeHold = ''
+      this.retryNotices++
+      return
+    }
     const kind = classifyOutputLimitNotice(combined)
     if (kind === 'hold') {
       this.noticeHold = combined
       return
     }
     this.noticeHold = ''
-    if (kind === 'drop' || AGENT_RETRY_NOTICE.test(combined)) {
+    if (kind === 'drop') {
       this.retryNotices++
       return
     }
@@ -376,6 +419,8 @@ export interface PumpHost {
 export interface TokenUsageOptions {
   /** Latest single-call context occupancy reported via `usage_update.used`. */
   contextTokens?: number
+  /** Fallback single-call context occupancy decoded from same-turn `gen_metadata` (`estimated_tokens_used`). */
+  estimatedContextTokens?: number
   /** Final `session/prompt` segment's usage when the turn spanned `max_tokens` continuations. */
   lastSegmentUsage?: AcpPromptResult['usage']
 }
@@ -434,6 +479,7 @@ export function toTokenUsage(
       ? Math.min(output, Math.round(usage.thoughtTokens))
       : undefined
   const liveContext = options?.contextTokens
+  const estimatedContext = options?.estimatedContextTokens
   let totalTokens: number
   if (
     typeof liveContext === 'number' &&
@@ -441,6 +487,12 @@ export function toTokenUsage(
     liveContext > 0
   ) {
     totalTokens = Math.round(liveContext)
+  } else if (
+    typeof estimatedContext === 'number' &&
+    Number.isFinite(estimatedContext) &&
+    estimatedContext > 0
+  ) {
+    totalTokens = Math.round(estimatedContext)
   } else {
     const seg = options?.lastSegmentUsage ?? usage
     const scale = Math.max(1, calls)
@@ -620,6 +672,7 @@ async function* stepChunks(
           turn.continuations++
           turn.segmentToolSteps = 0
           turn.contextUsed = undefined
+          turn.estimatedContextUsed = undefined
           turn.promptSettled = host.continuePrompt().then(
             (result) => turn.events.push({ kind: 'done', result }),
             (error: unknown) =>
@@ -635,6 +688,7 @@ async function* stepChunks(
             : turn.toolSteps + turn.continuations + 1
         const usage = toTokenUsage(turn.usage, segmentCalls, {
           contextTokens: turn.contextUsed,
+          estimatedContextTokens: turn.estimatedContextUsed,
           lastSegmentUsage: event.result.usage ?? turn.usage,
         })
         if (usage !== undefined) yield { type: 'usage', usage }

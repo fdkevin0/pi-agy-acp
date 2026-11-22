@@ -71,8 +71,11 @@ it. This may start ACP but sends no model prompt; failure does not prevent quota
 from appearing. Use `/agy-acp reset` to retry discovery. Viewing status never starts it.
 
 The email comes from login logs. With the default home only, the extension also
-checks `~/.gemini/antigravity-cli/cli.log` if needed; a custom `PI_AGY_HOME` stays
-isolated. Cached plans and login logs can be stale after an account change.
+checks `ANTIGRAVITY_CLI_HOME`, `AGY_HOME`, and `~/.gemini/antigravity-cli`
+(`cli.log` plus the newest 10 `log/cli-*.log` and `log/acp-server-*.log` files,
+scanning each log's tail 64 KiB and falling back to its head 64 KiB when larger);
+a custom `PI_AGY_HOME` stays isolated. Cached plans and login logs can be stale
+after an account change.
 
 ### Quota status and warnings
 
@@ -125,31 +128,28 @@ for each concurrently running Pi instance, since startup cleanup assumes exclusi
 use of the directory.
 
 With file-backed authentication, the extension copies the existing OAuth token
-from your normal agy directory and sets its permissions to `0600`. Do not commit
+from your normal agy directory (`ANTIGRAVITY_CLI_HOME`, `AGY_HOME`, or
+`~/.gemini/antigravity-cli`) and sets its permissions to `0600`. Do not commit
 or share this directory. Authentication and token refresh remain agy's responsibility.
 
 ## Models and context
 
-Loading the extension uses the cached catalog, or five fallback model families,
-without starting agy. Model refresh or the first request updates available models
-and reasoning levels from ACP. A forced refresh queries again; refreshes can be
-cancelled. The selector exposes only the reasoning levels offered for each model.
-Direct requests map `minimal` to `low` and `xhigh` or `max` to `high`; `off` uses
-the runtime default.
+Loading the extension restores the cached catalog from `catalog.json` (or starts
+empty on a fresh install) without starting agy. Model refresh (such as opening
+`/model`) or the first request discovers available models, reasoning levels
+(including grouped select options and `-effort` suffix variants), and image input
+capability (`promptCapabilities.image`) dynamically from ACP. A forced refresh
+queries again; refreshes can be cancelled. The selector exposes only the
+reasoning levels offered for each model (`low`, `medium`, `high`, `xhigh`, `max`).
+Direct requests map `minimal` to `low` and forward `xhigh` and `max` (clamping to
+the nearest effort offered by that model); `off` uses the runtime default.
 
-The fallback families are:
-
-- `gemini-4-argon`
-- `gemini-3.8-flash`
-- `claude-opus-5-5`
-- `claude-sonnet-5-5`
-- `gpt-oss-120b-medium`
-
-These entries are defaults, not a guarantee of account access. Model context windows
-start at `0` until learned dynamically from the server-issued `max_context_tokens`
-metadata in the session database and cached per model in `catalog.json`. The history
-replay budget is 160,000 bytes; older history can be omitted to fit, and historical
-images become text placeholders.
+Model context windows start at `0` until learned dynamically from the
+server-issued `max_context_tokens` metadata in the session database and cached
+per model in `catalog.json` alongside the `agy` binary fingerprint; updating the
+`agy` binary invalidates cached context windows and triggers re-discovery on the
+next refresh or session. The history replay budget is 160,000 bytes; older
+history can be omitted to fit, and historical images become text placeholders.
 
 ## Usage and costs
 
@@ -157,7 +157,8 @@ Usage comes from the ACP session rather than per-step API headers. Parked `toolU
 steps emit zero usage; statistics arrive on the final step when the full ACP turn
 finishes (accumulated across any automatic `max_tokens` continuations). `max_context_tokens`
 recorded in the session SQLite metadata supplies the model's context window, while
-`usage_update` supplies live token occupancy.
+`usage_update` (and same-turn `estimated_tokens_used` metadata when `usage_update`
+is absent) supplies live token occupancy.
 
 The extension separates cumulative token consumption from final-call context
 occupancy:
@@ -167,10 +168,11 @@ occupancy:
   overrides reflect full multi-step consumption.
 - `totalTokens` (which feeds Pi's context meter and auto-compaction threshold via
   `calculateContextTokens`) uses the final model call's live `usage_update.used`
-  count when `agy` provides it. When `usage_update` is absent, it falls back to
-  averaging the final `session/prompt` segment's prompt tokens across that
-  segment's model calls plus final-segment output tokens; this fallback is an
-  estimate rather than an exact per-step measurement.
+  count when `agy` provides it. When `usage_update` is absent, it prefers the
+  same turn's `estimated_tokens_used` from `gen_metadata`, and otherwise falls
+  back to averaging the final `session/prompt` segment's prompt tokens across
+  that segment's model calls plus final-segment output tokens; this fallback is
+  an estimate rather than an exact per-step measurement.
 
 Default model prices are zero because pricing is unavailable. If you configure
 Pi model pricing overrides, flat per-million rates price the cumulative turn
@@ -184,7 +186,8 @@ scripts.
 
 ## Compatibility limits
 
-This version targets the `@earendil-works/*` Pi packages at version 1.5.x.
+This version requires `agy` CLI >= 1.5.10 and targets the `@earendil-works/*`
+Pi packages at version 1.5.x.
 Host `peerDependencies` use `*` as required by Pi package conventions;
 `devDependencies` pin a reproducible CI baseline (`1.5.2`), and CI validates
 both that baseline (on Node.js 22.19.0 and 24) and the `1.5.x` host range

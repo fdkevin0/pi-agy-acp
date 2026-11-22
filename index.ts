@@ -26,7 +26,7 @@ import type { QuotaSnapshot } from './src/quota.ts'
 
 export default function (
   pi: ExtensionAPI,
-  host: Partial<Pick<RuntimeHost, 'runCommand'>> = {},
+  host: Partial<Pick<RuntimeHost, 'runCommand' | 'spawnAcp'>> = {},
 ) {
   const envQuotaDisplay = asQuotaDisplay(process.env.PI_AGY_QUOTA_DISPLAY)
   const config = {
@@ -38,7 +38,7 @@ export default function (
   const createRuntime = () =>
     new AntigravityRuntime({
       config,
-      spawnAcp,
+      spawnAcp: host.spawnAcp ?? spawnAcp,
       runCommand: host.runCommand ?? runCommand,
       log: { info: () => {}, warn: () => {} },
       onModelsChanged: () => {
@@ -51,13 +51,14 @@ export default function (
     envQuotaDisplay ??
     readQuotaDisplayPreference(home) ??
     DEFAULT_QUOTA_DISPLAY
-  const models = (): ProviderModelConfig[] =>
-    runtime.catalog.list().map((m) => {
+  const models = (): ProviderModelConfig[] => {
+    const input = runtime.catalog.inputModalities()
+    return runtime.catalog.list().map((m) => {
       const efforts = runtime.catalog.effortsFor(m.id)
       return {
         id: m.id,
         name: m.name,
-        input: ['text', 'image'],
+        input,
         reasoning: efforts.length > 0,
         thinkingLevelMap:
           efforts.length > 0
@@ -67,8 +68,8 @@ export default function (
                 low: efforts.includes('low') ? 'low' : null,
                 medium: efforts.includes('medium') ? 'medium' : null,
                 high: efforts.includes('high') ? 'high' : null,
-                xhigh: null,
-                max: null,
+                xhigh: efforts.includes('xhigh') ? 'xhigh' : null,
+                max: efforts.includes('max') ? 'max' : null,
               }
             : undefined,
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -76,6 +77,7 @@ export default function (
         maxTokens: 65536,
       }
     })
+  }
   const register = () =>
     pi.registerProvider(config.provider, {
       name: config.displayName,

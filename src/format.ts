@@ -1,4 +1,4 @@
-import { asEffort, type Effort, type QuotaDisplay } from './config.ts'
+import { asEffort, EFFORTS, type Effort, type QuotaDisplay } from './config.ts'
 import type {
   AccountInfo,
   QuotaSnapshot,
@@ -33,10 +33,16 @@ export interface QuotaModelRef {
 const EXPLICIT_MEMBERS_PREFIX = /^\s*models within this group:\s*/i
 const CLAUSE_SPLIT = /[,;\n/|&+]+|\b(?:and|or)\b/i
 const ID_DATE_SUFFIX = /[-_](?:20\d{2}[-_]\d{2}[-_]\d{2}|20\d{6})$/i
+const EFFORT_PATTERN = EFFORTS.join('|')
 // Effort or thinking-mode suffixes in model IDs (`-thinking`) and `/usage` labels (`(Thinking)`).
-const ID_QUALIFIER_SUFFIX = /[-_](low|medium|high|thinking)$/i
-const GROUP_QUALIFIER_SUFFIX =
-  /\s*\((low|medium|high|thinking)\)(?=\s*(?:models?|groups?)?[\s.!?)]*$)/i
+const ID_QUALIFIER_SUFFIX = new RegExp(
+  `[-_](?:(${EFFORT_PATTERN})(?:-effort)?|(thinking))$`,
+  'i',
+)
+const GROUP_QUALIFIER_SUFFIX = new RegExp(
+  `\\s*\\((${EFFORT_PATTERN}|thinking)\\)(?=\\s*(?:models?|groups?)?[\\s.!?)]*$)`,
+  'i',
+)
 const SPECIFIER = /^\d+(?:\.\d+)*b?$/
 const VENDOR_TOKENS = new Set(['google', 'anthropic', 'openai'])
 const FAMILY_TOKENS = new Set(['gemini', 'claude', 'gpt'])
@@ -127,7 +133,7 @@ function parseClause(raw: string, stripNoise = false): ParsedPhrase {
     }
     const idQual = ID_QUALIFIER_SUFFIX.exec(text)
     if (idQual) {
-      const nextEffort = asEffort(idQual[1]!.toLowerCase())
+      const nextEffort = asEffort((idQual[1] ?? idQual[2])!.toLowerCase())
       if (nextEffort) {
         if (effort && effort !== nextEffort) effortConflict = true
         effort = nextEffort
@@ -447,7 +453,7 @@ export function formatStatus(status: RuntimeStatus): FormattedNotice {
     `  Home:     ${status.home}`,
     ...(account ? [`  Account:  ${account}`] : []),
     `  Sessions: ${status.liveSessions} live · ${status.activeTurns} active turn(s)`,
-    `  Context:  ${status.contextWindow ? `${Math.round(status.contextWindow / 1024)}K tokens` : 'dynamic (unprobed)'} · default effort: ${status.defaultEffort} (${status.efforts.join(', ')})`,
+    `  Context:  ${status.contextWindow ? `${Math.round(status.contextWindow / 1024)}K tokens` : 'dynamic (unprobed)'} · default effort: ${status.defaultEffort}${status.efforts.length > 0 ? ` (${status.efforts.join(', ')})` : ''}`,
     '  Models:',
   ]
   if (status.models.length === 0) lines.push('    No models available.')

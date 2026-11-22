@@ -10,6 +10,7 @@ import {
   mkdirSync,
   readFileSync,
   writeFileSync,
+  copyFileSync,
   existsSync,
   chmodSync,
   utimesSync,
@@ -31,6 +32,7 @@ import { VERSION } from '../src/version.ts'
 import { AcpProcess } from '../src/acp-process.ts'
 import {
   AcpTurn,
+  classifyOutputLimitNotice,
   pumpStep,
   structuredToolMeta,
   toTokenUsage,
@@ -2329,12 +2331,12 @@ test('Windows preflight locates agy.exe in LOCALAPPDATA and PATH while skipping 
   )
 
   assert.throws(
-    () => assertSupportedAgyVersion('1.2.7', defaultWinExe),
-    /1\.2\.7.*agy update/,
+    () => assertSupportedAgyVersion('1.5.9', defaultWinExe),
+    /1\.5\.9.*agy update/,
   )
-  assert.doesNotThrow(() => assertSupportedAgyVersion('1.5.2', defaultWinExe))
+  assert.doesNotThrow(() => assertSupportedAgyVersion('1.5.10', defaultWinExe))
   assert.doesNotThrow(() =>
-    assertSupportedAgyVersion('Antigravity CLI 1.5.2', defaultWinExe),
+    assertSupportedAgyVersion('Antigravity CLI 1.5.14', defaultWinExe),
   )
   assert.doesNotThrow(() =>
     assertSupportedAgyVersion('fake-agy 0.0.1', defaultWinExe),
@@ -3839,4 +3841,346 @@ test('switching models in a reused session isolates gen_metadata rows and thrown
     /synthetic prompt error/,
   )
   assert.equal(runtime.contextWindowFor('claude-sonnet-5-5'), 300_000)
+})
+
+test('initialize handshake rejects unsupported agentInfo.version even when --version is non-semver', async (t) => {
+  const { runtime } = makeRuntime(t, {
+    env: { FAKE_AGY_VERSION: '1.5.9' },
+    host: {
+      runCommand: async () => ({ code: 0, stdout: 'unknown', stderr: '' }),
+    },
+  })
+  await assert.rejects(runtime.ensureReady(), /requires >= 1\.5\.10/)
+  assert.equal(runtime.process, undefined)
+  assert.equal(runtime.bridge.server, undefined)
+  assert.equal(runtime.status().state, 'error')
+})
+
+test('binary fingerprint change invalidates cached contextWindows and forces warmup to re-probe', async (t) => {
+  const binDir = mkdtempSync(join(tmpdir(), 'agy-bin-fp-'))
+  t.after(() => rmSync(binDir, { recursive: true, force: true }))
+  const customFake = join(binDir, 'agy')
+  copyFileSync(fake, customFake)
+  chmodSync(customFake, 0o755)
+
+  const modelChanges = []
+  const { home, runtime, adapter, mcps } = makeRuntime(t, {
+    config: { command: customFake },
+    host: {
+      onModelsChanged: () => {
+        modelChanges.push(runtime.contextWindowFor('gemini-4-argon'))
+      },
+    },
+  })
+
+  await collect(
+    adapter.stream({
+      provider: 'antigravity',
+      model: 'gemini-4-argon',
+      sessionId: 'S-FP',
+      messages: [sys, user('u1', 'hello')],
+    }),
+  )
+  assert.equal(runtime.contextWindowFor('gemini-4-argon'), 512_000)
+  assert.equal(runtime.catalog.observed, true)
+  const saved = JSON.parse(readFileSync(join(home, 'catalog.json'), 'utf8'))
+  assert.equal(typeof saved.binaryFingerprint, 'string')
+  assert.equal(mcps().length, 1)
+
+  // Calling warmup with unchanged binary is a no-op because catalog is observed.
+  await runtime.warmup()
+  assert.equal(mcps().length, 1)
+
+  // Updating the binary on disk changes its fingerprint, invalidating contextWindows and observed.
+  writeFileSync(customFake, `${readFileSync(customFake, 'utf8')}\n// updated\n`)
+  chmodSync(customFake, 0o755)
+  await runtime.warmup()
+  assert.equal(runtime.contextWindowFor('gemini-4-argon'), 0)
+  assert.equal(mcps().length, 2)
+  assert.equal(modelChanges.at(-1), 0)
+  const updatedSaved = JSON.parse(readFileSync(join(home, 'catalog.json'), 'utf8'))
+  assert.notEqual(updatedSaved.binaryFingerprint, saved.binaryFingerprint)
+})
+
+test('select handles models and efforts advertised inside grouped configOptions', async (t) => {
+  const selected = []
+  const groupedOptions = [
+    {
+      id: 'model',
+      category: 'model',
+      currentValue: 'gemini-4-argon',
+      options: [
+        {
+          group: 'google',
+          options: [{ value: 'gemini-4-argon', name: 'Gemini 4 Argon' }],
+        },
+        {
+          group: 'anthropic',
+          options: [{ value: 'claude-opus-5-5', name: 'Claude Opus 5.5' }],
+        },
+      ],
+    },
+    {
+      id: 'thought_level',
+      category: 'thought_level',
+      currentValue: 'high',
+      options: [
+        { group: 'standard', options: [{ value: 'low' }, { value: 'high' }] },
+        { group: 'extended', options: [{ value: 'xhigh' }, { value: 'max' }] },
+      ],
+    },
+  ]
+  const { runtime } = makeRuntime(t, {
+    host: {
+      spawnAcp: () =>
+        scriptedChild({
+          initialize: (request, wire) =>
+            sendWireResult(request, wire, {
+              protocolVersion: 1,
+              agentInfo: { name: 'grouped-fake', version: '1.5.14' },
+            }),
+          'session/new': (request, wire) =>
+            sendWireResult(request, wire, {
+              sessionId: 's-grouped',
+              configOptions: groupedOptions,
+              models: {
+                availableModels: [
+                  { modelId: 'gemini-4-argon-low-effort' },
+                  { modelId: 'gemini-4-argon-high-effort' },
+                  { modelId: 'claude-opus-5-5-high-effort' },
+                  { modelId: 'claude-opus-5-5-xhigh-effort' },
+                  { modelId: 'claude-opus-5-5-max-effort' },
+                ],
+              },
+            }),
+          'session/set_config_option': (request, wire) => {
+            selected.push([request.params.configId, request.params.value])
+            sendWireResult(request, wire, { configOptions: groupedOptions })
+          },
+          'session/prompt': (request, wire) => {
+            wire.stdout.write(
+              `${JSON.stringify({
+                jsonrpc: '2.0',
+                method: 'session/update',
+                params: {
+                  sessionId: 's-grouped',
+                  update: {
+                    sessionUpdate: 'agent_message_chunk',
+                    content: { type: 'text', text: 'grouped-ok' },
+                  },
+                },
+              })}\n`,
+            )
+            sendWireResult(request, wire, { stopReason: 'end_turn' })
+          },
+        }),
+    },
+  })
+
+  const chunks = await collect(
+    runtime.stream({
+      model: 'claude-opus-5-5',
+      reasoningEffort: 'xhigh',
+      sessionId: 'S-GROUPED',
+      messages: [sys, user('u1', 'hi')],
+    }),
+  )
+  assert.equal(finishOf(chunks).reason.kind, 'stop')
+  assert.equal(textOf(chunks), 'grouped-ok')
+  assert.deepEqual(selected, [
+    ['model', 'claude-opus-5-5'],
+    ['thought_level', 'xhigh'],
+  ])
+})
+
+test('AGY internal retry notices (stream interrupted, empty output, problem retries) are filtered without setting turn.produced', async () => {
+  assert.equal(
+    classifyOutputLimitNotice(
+      'The stream was interrupted. Please continue the task you were working on.',
+    ),
+    'drop',
+  )
+  assert.equal(
+    classifyOutputLimitNotice('The stream was interrupted.'),
+    'hold',
+  )
+  assert.equal(
+    classifyOutputLimitNotice(
+      'model output error: model output must contain either output text or tool calls, these cannot both be empty, please try again',
+    ),
+    'drop',
+  )
+  assert.equal(
+    classifyOutputLimitNotice(
+      '⚠ Error: model output error: model output must contain either output text or tool calls, these cannot both be empty, please try again\nRetries remaining: 2',
+    ),
+    'drop',
+  )
+  assert.equal(
+    classifyOutputLimitNotice('There was a problem communicating with backend.'),
+    'hold',
+  )
+  assert.equal(
+    classifyOutputLimitNotice(
+      'There was a problem communicating with backend.\nRetries remaining: 2',
+    ),
+    'drop',
+  )
+
+  // Turn with only internal retry notices (including cross-chunk splits) must NOT emit text or mark produced=true.
+  const emptyTurn = new AcpTurn('retryonly')
+  emptyTurn.onUpdate({
+    sessionUpdate: 'agent_message_chunk',
+    content: { type: 'text', text: 'The stream was interrupted.' },
+  })
+  emptyTurn.onUpdate({
+    sessionUpdate: 'agent_message_chunk',
+    content: {
+      type: 'text',
+      text: ' Please continue the task you were working on.\n',
+    },
+  })
+  emptyTurn.onUpdate({
+    sessionUpdate: 'agent_message_chunk',
+    content: {
+      type: 'text',
+      text: 'model output error: model output must contain either output text or tool calls, ',
+    },
+  })
+  emptyTurn.onUpdate({
+    sessionUpdate: 'agent_message_chunk',
+    content: {
+      type: 'text',
+      text: 'these cannot both be empty, please try again\n',
+    },
+  })
+  emptyTurn.onUpdate({
+    sessionUpdate: 'agent_message_chunk',
+    content: { type: 'text', text: 'There was a problem generating output.' },
+  })
+  emptyTurn.onUpdate({
+    sessionUpdate: 'agent_message_chunk',
+    content: { type: 'text', text: '\nRetries remaining: 1\n' },
+  })
+  emptyTurn.events.push({ kind: 'done', result: { stopReason: 'end_turn' } })
+  const pumpHost = {
+    parkSettleMs: 10,
+    maxContinuations: 0,
+    continuePrompt: async () => ({ stopReason: 'end_turn' }),
+    cancel: () => {},
+  }
+  await assert.rejects(
+    collect(pumpStep(emptyTurn, pumpHost, undefined)),
+    (err) => err?.code === 'EMPTY_RESPONSE',
+  )
+  assert.equal(emptyTurn.produced, false)
+  assert.equal(emptyTurn.retryNotices, 3)
+
+  // Normal prose starting with "There was a problem" without "Retries remaining:" still flushes to the user.
+  const proseTurn = new AcpTurn('prose')
+  proseTurn.onUpdate({
+    sessionUpdate: 'agent_message_chunk',
+    content: { type: 'text', text: 'There was a problem in src/app.ts.' },
+  })
+  proseTurn.onUpdate({
+    sessionUpdate: 'agent_message_chunk',
+    content: { type: 'text', text: ' I fixed the import.' },
+  })
+  proseTurn.events.push({ kind: 'done', result: { stopReason: 'end_turn' } })
+  const proseChunks = await collect(pumpStep(proseTurn, pumpHost, undefined))
+  assert.equal(finishOf(proseChunks).reason.kind, 'stop')
+  assert.equal(
+    textOf(proseChunks),
+    'There was a problem in src/app.ts. I fixed the import.',
+  )
+  assert.equal(proseTurn.produced, true)
+  assert.equal(proseTurn.retryNotices, 0)
+})
+
+test('toTokenUsage and runtime fall back to same-turn gen_metadata estimated_tokens_used when usage_update is absent', async (t) => {
+  assert.equal(
+    toTokenUsage(
+      { inputTokens: 600, outputTokens: 50, cachedReadTokens: 400 },
+      2,
+      { contextTokens: 848, estimatedContextTokens: 1234 },
+    ).totalTokens,
+    848,
+  )
+  assert.equal(
+    toTokenUsage(
+      { inputTokens: 600, outputTokens: 50, cachedReadTokens: 400 },
+      2,
+      { estimatedContextTokens: 1234 },
+    ).totalTokens,
+    1234,
+  )
+  assert.equal(
+    toTokenUsage(
+      { inputTokens: 600, outputTokens: 50, cachedReadTokens: 400 },
+      2,
+      { contextTokens: 0, estimatedContextTokens: 0 },
+    ).totalTokens,
+    550,
+  )
+
+  const { adapter } = makeRuntime(t)
+  const base = {
+    provider: 'antigravity',
+    model: 'gemini-4-argon',
+    sessionId: 'S-EST-CTX',
+  }
+
+  // Turn 1: no usage_update, same-turn gen_metadata provides estimated_tokens_used = 1234.
+  const turn1 = await collect(
+    adapter.stream({ ...base, messages: [sys, user('u1', 'ESTCTX 1234 hello')] }),
+  )
+  assert.equal(finishOf(turn1).reason.kind, 'stop')
+  assert.equal(turn1.find((c) => c.type === 'usage').usage.totalTokens, 1234)
+
+  // Turn 2 (same session): neither usage_update nor estimated_tokens_used -> must NOT reuse Turn 1's 1234.
+  const turn2 = await collect(
+    adapter.stream({
+      ...base,
+      messages: [sys, user('u1', 'ESTCTX 1234 hello'), assistantFrom('a1', turn1), user('u2', 'plain turn')],
+    }),
+  )
+  assert.equal(finishOf(turn2).reason.kind, 'stop')
+  assert.equal(turn2.find((c) => c.type === 'usage').usage.totalTokens, 1050)
+
+  // Turn 3: both usage_update (848) and estimated_tokens_used (2222) -> usage_update wins.
+  const turn3 = await collect(
+    adapter.stream({
+      ...base,
+      messages: [
+        sys,
+        user('u1', 'ESTCTX 1234 hello'),
+        assistantFrom('a1', turn1),
+        user('u2', 'plain turn'),
+        assistantFrom('a2', turn2),
+        user('u3', 'ESTCTX 2222\nUSAGEUPD 848'),
+      ],
+    }),
+  )
+  assert.equal(finishOf(turn3).reason.kind, 'stop')
+  assert.equal(turn3.find((c) => c.type === 'usage').usage.totalTokens, 848)
+})
+
+test('initialize promptCapabilities.image dynamically updates catalog input modalities', async (t) => {
+  const changed = []
+  const { home, runtime } = makeRuntime(t, {
+    env: { FAKE_AGY_IMAGE: '0' },
+    host: {
+      onModelsChanged: () => {
+        changed.push(runtime.catalog.inputModalities())
+      },
+    },
+  })
+  assert.deepEqual(runtime.catalog.inputModalities(), ['text', 'image'])
+  await runtime.ensureReady()
+  assert.deepEqual(runtime.catalog.inputModalities(), ['text'])
+  assert.deepEqual(changed, [['text']])
+  assert.deepEqual(
+    new ModelCatalog(join(home, 'catalog.json')).inputModalities(),
+    ['text'],
+  )
 })

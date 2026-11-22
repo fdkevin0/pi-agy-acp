@@ -29,13 +29,24 @@ pi -e ./index.ts
    session cleanup finishes before Pi can start its next step.
 
 - **Model discovery:** Registration and cache-only refresh start no processes,
-  sockets, or timers. Concurrent refreshes share a discovery session; after a live
+  sockets, or timers; before the first ACP discovery (`catalog.json` absent),
+  the catalog starts empty with no hardcoded model list. `catalog.json` is
+  written atomically and persists models, per-model efforts, `promptCapabilities.image`,
+  tier, `contextWindows`, and a subprocess-free `agy` binary fingerprint
+  (`realpath`, `dev`, `ino`, `size`, `mtimeNs`); a changed binary invalidates
+  cached `contextWindows` and `observed` so the next refresh or session re-probes.
+  The ACP `initialize` handshake also validates `agentInfo.version` against
+  `MIN_AGY_VERSION`. Concurrent refreshes share a discovery session; after a live
   catalog is observed, later refreshes reuse it unless forced. Refresh suppresses
   provider re-registration so it cannot cancel itself. Cancellation ends the
   caller's wait; shared discovery still closes its session and cleans its files.
 - **Session lifecycle:** The bridge binds to `127.0.0.1`, uses per-session bearer
   credentials, and validates structured tool identity before granting permissions.
-  Live `agy 1.5.9` sessions issue `session/request_permission` only inside an
+  On Unix, `agy acp` and helper commands run in detached process groups so
+  termination and timeouts signal `-pid` (`SIGTERM`, then `SIGKILL`) without
+  orphaning `--process-per-session` workers. Session SQLite reads reject
+  symlinked or non-regular `.db`, `.db-wal`, and `.db-shm` files.
+  Live `agy 1.5.10+` sessions issue `session/request_permission` only inside an
   active `session/prompt` turn (never during `session/new` or
   `session/set_config_option`), so session creation and idle pre-/post-turn
   windows remain fail-closed (`cancelled` before `session/new` completes;
@@ -52,13 +63,16 @@ pi -e ./index.ts
   First interruption wins (`abandon` vs. `fail`), cancellation takes priority
   over buffered output, and turn/tenant identities guard all async callbacks.
 - **Quota and TUI:** Settled checks share the reader's TTL and in-flight request
-  without blocking Pi. Model selection reads memory only. UI generation checks
-  discard stale background results; warning keys include group, bucket, reset
-  time, and threshold. An explicit quota query can discover uncached account tiers through
-  one tool-less ACP session per runtime, persisting the tier in `catalog.json`.
-  Email lookup reads at most the last 64 KiB of each candidate login log and uses
-  the last match in the first matching file. Runtime warnings stay off stderr to
-  preserve TUI rendering; diagnostics use status and agy's logs.
+  without blocking Pi. `/usage` commands close stdin, cap stdout at 1 MiB, and
+  abort early if stderr matches `Authentication required`. Model selection reads
+  memory only. UI generation checks discard stale background results; warning
+  keys include group, bucket, reset time, and threshold. An explicit quota query
+  can discover uncached account tiers through one tool-less ACP session per
+  runtime, persisting the tier in `catalog.json`. Email lookup scans `cli.log`
+  and the newest 10 contained `log/cli-*.log` and `log/acp-server-*.log` files
+  (newest first, deduplicated), checking the tail 64 KiB first and falling back
+  to the head 64 KiB when larger. Runtime warnings stay off stderr to preserve
+  TUI rendering; diagnostics use status and agy's logs.
 - **Pi stream and error contracts:** `onPayload` can replace the request, and
   `onProviderStreamEvent` observes events before conversion. At the first stream
   event, `onResponse` receives synthetic status `200` and empty headers before
