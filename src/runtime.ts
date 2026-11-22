@@ -8,6 +8,7 @@
  */
 
 import { randomBytes, timingSafeEqual } from 'node:crypto'
+import { statSync } from 'node:fs'
 import { join } from 'node:path'
 import { LlmError } from './protocol.ts'
 import type {
@@ -94,6 +95,8 @@ import { VERSION } from './version.ts'
 
 const CONTINUE_PROMPT =
   'Continue exactly where your previous output stopped. Do not repeat any earlier text.'
+const SWEEP_INTERVAL_MS = 60_000
+const EMAIL_CACHE_TTL_MS = 10_000
 
 /** Host services the runtime uses. */
 export interface RuntimeHost {
@@ -107,6 +110,8 @@ export interface RuntimeHost {
   relayAfterMs?: number
   /** Monotonic clock in milliseconds for quota TTL checks; defaults to `performance.now()`. */
   quotaNow?: () => number
+  /** Monotonic clock in milliseconds for idle-session sweeping, LRU ordering, and log-email cache TTL; defaults to `performance.now()`. */
+  monotonicNow?: () => number
 }
 
 /** Snapshot reported to the settings page and quota pill. */
@@ -163,6 +168,7 @@ interface Conversation {
   turn: AcpTurn | undefined
   dirty: boolean
   lastUsed: number
+  idleMs: number
   model: string | undefined
   /** Lower `gen_metadata.idx` bound for `model`, or `null` when unobservable after a failed cursor read. */
   metaFloorIdx: number | null
@@ -199,6 +205,11 @@ export class AntigravityRuntime {
   /** Serializes capacity checks and session creation so concurrent requests cannot overshoot maxLiveSessions. */
   private readonly capacityMutex = new KeyedMutex()
   private sweeper: ReturnType<typeof setInterval> | undefined
+  private readonly monotonicNow: () => number
+  private lastSweepAt: number
+  private emailCache:
+    | { fingerprint: string; email: string | undefined; at: number }
+    | undefined
   private lastTurn: RuntimeStatus['lastTurn']
   private lifecycle: 'active' | 'disposing' | 'disposed' = 'active'
   private readonly shutdown = new AbortController()
@@ -208,6 +219,8 @@ export class AntigravityRuntime {
   /** @param host - host services. */
   constructor(host: RuntimeHost) {
     this.host = host
+    this.monotonicNow = host.monotonicNow ?? (() => performance.now())
+    this.lastSweepAt = this.monotonicNow()
     this.home = host.config.home.length > 0 ? host.config.home : defaultHome()
     this.catalog = new ModelCatalog(
       join(this.home, 'catalog.json'),
@@ -267,9 +280,20 @@ export class AntigravityRuntime {
     ) {
       // Restart an idle ACP process after an on-disk `agy` upgrade so discovery probes the new binary.
       const stale = this.process
+      const staleSessions = [...this.conversations.values()]
+        .filter((conv) => conv.process === stale)
+        .map((conv) => ({ conv, sessionId: conv.sessionId }))
       this.process = undefined
       this.processFingerprint = undefined
+      this.state = 'idle'
       stale.stop()
+      for (const { conv, sessionId } of staleSessions) {
+        if (sessionId !== undefined) {
+          removeSessionArtifacts(this.home, sessionId)
+        }
+        this.clearSession(conv)
+        conv.dirty = true
+      }
     }
     if (this.catalog.syncBinaryFingerprint(fp)) {
       this.host.onModelsChanged()
@@ -423,7 +447,19 @@ export class AntigravityRuntime {
     const paths = [join(this.home, 'acp.log'), this.home]
     if (isDefaultPiAgyHome(this.home))
       paths.push(...defaultAgyHomes())
-    const email = readLoggedEmail(paths)
+    const now = this.monotonicNow()
+    const fingerprint = logPathsFingerprint(paths)
+    let email: string | undefined
+    if (
+      this.emailCache !== undefined &&
+      this.emailCache.fingerprint === fingerprint &&
+      now - this.emailCache.at < EMAIL_CACHE_TTL_MS
+    ) {
+      email = this.emailCache.email
+    } else {
+      email = readLoggedEmail(paths)
+      this.emailCache = { fingerprint, email, at: now }
+    }
     const tier = this.catalog.tier()
     if (!email && !tier) return undefined
     return { email, plan: tier?.name, tierId: tier?.id }
@@ -464,7 +500,8 @@ export class AntigravityRuntime {
   async ensureReady(): Promise<AcpProcess> {
     this.assertActive()
     if (this.sweeper === undefined) {
-      this.sweeper = setInterval(() => this.sweep(), 60_000)
+      this.lastSweepAt = this.monotonicNow()
+      this.sweeper = setInterval(() => this.sweep(), SWEEP_INTERVAL_MS)
       this.sweeper.unref?.()
     }
     if (this.starting === undefined && this.process?.alive === true)
@@ -613,7 +650,8 @@ export class AntigravityRuntime {
       this.assertActive()
       conv = await this.acquireConversation(key)
       this.assertOwner(proc, conv)
-      conv.lastUsed = Date.now()
+      conv.lastUsed = this.monotonicNow()
+      conv.idleMs = 0
       const split = splitSystem(options)
       const tools = toBridgeTools(options.tools)
       conv.toolNames = new Set(tools.map((t) => t.name))
@@ -638,10 +676,11 @@ export class AntigravityRuntime {
         // already owns. A compaction checkpoint, pruned/rewritten prefix, or
         // model/effort change means the live session is stale, so abandon the
         // turn and let plan() rebuild from Pi's authoritative history.
+        const resumedEffort = clampEffortToOptions(conv.configOptions, effort)
         if (
           !this.historyPrefixIntact(conv, split.system, split.messages) ||
           conv.model !== options.model ||
-          conv.effort !== effort
+          conv.effort !== resumedEffort
         ) {
           this.dropTurn(
             conv,
@@ -658,7 +697,7 @@ export class AntigravityRuntime {
           this.assertActive()
           if (resumed !== undefined) {
             conv.knownIds = messageIds(split.messages)
-            yield* this.pump(conv, resumed, proc, options, effort)
+            yield* this.pump(conv, resumed, proc, options, resumedEffort)
             return
           }
           this.dropTurn(
@@ -680,7 +719,7 @@ export class AntigravityRuntime {
         effort = this.effectiveEffort(options.model, requestedEffort)
       }
       this.assertOwner(proc, conv, conv.sessionId)
-      await this.select(conv, proc, options.model, effort)
+      effort = await this.select(conv, proc, options.model, effort)
       this.assertOwner(proc, conv, conv.sessionId)
       let blocks: AcpPromptBlock[]
       if (plan.rebuild) {
@@ -736,6 +775,8 @@ export class AntigravityRuntime {
     const existing = this.conversations.get(key)
     if (existing !== undefined) {
       existing.opening = true
+      existing.lastUsed = this.monotonicNow()
+      existing.idleMs = 0
       return existing
     }
     const unlock = await this.capacityMutex.acquire(
@@ -747,6 +788,8 @@ export class AntigravityRuntime {
       const again = this.conversations.get(key)
       if (again !== undefined) {
         again.opening = true
+        again.lastUsed = this.monotonicNow()
+        again.idleMs = 0
         return again
       }
       const max = Math.max(1, this.host.config.maxLiveSessions)
@@ -794,7 +837,8 @@ export class AntigravityRuntime {
       issuedIds: new Set(),
       turn: undefined,
       dirty: false,
-      lastUsed: Date.now(),
+      lastUsed: this.monotonicNow(),
+      idleMs: 0,
       model: undefined,
       metaFloorIdx: 0,
       effort: undefined,
@@ -1166,7 +1210,7 @@ export class AntigravityRuntime {
     proc: AcpProcess,
     model: string,
     effort: Effort,
-  ): Promise<void> {
+  ): Promise<Effort> {
     const sessionId = conv.sessionId as string
     this.assertOwner(proc, conv, sessionId)
     const modelOption = conv.configOptions.find(
@@ -1213,17 +1257,37 @@ export class AntigravityRuntime {
     const levelOption = conv.configOptions.find(
       (o) => o.id === 'thought_level' || o.category === 'thought_level',
     )
+    const offeredEfforts =
+      levelOption?.options !== undefined
+        ? flattenConfigOptions(levelOption.options)
+            .map((o) => asEffort(o.value))
+            .filter((v): v is Effort => v !== undefined)
+        : undefined
+    const targetEffort =
+      offeredEfforts !== undefined && offeredEfforts.length > 0
+        ? offeredEfforts.includes(effort)
+          ? effort
+          : nearestEffort(effort, offeredEfforts)
+        : effort
     // Fixed-variant families (GPT-OSS) and single-variant orchestrators reject
-    // thought_level writes, so only selectable families write it.
+    // thought_level writes, so only selectable families with offered levels write it.
     if (
       this.catalog.supportsEffortSelection(model) &&
       levelOption !== undefined &&
-      conv.effort !== effort &&
-      levelOption.currentValue !== effort
+      (offeredEfforts === undefined || offeredEfforts.length > 0) &&
+      conv.effort !== targetEffort &&
+      levelOption.currentValue !== targetEffort
     ) {
-      await this.applyConfigOption(conv, proc, sessionId, levelOption.id, effort)
+      await this.applyConfigOption(
+        conv,
+        proc,
+        sessionId,
+        levelOption.id,
+        targetEffort,
+      )
     }
-    conv.effort = effort
+    conv.effort = targetEffort
+    return targetEffort
   }
 
   private async applyConfigOption(
@@ -1240,6 +1304,9 @@ export class AntigravityRuntime {
       })
     this.assertOwner(proc, conv, sessionId)
     conv.configOptions = configOptions
+    if (this.catalog.observe(configOptions)) {
+      this.host.onModelsChanged()
+    }
   }
 
   private plan(
@@ -1620,7 +1687,8 @@ export class AntigravityRuntime {
   }
 
   private async afterStep(conv: Conversation): Promise<void> {
-    conv.lastUsed = Date.now()
+    conv.lastUsed = this.monotonicNow()
+    conv.idleMs = 0
     const idle = this.isIdle(conv)
     if (idle && conv.key.startsWith('anon-')) {
       await this.resetSession(conv)
@@ -1674,8 +1742,12 @@ export class AntigravityRuntime {
           ? request.arguments.call_id
           : ''
       return (
-        turn.awaitRelayedCall(callId, relayAfterMs, request.signal) ??
-        toolError(`Unknown harness call id ${callId}.`)
+        turn.awaitRelayedCall(
+          callId,
+          relayAfterMs,
+          request.signal,
+          request.commit,
+        ) ?? toolError(`Unknown harness call id ${callId}.`)
       )
     }
     let name = request.name
@@ -1698,14 +1770,25 @@ export class AntigravityRuntime {
     }
     if (!conv.toolNames.has(name))
       return toolError(`The harness has no tool named ${name}.`)
-    return turn.invokeTool(name, args, relayAfterMs, request.signal)
+    return turn.invokeTool(
+      name,
+      args,
+      relayAfterMs,
+      request.signal,
+      request.commit,
+    )
   }
 
   private sweep(): void {
     const ttl = this.host.config.idleSessionTtlMs
-    const now = Date.now()
+    const now = this.monotonicNow()
+    const delta = Math.max(0, now - this.lastSweepAt)
+    this.lastSweepAt = now
+    const slice = Math.min(delta, SWEEP_INTERVAL_MS * 2)
     for (const conv of [...this.conversations.values()]) {
-      if (this.isIdle(conv) && now - conv.lastUsed > ttl) {
+      if (!this.isIdle(conv)) continue
+      conv.idleMs += slice
+      if (conv.idleMs > ttl) {
         void this.resetSession(conv).catch((error: unknown) => {
           this.host.log.warn(
             `session sweep cleanup failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -1715,6 +1798,43 @@ export class AntigravityRuntime {
       }
     }
   }
+}
+
+function clampEffortToOptions(
+  configOptions: readonly AcpConfigOption[],
+  effort: Effort,
+): Effort {
+  const levelOption = configOptions.find(
+    (o) => o.id === 'thought_level' || o.category === 'thought_level',
+  )
+  if (levelOption?.options === undefined) return effort
+  const offered = flattenConfigOptions(levelOption.options)
+    .map((o) => asEffort(o.value))
+    .filter((v): v is Effort => v !== undefined)
+  if (offered.length === 0 || offered.includes(effort)) return effort
+  return nearestEffort(effort, offered)
+}
+
+function statSignature(path: string): string {
+  try {
+    const st = statSync(path, { bigint: true })
+    return `${st.isDirectory() ? 'd' : 'f'}:${st.ino}:${st.mtimeNs}:${st.ctimeNs}:${st.size}`
+  } catch {
+    return 'missing'
+  }
+}
+
+function logPathsFingerprint(paths: readonly string[]): string {
+  const parts: string[] = []
+  for (const p of paths) {
+    const sig = statSignature(p)
+    parts.push(`${p}=${sig}`)
+    if (sig.startsWith('d:')) {
+      parts.push(`${p}/cli.log=${statSignature(join(p, 'cli.log'))}`)
+      parts.push(`${p}/log=${statSignature(join(p, 'log'))}`)
+    }
+  }
+  return parts.join('|')
 }
 
 function messageIds(messages: readonly RequestMessage[]): string[] {

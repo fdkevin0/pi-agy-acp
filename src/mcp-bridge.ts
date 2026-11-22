@@ -52,6 +52,12 @@ export interface BridgeCallRequest {
   arguments: Record<string, unknown>
   /** Aborts when the agent disconnects or cancels the call. */
   signal: AbortSignal
+  /**
+   * Synchronously finalize and write a tool result onto the open SSE stream
+   * without yielding a microtask. When the client has already disconnected,
+   * returns a cancelled error without invoking `finalize`.
+   */
+  commit?: (finalize: () => BridgeToolResult) => BridgeToolResult
 }
 
 /** Owner-side routing of tool listings and calls. */
@@ -88,7 +94,7 @@ export interface McpBridgeOptions {
   log?: (message: string) => void
 }
 
-const MAX_BODY_BYTES = 1_048_576
+const MAX_BODY_BYTES = 8 * 1024 * 1024
 
 const MCP_PROTOCOL_VERSION = '2025-06-18'
 const CONVERSATION_META_KEY = 'antigravity.google/conversation_id'
@@ -391,6 +397,23 @@ export class McpBridge {
         )
       }
     }, this.options.keepAliveMs)
+    keepAlive.unref()
+
+    let wroteResponse = false
+    const commit = (finalize: () => BridgeToolResult): BridgeToolResult => {
+      if (res.writableEnded || res.destroyed || controller.signal.aborted) {
+        return {
+          content: [{ type: 'text', text: 'The tool call was cancelled.' }],
+          isError: true,
+        }
+      }
+      const finalResult = finalize()
+      writeEvent(res, { jsonrpc: '2.0', id: request.id, result: finalResult })
+      settled = true
+      wroteResponse = true
+      res.end()
+      return finalResult
+    }
 
     let result: BridgeToolResult
     try {
@@ -400,6 +423,7 @@ export class McpBridge {
         name,
         arguments: args,
         signal: controller.signal,
+        commit,
       })
     } catch (error) {
       result = {
@@ -415,7 +439,7 @@ export class McpBridge {
       settled = true
       clearInterval(keepAlive)
     }
-    if (!res.writableEnded && !res.destroyed) {
+    if (!wroteResponse && !res.writableEnded && !res.destroyed) {
       writeEvent(res, { jsonrpc: '2.0', id: request.id, result })
       res.end()
     }

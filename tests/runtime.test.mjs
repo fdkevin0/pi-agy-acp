@@ -3506,9 +3506,39 @@ test('partial parallel relay delivery releases buffering, attaches deferred suff
     new RegExp(`<harness_relay_update>\\n\\[tool completed: ${c2.id} \\(bash\\) — call mcp_pi_pi_await_result with \\{"call_id":"${c2.id}"\\} to read its result\\]\\n</harness_relay_update>`),
   )
 
-  // A repeated pi_await_result for c1 does not duplicate the one-time suffix or completion hint.
+  // A repeated pi_await_result for already-delivered c1 returns explicit status without consuming new suffixes or sibling updates.
+  const c3 = turn.park('bash', { command: 'c' })
+  const step2 = await collect(pumpStep(turn, {
+    parkSettleMs: 0, maxContinuations: 0,
+    continuePrompt: async () => ({ stopReason: 'end_turn' }), cancel() {},
+  }, undefined))
+  assert.deepEqual(callsOf(step2).map((c) => c.id), [c3.id])
+  const c4 = turn.park('bash', { command: 'd' })
+  const step2b = await collect(pumpStep(turn, {
+    parkSettleMs: 0, maxContinuations: 0,
+    continuePrompt: async () => ({ stopReason: 'end_turn' }), cancel() {},
+  }, undefined))
+  assert.deepEqual(callsOf(step2b).map((c) => c.id), [c4.id])
+  turn.markRelayed(c3.id)
+  turn.markRelayed(c4.id)
+  turn.pendingCalls.set(c3.id, c3)
+  turn.pendingCalls.set(c4.id, c4)
+  turn.deliverToolResults(
+    new Map([
+      [c3.id, { content: [{ type: 'text', text: 'res-c' }] }],
+      [c4.id, { content: [{ type: 'text', text: 'res-d' }] }],
+    ]),
+    '<user>\nfresh-steer\n</user>',
+  )
   const secondDelivered = await turn.awaitRelayedCall(c1.id, 60_000, controller.signal)
-  assert.deepEqual(secondDelivered, { content: [{ type: 'text', text: 'res-a' }] })
+  assert.deepEqual(secondDelivered, {
+    content: [{ type: 'text', text: `Tool call ${c1.id} result was already delivered.` }],
+  })
+  const deliveredC3 = await turn.awaitRelayedCall(c3.id, 60_000, controller.signal)
+  assert.equal(deliveredC3.content.length, 2)
+  assert.match(deliveredC3.content[1].text, /fresh-steer/)
+  assert.match(deliveredC3.content[1].text, new RegExp(c4.id))
+  await turn.awaitRelayedCall(c4.id, 60_000, controller.signal)
 
   // Drop the earlier buffered text to verify reasoning-only max_tokens omits leading blank lines.
   turn.events.shift()
@@ -4345,6 +4375,27 @@ test('AGY internal retry notices (stream interrupted, empty output, problem retr
     ),
     'drop',
   )
+  assert.equal(
+    classifyOutputLimitNotice(
+      'There was a problem communicating with backend.\nRetries remaining: 0',
+    ),
+    'emit',
+  )
+  assert.equal(
+    classifyOutputLimitNotice(
+      '⚠ Error: model output error: model output must contain either output text or tool calls, these cannot both be empty, please try again\nRetries remaining: 0',
+    ),
+    'emit',
+  )
+  assert.equal(
+    classifyOutputLimitNotice(
+      'The stream was interrupted. Please continue the task you were working on.\nRetries remaining: 0',
+    ),
+    'emit',
+  )
+  assert.equal(classifyOutputLimitNotice('Retries remaining: 0'), 'emit')
+  assert.equal(classifyOutputLimitNotice('Retries remaining: 1'), 'drop')
+  assert.equal(classifyOutputLimitNotice('Retries remaining:'), 'hold')
 
   // Turn with only internal retry notices (including cross-chunk splits) must NOT emit text or mark produced=true.
   const emptyTurn = new AcpTurn('retryonly')
@@ -4414,6 +4465,26 @@ test('AGY internal retry notices (stream interrupted, empty output, problem retr
   )
   assert.equal(proseTurn.produced, true)
   assert.equal(proseTurn.retryNotices, 0)
+
+  // Terminal Retries remaining: 0 emitted across chunks must surface to the user immediately.
+  const exhaustedTurn = new AcpTurn('retry-exhausted')
+  exhaustedTurn.onUpdate({
+    sessionUpdate: 'agent_message_chunk',
+    content: { type: 'text', text: 'There was a problem generating output.' },
+  })
+  exhaustedTurn.onUpdate({
+    sessionUpdate: 'agent_message_chunk',
+    content: { type: 'text', text: '\nRetries remaining: 0\n' },
+  })
+  exhaustedTurn.events.push({ kind: 'done', result: { stopReason: 'end_turn' } })
+  const exhaustedChunks = await collect(pumpStep(exhaustedTurn, pumpHost, undefined))
+  assert.equal(finishOf(exhaustedChunks).reason.kind, 'stop')
+  assert.equal(
+    textOf(exhaustedChunks),
+    'There was a problem generating output.\nRetries remaining: 0\n',
+  )
+  assert.equal(exhaustedTurn.produced, true)
+  assert.equal(exhaustedTurn.retryNotices, 0)
 })
 
 test('toTokenUsage and runtime fall back to same-turn gen_metadata estimated_tokens_used when usage_update is absent', async (t) => {
@@ -4732,4 +4803,389 @@ test('streaming usage_update skips SQLite when contextWindow is cached and used 
     }),
   )
   assert.equal(finishOf(turn3Step2).reason.kind, 'stop')
+})
+
+test('atomic MCP commit and same-tick abort guard preserve deferred suffix and unawaited relay updates', async () => {
+  const turn = new AcpTurn('atomic-commit')
+  const prompt = deferred()
+  turn.bindPrompt(prompt.promise)
+  const c1 = turn.park('bash', { command: 'a' })
+  const c2 = turn.park('bash', { command: 'b' })
+  turn.pendingCalls.set(c1.id, c1)
+  turn.pendingCalls.set(c2.id, c2)
+  turn.markRelayed(c1.id)
+  turn.markRelayed(c2.id)
+  turn.deliverToolResults(
+    new Map([
+      [c1.id, { content: [{ type: 'text', text: 'res-a' }] }],
+      [c2.id, { content: [{ type: 'text', text: 'res-b' }] }],
+    ]),
+    '<user>\npreserved-steer\n</user>',
+  )
+
+  // 1. Same-tick Promise.race tie: c1 is already resolved AND signal is already aborted.
+  const abortedCtrl = new AbortController()
+  abortedCtrl.abort()
+  const tieResult = await turn.awaitRelayedCall(c1.id, 60_000, abortedCtrl.signal)
+  assert.equal(tieResult.isError, true)
+  assert.match(tieResult.content[0].text, /cancelled/i)
+
+  // 2. Rejected commit (closed HTTP response): finalize is never called, state stays intact.
+  const closedCtrl = new AbortController()
+  let finalizeCalls = 0
+  const rejectedResult = await turn.awaitRelayedCall(
+    c1.id,
+    60_000,
+    closedCtrl.signal,
+    () => ({ content: [{ type: 'text', text: 'The tool call was cancelled.' }], isError: true }),
+  )
+  assert.equal(rejectedResult.isError, true)
+  assert.equal(finalizeCalls, 0)
+
+  // 3. Subsequent healthy await receives c1 result plus preserved suffix and c2 completion update.
+  const liveCtrl = new AbortController()
+  const committed = await turn.awaitRelayedCall(
+    c1.id,
+    60_000,
+    liveCtrl.signal,
+    (finalize) => {
+      finalizeCalls++
+      return finalize()
+    },
+  )
+  assert.equal(finalizeCalls, 1)
+  assert.equal(committed.content[0].text, 'res-a')
+  assert.match(committed.content[1].text, /preserved-steer/)
+  assert.match(committed.content[1].text, new RegExp(c2.id))
+})
+
+test('concurrent pi_await_result is rejected without mutating relays and waiter slot releases after relay or abort', async () => {
+  const turn = new AcpTurn('reentry-guard')
+  const prompt = deferred()
+  turn.bindPrompt(prompt.promise)
+
+  // Concurrent pi_await_result while invokeTool is actively waiting.
+  const invokeCtrl = new AbortController()
+  const invokePromise = turn.invokeTool('bash', { command: 'slow' }, 60_000, invokeCtrl.signal)
+  const [call] = [...turn.calls.values()]
+  const dupWhileInvoke = await turn.awaitRelayedCall(call.id, 60_000, new AbortController().signal)
+  assert.deepEqual(dupWhileInvoke, {
+    content: [{ type: 'text', text: `Tool call ${call.id} is already being awaited.` }],
+    isError: true,
+  })
+
+  // Aborting invokeTool releases active waiter so pi_await_result can resume.
+  invokeCtrl.abort()
+  const invokeCancelled = await invokePromise
+  assert.equal(invokeCancelled.isError, true)
+
+  // Concurrent pi_await_result while another pi_await_result is actively waiting.
+  turn.markRelayed(call.id)
+  const wait1Ctrl = new AbortController()
+  const wait1 = turn.awaitRelayedCall(call.id, 60_000, wait1Ctrl.signal)
+  const dupWhileAwait = await turn.awaitRelayedCall(call.id, 60_000, new AbortController().signal)
+  assert.deepEqual(dupWhileAwait, {
+    content: [{ type: 'text', text: `Tool call ${call.id} is already being awaited.` }],
+    isError: true,
+  })
+
+  // Aborting wait1 releases waiter slot; next await succeeds when result arrives.
+  wait1Ctrl.abort()
+  assert.equal((await wait1).isError, true)
+  turn.pendingCalls.set(call.id, call)
+  turn.deliverToolResults(new Map([[call.id, { content: [{ type: 'text', text: 'done' }] }]]), '')
+  const finalResult = await turn.awaitRelayedCall(call.id, 60_000, new AbortController().signal)
+  assert.deepEqual(finalResult, { content: [{ type: 'text', text: 'done' }] })
+})
+
+test('pumpStep skips max_tokens auto-continuation while turn.isRelaying is true', async () => {
+  const turn = new AcpTurn('relay-max-tokens')
+  const prompt = deferred()
+  turn.bindPrompt(prompt.promise)
+  const call = turn.park('bash', { command: 'long' })
+  turn.markRelayed(call.id)
+  assert.equal(turn.isRelaying, true)
+  turn.events.shift()
+  prompt.resolve({ stopReason: 'max_tokens' })
+  await turn.promptSettled
+  let continuations = 0
+  await assert.rejects(
+    collect(
+      pumpStep(
+        turn,
+        {
+          parkSettleMs: 0,
+          maxContinuations: 3,
+          continuePrompt: async () => {
+            continuations++
+            return { stopReason: 'end_turn' }
+          },
+          cancel() {},
+        },
+        undefined,
+      ),
+    ),
+    (err) => err?.code === 'PROVIDER_ERROR' && /relayed tool result/.test(err.message),
+  )
+  assert.equal(continuations, 0)
+  assert.equal(turn.continuations, 0)
+})
+
+test('select clamps thought_level to live levelOption options, skips empty options, and feeds applyConfigOption into catalog', async (t) => {
+  const selected = []
+  let modelChanges = 0
+  const initialOptions = [
+    {
+      id: 'model',
+      category: 'model',
+      currentValue: 'claude-opus-5-5',
+      options: [
+        { value: 'claude-opus-5-5', name: 'Claude Opus 5.5' },
+        { value: 'gemini-4-argon', name: 'Gemini 4 Argon' },
+        { value: 'fixed-no-efforts', name: 'Fixed No Efforts' },
+      ],
+    },
+    {
+      id: 'thought_level',
+      category: 'thought_level',
+      currentValue: 'xhigh',
+      options: [{ value: 'low' }, { value: 'high' }, { value: 'xhigh' }],
+    },
+  ]
+  const narrowedForArgon = [
+    {
+      id: 'model',
+      category: 'model',
+      currentValue: 'gemini-4-argon',
+      options: [
+        { value: 'claude-opus-5-5', name: 'Claude Opus 5.5' },
+        { value: 'gemini-4-argon', name: 'Gemini 4 Argon' },
+        { value: 'fixed-no-efforts', name: 'Fixed No Efforts' },
+        { value: 'newly-added-model', name: 'Newly Added Model' },
+      ],
+    },
+    {
+      id: 'thought_level',
+      category: 'thought_level',
+      currentValue: 'low',
+      options: [{ value: 'low' }, { value: 'high' }],
+    },
+  ]
+  const emptyEffortsForFixed = [
+    {
+      id: 'model',
+      category: 'model',
+      currentValue: 'fixed-no-efforts',
+      options: narrowedForArgon[0].options,
+    },
+    {
+      id: 'thought_level',
+      category: 'thought_level',
+      currentValue: 'low',
+      options: [],
+    },
+  ]
+  const optionResponses = new Map([
+    ['model:gemini-4-argon', narrowedForArgon],
+    ['thought_level:high', narrowedForArgon],
+    ['model:fixed-no-efforts', emptyEffortsForFixed],
+  ])
+  const { runtime } = makeRuntime(t, {
+    host: {
+      onModelsChanged: () => {
+        modelChanges++
+      },
+      spawnAcp: () =>
+        scriptedChild({
+          initialize: (request, wire) =>
+            sendWireResult(request, wire, {
+              protocolVersion: 1,
+              agentInfo: { name: 'clamp-fake', version: '1.5.14' },
+            }),
+          'session/new': (request, wire) =>
+            sendWireResult(request, wire, {
+              sessionId: 's-clamp',
+              configOptions: initialOptions,
+            }),
+          'session/set_config_option': (request, wire) => {
+            selected.push([request.params.configId, request.params.value])
+            const key = `${request.params.configId}:${request.params.value}`
+            sendWireResult(request, wire, {
+              configOptions: optionResponses.get(key),
+            })
+          },
+          'session/prompt': (request, wire) => {
+            wire.stdout.write(
+              `${JSON.stringify({
+                jsonrpc: '2.0',
+                method: 'session/update',
+                params: {
+                  sessionId: 's-clamp',
+                  update: {
+                    sessionUpdate: 'agent_message_chunk',
+                    content: { type: 'text', text: 'ok' },
+                  },
+                },
+              })}\n`,
+            )
+            sendWireResult(request, wire, { stopReason: 'end_turn' })
+          },
+        }),
+    },
+  })
+
+  // Requesting xhigh for gemini-4-argon clamps to high after model switch returns narrowed options.
+  const first = await collect(
+    runtime.stream({
+      model: 'gemini-4-argon',
+      reasoningEffort: 'xhigh',
+      sessionId: 'S-CLAMP',
+      messages: [sys, user('u1', 'hi')],
+    }),
+  )
+  assert.equal(finishOf(first).reason.kind, 'stop')
+  assert.deepEqual(selected, [
+    ['model', 'gemini-4-argon'],
+    ['thought_level', 'high'],
+  ])
+  assert.equal(runtime.conversations.get('S-CLAMP').effort, 'high')
+  assert.equal(runtime.catalog.list().some((m) => m.id === 'newly-added-model'), true)
+  assert.ok(modelChanges >= 2)
+
+  // Switching to a model with empty levelOption.options does not send thought_level.
+  const second = await collect(
+    runtime.stream({
+      model: 'fixed-no-efforts',
+      reasoningEffort: 'xhigh',
+      sessionId: 'S-CLAMP',
+      messages: [sys, user('u1', 'hi'), assistantFrom('a1', first), user('u2', 'next')],
+    }),
+  )
+  assert.equal(finishOf(second).reason.kind, 'stop')
+  assert.deepEqual(selected, [
+    ['model', 'gemini-4-argon'],
+    ['thought_level', 'high'],
+    ['model', 'fixed-no-efforts'],
+  ])
+})
+
+test('reconcileBinaryFingerprint resets state to idle, cleans session artifacts, and marks idle conversations dirty', async (t) => {
+  const binDir = mkdtempSync(join(tmpdir(), 'agy-bin-reconcile-'))
+  t.after(() => rmSync(binDir, { recursive: true, force: true }))
+  const customFake = join(binDir, 'agy')
+  copyFileSync(fake, customFake)
+  chmodSync(customFake, 0o755)
+
+  const { home, runtime, adapter } = makeRuntime(t, {
+    config: { command: customFake },
+  })
+  await collect(
+    adapter.stream({
+      provider: 'antigravity',
+      model: 'gemini-4-argon',
+      sessionId: 'S-RECONCILE',
+      messages: [sys, user('u1', 'hello')],
+    }),
+  )
+  const conv = runtime.conversations.get('S-RECONCILE')
+  const oldSessionId = conv.sessionId
+  assert.equal(typeof oldSessionId, 'string')
+  assert.equal(existsSync(join(home, 'agy', 'conversations', `${oldSessionId}.db`)), true)
+  assert.equal(runtime.status().state, 'ready')
+  assert.equal(runtime.status().liveSessions, 1)
+
+  writeFileSync(customFake, `${readFileSync(customFake, 'utf8')}\n// upgraded\n`)
+  chmodSync(customFake, 0o755)
+  runtime.reconcileBinaryFingerprint()
+
+  assert.equal(runtime.status().state, 'idle')
+  assert.equal(runtime.status().liveSessions, 0)
+  assert.equal(conv.sessionId, undefined)
+  assert.equal(conv.dirty, true)
+  assert.equal(existsSync(join(home, 'agy', 'conversations', `${oldSessionId}.db`)), false)
+  assert.equal(existsSync(join(home, 'agy', 'brain', oldSessionId)), false)
+})
+
+test('monotonic sleep-resilient sweep survives 2-hour sleep wake, evicts after cumulative idle TTL, and tolerates clock rollback', async (t) => {
+  let clock = 10_000
+  const { runtime } = makeRuntime(t, {
+    config: { idleSessionTtlMs: 1_800_000 },
+    host: { monotonicNow: () => clock },
+  })
+  await collect(
+    runtime.stream({
+      model: 'gemini-4-argon',
+      sessionId: 'S-SLEEP',
+      messages: [sys, user('u1', 'hello')],
+    }),
+  )
+  const conv = runtime.conversations.get('S-SLEEP')
+  assert.equal(conv.idleMs, 0)
+
+  // Sudden 2-hour jump in a single sweep tick advances idleMs by at most 2 * 60_000ms.
+  clock += 7_200_000
+  runtime.sweep()
+  assert.equal(runtime.conversations.get('S-SLEEP'), conv)
+  assert.equal(conv.idleMs, 120_000)
+
+  // Clock rollback (negative delta) does not corrupt idleMs or falsely evict.
+  clock -= 500_000
+  runtime.sweep()
+  assert.equal(runtime.conversations.get('S-SLEEP'), conv)
+  assert.equal(conv.idleMs, 120_000)
+
+  // Separate runtime with 150s TTL evicts after 3 cumulative 60s idle ticks.
+  let shortClock = 1_000
+  const shortRt = makeRuntime(t, {
+    config: { idleSessionTtlMs: 150_000 },
+    host: { monotonicNow: () => shortClock },
+  }).runtime
+  await collect(
+    shortRt.stream({
+      model: 'gemini-4-argon',
+      sessionId: 'S-CUMULATIVE',
+      messages: [sys, user('u1', 'hello')],
+    }),
+  )
+  shortClock += 60_000
+  shortRt.sweep()
+  assert.equal(shortRt.conversations.has('S-CUMULATIVE'), true)
+  shortClock += 60_000
+  shortRt.sweep()
+  assert.equal(shortRt.conversations.has('S-CUMULATIVE'), true)
+  shortClock += 60_000
+  shortRt.sweep()
+  assert.equal(shortRt.conversations.has('S-CUMULATIVE'), false)
+})
+
+test('accountInfo caches logged email across status calls for 10s monotonic TTL and invalidates immediately on log mutation', (t) => {
+  let clock = 50_000
+  const { home, runtime } = makeRuntime(t, {
+    host: { monotonicNow: () => clock },
+  })
+  const logDir = join(home, 'log')
+  mkdirSync(logDir, { recursive: true })
+  const rotated1 = join(logDir, 'cli-1.log')
+  writeFileSync(rotated1, 'applyAuthResult: email=first@example.com\n')
+  assert.equal(runtime.status().account?.email, 'first@example.com')
+
+  // In-place overwrite of rotated file within 10s TTL serves cached email without rescanning.
+  writeFileSync(rotated1, 'applyAuthResult: email=second@example.com\n')
+  clock += 5_000
+  assert.equal(runtime.status().account?.email, 'first@example.com')
+
+  // Advancing monotonic clock past 10s TTL refreshes email from disk.
+  clock += 5_000
+  assert.equal(runtime.status().account?.email, 'second@example.com')
+
+  // Mutating acp.log invalidates fingerprint immediately at the same monotonic timestamp.
+  writeFileSync(join(home, 'acp.log'), 'applyAuthResult: email=third@example.com\n')
+  assert.equal(runtime.status().account?.email, 'third@example.com')
+
+  // Creating a new rotated log in log/ invalidates immediately after removing acp.log.
+  rmSync(join(home, 'acp.log'))
+  const rotated2 = join(logDir, 'cli-2.log')
+  writeFileSync(rotated2, 'applyAuthResult: email=fourth@example.com\n')
+  utimesSync(rotated2, new Date(Date.now() + 60_000), new Date(Date.now() + 60_000))
+  assert.equal(runtime.status().account?.email, 'fourth@example.com')
 })

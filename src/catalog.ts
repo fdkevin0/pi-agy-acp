@@ -285,13 +285,14 @@ export class ModelCatalog {
       (o) => o.id === 'thought_level' || o.category === 'thought_level',
     )
     const beforeEfforts = JSON.stringify(this.efforts)
-    if (levelOption?.options !== undefined) {
-      const offered = flattenConfigOptions(levelOption.options)
-        .map((o) => o.value)
-        .filter((v): v is Effort => (EFFORTS as readonly string[]).includes(v))
-      if (offered.length > 0)
-        this.efforts = EFFORTS.filter((e) => offered.includes(e))
-    }
+    const levelEfforts =
+      levelOption?.options !== undefined
+        ? flattenConfigOptions(levelOption.options)
+            .map((o) => o.value)
+            .filter((v): v is Effort =>
+              (EFFORTS as readonly string[]).includes(v),
+            )
+        : []
     const modelEntries = flattenConfigOptions(modelOption?.options)
     const next =
       modelEntries.length > 0
@@ -303,18 +304,31 @@ export class ModelCatalog {
     this.observed = true
     const changed = JSON.stringify(next) !== JSON.stringify(this.models)
     if (changed) this.models = next
-    const derivedChanged = this.deriveEfforts()
-    if (this.efforts.length === 0 && this.byModel.size > 0) {
-      const union = new Set<Effort>()
-      for (const values of this.byModel.values()) {
-        for (const effort of values) union.add(effort)
-      }
-      if (union.size > 0) {
-        this.efforts = EFFORTS.filter((e) => union.has(e))
+    let prunedChanged = false
+    if (modelEntries.length > 0) {
+      const activeIds = new Set(this.models.map((m) => m.id))
+      for (const id of [...this.byModel.keys()]) {
+        if (!activeIds.has(id)) {
+          this.byModel.delete(id)
+          prunedChanged = true
+        }
       }
     }
+    const derivedChanged = this.deriveEfforts()
+    const union = new Set<Effort>(levelEfforts)
+    for (const model of this.models) {
+      const values = this.byModel.get(model.id)
+      if (values !== undefined) {
+        for (const effort of values) union.add(effort)
+      }
+    }
+    if (union.size > 0) {
+      this.efforts = EFFORTS.filter((e) => union.has(e))
+    }
     const effortsChanged =
-      derivedChanged || beforeEfforts !== JSON.stringify(this.efforts)
+      prunedChanged ||
+      derivedChanged ||
+      beforeEfforts !== JSON.stringify(this.efforts)
     if (changed || effortsChanged || tierChanged || this.fingerprintDirty)
       this.save()
     return changed || effortsChanged
@@ -350,11 +364,7 @@ export class ModelCatalog {
         }
         continue
       }
-      const present = this.available.some(
-        (entry) =>
-          entry.modelId === model.id ||
-          entry.modelId.startsWith(`${model.id}-`),
-      )
+      const present = this.available.some((entry) => entry.modelId === model.id)
       if (!present) continue
       const prevEfforts = this.effortsFor(model.id)
       if (this.byModel.get(model.id)?.length !== 0) {

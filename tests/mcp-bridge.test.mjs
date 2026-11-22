@@ -101,7 +101,7 @@ test('a throwing diagnostic sink cannot escape the boundary', async (t) => {
 
 test('body limit accepts the exact byte boundary and rejects declared and chunked excess with 413', async (t) => {
   const { port } = await bridge(t)
-  const limit = 1_048_576
+  const limit = 8 * 1024 * 1024
   const body = '{"id":1,"method":"ping"}'
   assert.match(await raw(port, post(body + ' '.repeat(limit - body.length))), /"result":\{\}/)
   assert.match(await raw(port, post('').replace('Content-Length: 0', `Content-Length: ${limit + 1}`)), /^HTTP\/1.1 413/)
@@ -186,4 +186,77 @@ test('close destroys active SSE and aborts an uncooperative tool', { timeout: 3_
   await b.close()
   await Promise.all([closed, aborted])
   assert.equal(signal.aborted, true)
+})
+
+test('handleCall commit writes SSE result synchronously once when open and skips finalize after disconnect', { timeout: 3_000 }, async (t) => {
+  const finalized = []
+  const openBridge = await bridge(t, {
+    callTool: async ({ commit }) => {
+      assert.equal(typeof commit, 'function')
+      return commit(() => {
+        finalized.push('open')
+        return { content: [{ type: 'text', text: 'committed-once' }] }
+      })
+    },
+  })
+  const openResp = await new Promise((resolve, reject) => {
+    let body = ''
+    const req = request(
+      {
+        hostname: '127.0.0.1',
+        port: openBridge.port,
+        path: '/mcp/tenant',
+        method: 'POST',
+        headers: { authorization: 'Bearer secret' },
+        agent: false,
+      },
+      (res) => {
+        res.setEncoding('utf8')
+        res.on('data', (chunk) => {
+          body += chunk
+        })
+        res.on('end', () => {
+          req.destroy()
+          resolve(body)
+        })
+        res.on('error', reject)
+      },
+    )
+    t.after(() => req.destroy())
+    req.on('error', reject)
+    req.end('{"id":1,"method":"tools/call","params":{"name":"echo"}}')
+  })
+  assert.deepEqual(finalized, ['open'])
+  assert.equal(openResp.match(/event: message/g)?.length, 1)
+  assert.match(openResp, /committed-once/)
+
+  const entered = deferred()
+  const release = deferred()
+  const returned = deferred()
+  const closedBridge = await bridge(t, {
+    callTool: async ({ signal, commit }) => {
+      entered.resolve(signal)
+      await release.promise
+      const res = commit(() => {
+        finalized.push('closed')
+        return { content: [{ type: 'text', text: 'must-not-run' }] }
+      })
+      returned.resolve(res)
+      return res
+    },
+  })
+  const socket = connect(closedBridge.port, '127.0.0.1')
+  t.after(() => socket.destroy())
+  await once(socket, 'connect')
+  socket.write(post('{"id":2,"method":"tools/call","params":{"name":"echo"}}'))
+  await once(socket, 'data')
+  const signal = await entered.promise
+  const aborted = once(signal, 'abort')
+  socket.destroy()
+  await aborted
+  release.resolve()
+  const cancelledRes = await returned.promise
+  assert.equal(cancelledRes.isError, true)
+  assert.match(cancelledRes.content[0].text, /cancelled/i)
+  assert.deepEqual(finalized, ['open'])
 })

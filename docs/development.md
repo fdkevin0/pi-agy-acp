@@ -102,7 +102,7 @@ pi -e ./index.ts
 ## MCP HTTP boundary
 
 The loopback bridge returns 400 for invalid URLs and 413 for authenticated POST
-bodies exceeding 1 MiB (1,048,576 bytes), including chunked uploads. Rejected
+bodies exceeding 8 MiB (8,388,608 bytes), including chunked uploads. Rejected
 oversized uploads close their connection after the error response. JSON parse
 errors retain the MCP parse-error response. Unexpected handler failures return
 500 before headers or destroy an already-started response; listener errors go to
