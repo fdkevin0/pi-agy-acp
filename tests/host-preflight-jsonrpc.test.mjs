@@ -778,10 +778,10 @@ process.exit(0)
       const userHome = join(root, `user-${label}`)
       const piHome = join(root, `home-${label}`)
       mkdirSync(userHome, { recursive: true })
-      const child = spawn(process.execPath, [driver], {
+      const child = spawn(process.execPath, ['--no-warnings', driver], {
         stdio: ['ignore', 'pipe', 'pipe'],
         env: {
-          PATH: process.env.PATH ?? '',
+          PATH: '',
           HOME: userHome,
           USERPROFILE: userHome,
           PI_AGY_HOME: piHome,
