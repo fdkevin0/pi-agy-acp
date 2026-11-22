@@ -33,16 +33,28 @@ export interface QuotaModelRef {
 const EXPLICIT_MEMBERS_PREFIX = /^\s*models within this group:\s*/i
 const CLAUSE_SPLIT = /[,;\n/|&+]+|\b(?:and|or)\b/i
 const ID_DATE_SUFFIX = /[-_](?:20\d{2}[-_]\d{2}[-_]\d{2}|20\d{6})$/i
-const EFFORT_PATTERN = EFFORTS.join('|')
+type EffortQualifier = Effort | 'extra-low'
+
+// Keep longest qualifiers first (`extra[-_]low` before `low`) so compound suffixes match whole.
+const EFFORT_QUALIFIER_PATTERN = [
+  'extra[-_]low',
+  ...[...EFFORTS].sort((a, b) => b.length - a.length),
+].join('|')
 // Effort or thinking-mode suffixes in model IDs (`-thinking`) and `/usage` labels (`(Thinking)`).
 const ID_QUALIFIER_SUFFIX = new RegExp(
-  `[-_](?:(${EFFORT_PATTERN})(?:-effort)?|(thinking))$`,
+  `[-_](?:(${EFFORT_QUALIFIER_PATTERN})(?:[-_]effort)?|(thinking))$`,
   'i',
 )
 const GROUP_QUALIFIER_SUFFIX = new RegExp(
-  `\\s*\\((${EFFORT_PATTERN}|thinking)\\)(?=\\s*(?:models?|groups?)?[\\s.!?)]*$)`,
+  `\\s*\\((${EFFORT_QUALIFIER_PATTERN}|thinking)\\)(?=\\s*(?:models?|groups?)?[\\s.!?)]*$)`,
   'i',
 )
+
+function parseEffortQualifier(raw: string): EffortQualifier | undefined {
+  const normalized = raw.toLowerCase().replace(/_/g, '-')
+  if (normalized === 'extra-low') return 'extra-low'
+  return asEffort(normalized)
+}
 const SPECIFIER = /^\d+(?:\.\d+)*b?$/
 const VENDOR_TOKENS = new Set(['google', 'anthropic', 'openai'])
 const FAMILY_TOKENS = new Set(['gemini', 'claude', 'gpt'])
@@ -75,7 +87,7 @@ interface ParsedPhrase {
   readonly head: string | undefined
   readonly words: readonly string[]
   readonly specs: readonly string[]
-  readonly effort: Effort | undefined
+  readonly effort: EffortQualifier | undefined
   readonly thinking: boolean
   readonly effortConflict: boolean
   readonly tokenCount: number
@@ -84,7 +96,7 @@ interface ParsedPhrase {
 
 function buildPhrase(
   tokens: readonly string[],
-  effort?: Effort,
+  effort?: EffortQualifier,
   thinking = false,
   effortConflict = false,
 ): ParsedPhrase {
@@ -108,9 +120,21 @@ function buildPhrase(
 
 function parseClause(raw: string, stripNoise = false): ParsedPhrase {
   let text = raw.trim().replace(/[.!?]+$/, '')
-  let effort: Effort | undefined
+  let effort: EffortQualifier | undefined
   let thinking = false
   let effortConflict = false
+  const applyQualifier = (rawQualifier: string) => {
+    const token = rawQualifier.toLowerCase()
+    if (token === 'thinking') {
+      thinking = true
+      return
+    }
+    const nextEffort = parseEffortQualifier(token)
+    if (nextEffort) {
+      if (effort && effort !== nextEffort) effortConflict = true
+      effort = nextEffort
+    }
+  }
   while (text.length > 0) {
     const withoutDate = text.replace(ID_DATE_SUFFIX, '')
     if (withoutDate !== text) {
@@ -119,13 +143,7 @@ function parseClause(raw: string, stripNoise = false): ParsedPhrase {
     }
     const groupQual = GROUP_QUALIFIER_SUFFIX.exec(text)
     if (groupQual) {
-      const nextEffort = asEffort(groupQual[1]!.toLowerCase())
-      if (nextEffort) {
-        if (effort && effort !== nextEffort) effortConflict = true
-        effort = nextEffort
-      } else {
-        thinking = true
-      }
+      applyQualifier(groupQual[1]!)
       text =
         text.slice(0, groupQual.index) +
         text.slice(groupQual.index + groupQual[0].length)
@@ -133,13 +151,7 @@ function parseClause(raw: string, stripNoise = false): ParsedPhrase {
     }
     const idQual = ID_QUALIFIER_SUFFIX.exec(text)
     if (idQual) {
-      const nextEffort = asEffort((idQual[1] ?? idQual[2])!.toLowerCase())
-      if (nextEffort) {
-        if (effort && effort !== nextEffort) effortConflict = true
-        effort = nextEffort
-      } else {
-        thinking = true
-      }
+      applyQualifier((idQual[1] ?? idQual[2])!)
       text = text.slice(0, idQual.index)
       continue
     }
@@ -371,6 +383,38 @@ export function formatQuotaStatus(
   return `AGY ${Math.round(displayFraction(quota.fraction, display) * 100)}%`
 }
 
+const WINDOW_DURATION = /^(\d+)([mhdw])$/
+const WINDOW_UNIT_SECONDS: Record<string, number> = {
+  m: 60,
+  h: 3600,
+  d: 86400,
+  w: 7 * 86400,
+}
+
+function windowSeconds(window: string): number | undefined {
+  const normalized = window.trim().toLowerCase()
+  if (normalized === 'weekly') return 7 * 86400
+  if (normalized === 'daily') return 86400
+  const match = WINDOW_DURATION.exec(normalized)
+  if (!match) return undefined
+  const count = Number(match[1])
+  const unit = WINDOW_UNIT_SECONDS[match[2]!]
+  return count > 0 && unit !== undefined ? count * unit : undefined
+}
+
+function isUntouchedRollingReset(
+  bucket: QuotaBucket,
+  fraction: number | undefined,
+  now: number,
+): boolean {
+  if (fraction === undefined || fraction < 1) return false
+  const resetMs = Date.parse(bucket.resetTime)
+  if (!Number.isFinite(resetMs)) return false
+  const windowSecs = windowSeconds(bucket.window)
+  if (windowSecs === undefined) return false
+  return Math.abs((resetMs - now) / 1000 - windowSecs) <= 60
+}
+
 function resetCountdown(resetTime: string, now: number): string {
   const reset = Date.parse(resetTime)
   if (!Number.isFinite(reset)) return 'reset time unavailable'
@@ -423,9 +467,10 @@ export function formatQuota(
         bucket.id ||
         'quota'
       ).padEnd(7)
-      const reset = bucket.resetTime
-        ? ` · ${resetCountdown(bucket.resetTime, now)}`
-        : ''
+      const reset =
+        bucket.resetTime && !isUntouchedRollingReset(bucket, fraction, now)
+          ? ` · ${resetCountdown(bucket.resetTime, now)}`
+          : ''
       lines.push(`    ${label} [${bar}] ${percent.padStart(4)}${reset}`)
       if (fraction !== undefined) {
         if (fraction <= 0.05) level = 'error'

@@ -102,6 +102,8 @@ export interface RuntimeHost {
   onModelsChanged(): void
   /** Delay before a parked call answers with a still-running notice; overrides config.relayAfterMs (85 seconds). */
   relayAfterMs?: number
+  /** Monotonic clock in milliseconds for quota TTL checks; defaults to `performance.now()`. */
+  quotaNow?: () => number
 }
 
 /** Snapshot reported to the settings page and quota pill. */
@@ -222,6 +224,7 @@ export class AntigravityRuntime {
       () => resolveAgyBinary(host.config.command),
       host.runCommand,
       host.config.quotaTtlMs,
+      host.quotaNow,
     )
   }
 

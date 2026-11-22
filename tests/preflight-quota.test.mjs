@@ -656,7 +656,7 @@ test('quota panel renders aligned bars, rounded percentages and relative reset t
   const snapshot = quotaSnapshot([1, 0.9091849327087402, 0.75, undefined])
   const buckets = snapshot.groups[0].buckets
   buckets[0].resetTime = new Date(
-    quotaNow + (4 * 60 + 59) * 60000,
+    quotaNow + (4 * 60 + 30) * 60000,
   ).toISOString()
   buckets[1].window = 'weekly'
   buckets[1].resetTime = new Date(
@@ -667,7 +667,7 @@ test('quota panel renders aligned bars, rounded percentages and relative reset t
   const notice = formatQuota(snapshot, quotaNow)
   assert.equal(notice.level, 'info')
   assert.match(notice.text, /Gemini Models\n    Gemini Flash, Gemini Pro/)
-  assert.match(notice.text, /5h\s+\[░░░░░░░░░░░░\]   0% · resets in 4h 59m/)
+  assert.match(notice.text, /5h\s+\[░░░░░░░░░░░░\]   0% · resets in 4h 30m/)
   assert.match(notice.text, /weekly\s+\[█░░░░░░░░░░░\]   9% · resets in 6d 7h/)
   assert.match(notice.text, /\[███░░░░░░░░░\]  25% · resets in 45m/)
   assert.match(notice.text, /Five hours\s+\[░░░░░░░░░░░░\]  n\/a/)
@@ -676,13 +676,87 @@ test('quota panel renders aligned bars, rounded percentages and relative reset t
   assert.equal(remainingNotice.level, 'info')
   assert.match(
     remainingNotice.text,
-    /5h\s+\[████████████\] 100% · resets in 4h 59m/,
+    /5h\s+\[████████████\] 100% · resets in 4h 30m/,
   )
   assert.match(
     remainingNotice.text,
     /weekly\s+\[███████████░\]  91% · resets in 6d 7h/,
   )
   assert.match(remainingNotice.text, /\[█████████░░░\]  75% · resets in 45m/)
+})
+
+test('quota panel suppresses untouched full-window rolling reset countdowns within 60s tolerance', () => {
+  const mk = (window, remainingFraction, offsetSec) => ({
+    status: 'ok',
+    updatedAt: new Date(quotaNow).toISOString(),
+    groups: [
+      {
+        name: 'Gemini Models',
+        description: '',
+        buckets: [
+          {
+            id: 'b',
+            name: window,
+            window,
+            remainingFraction,
+            resetTime: new Date(quotaNow + offsetSec * 1000).toISOString(),
+          },
+        ],
+      },
+    ],
+  })
+
+  // Untouched 100% rolling windows within ±60s omit the redundant reset suffix.
+  assert.match(
+    formatQuota(mk('5h', 1, 5 * 3600), quotaNow).text,
+    /5h\s+\[░░░░░░░░░░░░\]   0%$/,
+  )
+  assert.match(
+    formatQuota(mk('5h', 1, 5 * 3600 - 60), quotaNow).text,
+    /5h\s+\[░░░░░░░░░░░░\]   0%$/,
+  )
+  assert.match(
+    formatQuota(mk('5h', 1, 5 * 3600 + 60), quotaNow).text,
+    /5h\s+\[░░░░░░░░░░░░\]   0%$/,
+  )
+  assert.match(
+    formatQuota(mk('5h', 1, 5 * 3600), quotaNow, 'remaining').text,
+    /5h\s+\[████████████\] 100%$/,
+  )
+  assert.match(
+    formatQuota(mk('weekly', 1, 7 * 86400 - 60), quotaNow).text,
+    /weekly\s+\[░░░░░░░░░░░░\]   0%$/,
+  )
+  assert.match(
+    formatQuota(mk('weekly', 1, 7 * 86400 + 60), quotaNow).text,
+    /weekly\s+\[░░░░░░░░░░░░\]   0%$/,
+  )
+  assert.match(
+    formatQuota(mk('daily', 1, 86400), quotaNow).text,
+    /daily\s+\[░░░░░░░░░░░░\]   0%$/,
+  )
+
+  // Outside the ±60s tolerance or below 100% remaining keeps the countdown.
+  assert.match(
+    formatQuota(mk('5h', 1, 5 * 3600 - 61), quotaNow).text,
+    /5h\s+\[░░░░░░░░░░░░\]   0% · resets in 4h 58m$/,
+  )
+  assert.match(
+    formatQuota(mk('5h', 1, 5 * 3600 + 61), quotaNow).text,
+    /5h\s+\[░░░░░░░░░░░░\]   0% · resets in 5h 1m$/,
+  )
+  assert.match(
+    formatQuota(mk('weekly', 1, 7 * 86400 - 61), quotaNow).text,
+    /weekly\s+\[░░░░░░░░░░░░\]   0% · resets in 6d 23h$/,
+  )
+  assert.match(
+    formatQuota(mk('5h', 0.99, 5 * 3600), quotaNow).text,
+    /5h\s+\[░░░░░░░░░░░░\]   1% · resets in 5h 0m$/,
+  )
+  assert.match(
+    formatQuota(mk('5h', 0.999, 5 * 3600), quotaNow).text,
+    /5h\s+\[░░░░░░░░░░░░\]   0% · resets in 5h 0m$/,
+  )
 })
 
 test('quota severity uses exact thresholds and keeps errors above later healthy windows', () => {
@@ -739,7 +813,12 @@ test('quota reset formatting handles expired, imminent and malformed times', () 
     JSON.stringify({
       command: {
         data: {
-          groups: [{ name: 'Unknown', buckets: [{ window: 'weekly' }] }],
+          groups: [
+            {
+              name: 'Unknown',
+              buckets: [{ id: 'unknown-weekly', window: 'weekly' }],
+            },
+          ],
         },
       },
     }),
@@ -757,6 +836,137 @@ test('quota reset formatting handles expired, imminent and malformed times', () 
     formatQuota(quotaSnapshot([2]), quotaNow).text,
     /\[░░░░░░░░░░░░\]   0%/,
   )
+})
+
+test('parseUsage filters disabled, empty-key, and non-object buckets while preserving valid ones', () => {
+  const parsed = parseUsage(
+    JSON.stringify({
+      command: {
+        data: {
+          groups: [
+            {
+              name: 'Gemini Models',
+              description: 'Models within this group: Gemini 4 Argon',
+              buckets: [
+                null,
+                'not-an-object',
+                42,
+                true,
+                ['array-entry'],
+                {
+                  id: 'disabled-5h',
+                  window: '5h',
+                  disabled: true,
+                  remaining_fraction: 0,
+                  reset_time: '2026-11-08T05:00:00Z',
+                },
+                { id: '', window: '5h', remaining_fraction: 0.5 },
+                { id: '   ', window: '5h', remaining_fraction: 0.5 },
+                { window: '5h', remaining_fraction: 0.5 },
+                { id: 'empty-window', window: '', remaining_fraction: 0.5 },
+                { id: 'space-window', window: ' \t ', remaining_fraction: 0.5 },
+                { id: 'missing-window', remaining_fraction: 0.5 },
+                {
+                  id: 'active-5h',
+                  name: 'Five hours',
+                  window: '5h',
+                  disabled: false,
+                  remaining_fraction: 0.75,
+                  reset_time: '2026-11-08T05:00:00Z',
+                },
+                {
+                  id: ' trimmed-weekly ',
+                  name: 'Weekly',
+                  window: ' weekly ',
+                  remaining_fraction: 'not-a-number',
+                  reset_time: '2026-11-15T00:00:00Z',
+                },
+              ],
+            },
+          ],
+        },
+      },
+    }),
+  )
+  assert.deepEqual(parsed[0].buckets, [
+    {
+      id: 'active-5h',
+      name: 'Five hours',
+      window: '5h',
+      remainingFraction: 0.75,
+      resetTime: '2026-11-08T05:00:00Z',
+    },
+    {
+      id: 'trimmed-weekly',
+      name: 'Weekly',
+      window: 'weekly',
+      remainingFraction: undefined,
+      resetTime: '2026-11-15T00:00:00Z',
+    },
+  ])
+})
+
+test('QuotaReader uses monotonic clock seam with -Infinity initial timestamp and no premature expiry', async () => {
+  let clock = 0
+  let calls = 0
+  const okRunner = async () => {
+    calls++
+    return {
+      code: 0,
+      stderr: '',
+      stdout: JSON.stringify({ command: { data: { groups: [] } } }),
+    }
+  }
+  const startupReader = new QuotaReader(
+    () => 'fake',
+    okRunner,
+    100,
+    () => clock,
+  )
+  // Even when the monotonic clock starts at 0, an empty cache must not look fresh.
+  assert.equal(startupReader.peek(), undefined)
+  assert.equal((await startupReader.read()).status, 'ok')
+  assert.equal(calls, 1)
+
+  clock = 99
+  assert.equal(startupReader.peek().status, 'ok')
+  await startupReader.read()
+  assert.equal(calls, 1)
+
+  clock = 100
+  assert.equal(startupReader.peek(), undefined)
+  await startupReader.read()
+  assert.equal(calls, 2)
+
+  // Negative monotonic clock readings still behave deterministically.
+  let negativeClock = -500
+  let negativeCalls = 0
+  const negativeReader = new QuotaReader(
+    () => 'fake',
+    async () => {
+      negativeCalls++
+      return {
+        code: 0,
+        stderr: '',
+        stdout: JSON.stringify({ command: { data: { groups: [] } } }),
+      }
+    },
+    100,
+    () => negativeClock,
+  )
+  assert.equal(negativeReader.peek(), undefined)
+  await negativeReader.read()
+  assert.equal(negativeCalls, 1)
+
+  negativeClock = -401
+  assert.equal(negativeReader.peek().status, 'ok')
+  await negativeReader.read()
+  assert.equal(negativeCalls, 1)
+
+  negativeClock = -400
+  assert.equal(negativeReader.peek(), undefined)
+  await negativeReader.read()
+  assert.equal(negativeCalls, 2)
 })
 
 const statusSnapshot = {
