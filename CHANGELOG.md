@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.2.2](https://github.com/fdkevin0/pi-agy-acp/compare/v0.2.1...v0.2.2) (2026-11-22)
+
+
+### Bug Fixes
+
+* **host:** harden process lifecycle, OAuth/settings atomic writes, and JSON-RPC framing ([#40](https://github.com/fdkevin0/pi-agy-acp/issues/40)) ([c468085](https://github.com/fdkevin0/pi-agy-acp/commit/c4680859c9b407f6729382484c26dea2340423fe))
+* **quota:** filter disabled buckets, suppress untouched rolling resets, and use monotonic TTL ([#38](https://github.com/fdkevin0/pi-agy-acp/issues/38)) ([707eb80](https://github.com/fdkevin0/pi-agy-acp/commit/707eb80bfec3505b1634ee51f1f55ab9b9636000))
+* **runtime:** atomic MCP relay delivery, re-entry guard, and catalog/sweep hardening ([#42](https://github.com/fdkevin0/pi-agy-acp/issues/42)) ([4016234](https://github.com/fdkevin0/pi-agy-acp/commit/40162349b432746646ed4adfc0d084cac5f390dd))
+
 ## [0.2.1](https://github.com/fdkevin0/pi-agy-acp/compare/v0.2.0...v0.2.1) (2026-11-22)
 
 
