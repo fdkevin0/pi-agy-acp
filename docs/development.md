@@ -24,7 +24,13 @@ pi -e ./index.ts
 3. Model tool calls reach the bridge and remain pending while Pi executes them.
    Pi receives a `toolUse` result, then supplies tool results on its next request.
 4. Those results resolve the pending MCP requests, allowing the same ACP turn to
-   continue. Long-running tools use a relay to keep the agent waiting.
+   continue. Long-running tools use a relay (`pi_await_result`) to keep the agent
+   waiting; if the agent instead moves on to a new tool call or another awaited
+   result, buffered output flushes in order so later steps stream live, deferred
+   tool/steering suffixes and a one-time completion hint carry onto the next
+   delivered tool result, and `end_turn`/`max_tokens` finishes with a note if any
+   relayed call remained unretrieved (while immediate premature completion with no
+   further tool progress still fails with `PROVIDER_ERROR`).
 5. The adapter drains the runtime's generator before publishing completion, so
    session cleanup finishes before Pi can start its next step.
 

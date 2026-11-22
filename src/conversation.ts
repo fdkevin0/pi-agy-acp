@@ -203,8 +203,14 @@ export class AcpTurn {
   estimatedContextUsed?: number
   /** Lower `gen_metadata.idx` bound owned by the active turn segment, or `null` when unobservable. */
   metaFloorIdx: number | null = 0
-  /** Relayed call ids whose results the agent has not yet re-awaited via `pi_await_result`. */
+  /** Relayed call ids currently holding output in `relayBuffer` until re-awaited or superseded. */
   readonly relayedCalls = new Set<string>()
+  /** Relayed call ids in this turn whose results have never been retrieved by the agent. */
+  readonly unretrievedRelays = new Set<string>()
+  /** Unretrieved relayed call ids already resolved by Pi, awaiting a one-time completion hint to the agent. */
+  private readonly completedUnretrievedRelays = new Set<string>()
+  /** Tool deltas and steering text deferred until an active MCP call returns a real result. */
+  private readonly pendingSuffix: string[] = []
   /** Bounded output buffered while one or more calls are relayed. */
   private relayBuffer: Array<Extract<TurnEvent, { kind: 'text' | 'thought' }>> = []
   private relayBufferChars = 0
@@ -229,6 +235,10 @@ export class AcpTurn {
    * @returns the parked call.
    */
   park(name: string, args: Record<string, unknown>): ParkedCall {
+    // A new tool call means the agent moved on instead of only waiting on relayed call(s):
+    // flush buffered thought/text in chronological order before queueing the new call so
+    // subsequent steps stream live instead of accumulating in relayBuffer.
+    this.releaseRelayWait()
     const call: ParkedCall = {
       id: `agy_${this.turnTag}_${++this.nextCall}`,
       name,
@@ -247,22 +257,90 @@ export class AcpTurn {
   /** Record that `callId` timed out into a relay notice and awaits `pi_await_result`. */
   markRelayed(callId: string): void {
     this.relayedCalls.add(callId)
+    this.unretrievedRelays.add(callId)
   }
 
   /** Clear one relayed call when `pi_await_result` resumes it, flushing buffered output once all relays clear. */
   resumeRelay(callId: string): void {
+    this.unretrievedRelays.delete(callId)
+    this.completedUnretrievedRelays.delete(callId)
     if (this.relayedCalls.delete(callId) && this.relayedCalls.size === 0) {
-      for (const event of this.relayBuffer) this.events.push(event)
-      this.clearRelayBuffer()
-      const held = this.recoverNoticeHold()
-      if (held.length > 0) this.events.push({ kind: 'text', text: held })
+      this.flushRelayBuffer()
+    }
+  }
+
+  /** Record that Pi resolved `callId`, queuing a one-time completion hint if it was never re-awaited. */
+  noteCallResolved(callId: string): void {
+    if (this.unretrievedRelays.has(callId)) {
+      this.completedUnretrievedRelays.add(callId)
+    }
+  }
+
+  /** Queue tool-delta or steering suffix text to be attached to the next delivered tool result. */
+  pushPendingSuffix(suffix: string): void {
+    if (suffix.length > 0) this.pendingSuffix.push(suffix)
+  }
+
+  /** Drain all deferred tool-delta and steering suffixes. */
+  consumePendingSuffix(): string {
+    if (this.pendingSuffix.length === 0) return ''
+    const combined = this.pendingSuffix.join('\n\n')
+    this.pendingSuffix.length = 0
+    return combined
+  }
+
+  /**
+   * Finalize one real tool result immediately before returning it over MCP:
+   * release any stale relay buffer wait (e.g. when a parallel sibling was never re-awaited)
+   * and attach deferred harness suffixes plus one-time completion hints for unretrieved relays.
+   */
+  finalizeDeliveredResult(
+    callId: string,
+    result: BridgeToolResult,
+  ): BridgeToolResult {
+    this.unretrievedRelays.delete(callId)
+    this.completedUnretrievedRelays.delete(callId)
+    this.releaseRelayWait()
+    const notes: string[] = []
+    const suffix = this.consumePendingSuffix()
+    if (suffix.length > 0) notes.push(suffix)
+    for (const id of [...this.completedUnretrievedRelays]) {
+      this.completedUnretrievedRelays.delete(id)
+      const completed = this.calls.get(id)
+      if (completed === undefined) continue
+      notes.push(
+        `[harness_note: tool call ${completed.id} (${completed.name}) has completed; call ${AGENT_TOOL_PREFIX}${AWAIT_TOOL_NAME} with {"call_id":"${completed.id}"} to read its result.]`,
+      )
+    }
+    if (notes.length === 0) return result
+    return {
+      ...result,
+      content: [
+        ...result.content,
+        { type: 'text', text: `\n\n${notes.join('\n\n')}` },
+      ],
     }
   }
 
   /** Release all relay tracking and buffered output. */
   clearRelay(): void {
     this.relayedCalls.clear()
+    this.unretrievedRelays.clear()
+    this.completedUnretrievedRelays.clear()
     this.clearRelayBuffer()
+  }
+
+  private releaseRelayWait(): void {
+    if (this.relayedCalls.size === 0) return
+    this.relayedCalls.clear()
+    this.flushRelayBuffer()
+  }
+
+  private flushRelayBuffer(): void {
+    for (const event of this.relayBuffer) this.events.push(event)
+    this.clearRelayBuffer()
+    const held = this.recoverNoticeHold()
+    if (held.length > 0) this.events.push({ kind: 'text', text: held })
   }
 
   private clearRelayBuffer(): void {
@@ -365,6 +443,7 @@ export class AcpTurn {
     this.terminal ??= { kind: 'cancelled' }
     if (this.terminal.kind === 'cancelled') this.cancellation.abort()
     this.clearRelay()
+    this.pendingSuffix.length = 0
     this.settleCalls(reason)
   }
 
@@ -372,6 +451,7 @@ export class AcpTurn {
   fail(error: Error): void {
     this.terminal ??= { kind: 'failed', error }
     this.clearRelay()
+    this.pendingSuffix.length = 0
     this.events.push({ kind: 'error', error })
     this.settleCalls(error.message)
   }
@@ -679,6 +759,21 @@ async function* stepChunks(
               turn.fail(error instanceof Error ? error : new Error(String(error))),
           )
           break
+        }
+        if (
+          !turn.isRelaying &&
+          turn.unretrievedRelays.size > 0 &&
+          (stop === 'end_turn' || stop === 'max_tokens')
+        ) {
+          const ids = [...turn.unretrievedRelays]
+          turn.clearRelay()
+          const prefix =
+            open?.type === 'text' && open.text.length > 0 ? '\n\n' : ''
+          turn.produced = true
+          yield* append(
+            'text',
+            `${prefix}[Antigravity ended the turn without retrieving the result of long-running tool call(s) ${ids.join(', ')}; this reply may not reflect that result.]`,
+          )
         }
         turn.finished = true
         yield* close()

@@ -1474,6 +1474,8 @@ export class AntigravityRuntime {
     const pending = [...turn.pendingCalls.values()]
     turn.pendingCalls.clear()
     if (turn.finished || !this.isTurnLive(turn)) {
+      const carried = turn.consumePendingSuffix()
+      const combinedSuffix = [carried, suffix].filter(Boolean).join('\n\n')
       // The agent ended its turn while the harness ran the tools: hand the results over as new input.
       const transcript = renderTranscript(
         pending.map((call) => results.get(call.id) as RequestMessage),
@@ -1485,12 +1487,13 @@ export class AntigravityRuntime {
       this.startPrompt(conv, next, proc, [
         {
           type: 'text',
-          text: `${transcript}${suffix ? `\n\n${suffix}` : ''}\n\nContinue the task with these tool results.`,
+          text: `${transcript}${combinedSuffix ? `\n\n${combinedSuffix}` : ''}\n\nContinue the task with these tool results.`,
         },
       ])
       return next
     }
-    for (const [index, call] of pending.entries()) {
+    if (suffix.length > 0) turn.pushPendingSuffix(suffix)
+    for (const call of pending) {
       const message = results.get(call.id) as Extract<
         RequestMessage,
         { role: 'tool' }
@@ -1499,8 +1502,7 @@ export class AntigravityRuntime {
         message.content,
         message.isError === true,
       )
-      if (index === pending.length - 1 && suffix.length > 0)
-        result.content.push({ type: 'text', text: `\n\n${suffix}` })
+      turn.noteCallResolved(call.id)
       call.result.resolve(result)
     }
     return turn
@@ -1665,7 +1667,7 @@ export class AntigravityRuntime {
       }
       if (outcome === 'aborted')
         return toolError('The tool call was cancelled.')
-      return outcome
+      return turn.finalizeDeliveredResult(call.id, outcome)
     } finally {
       if (timer !== undefined) clearTimeout(timer)
       if (onAbort !== undefined) signal.removeEventListener('abort', onAbort)
