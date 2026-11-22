@@ -24,11 +24,13 @@ import {
   defaultAgyHomes,
   prepareHome,
   syncOAuthToken,
+} from '../src/preflight.ts'
+import {
   removeSessionArtifacts,
   extractContextWindowMetadata,
-  readSessionContextMetadata,
-  readSessionNextMetadataIndex,
-} from '../src/preflight.ts'
+  readSessionCursors,
+  readSessionTurnData,
+} from '../src/session-db.ts'
 import { defaults } from '../src/config.ts'
 import { AntigravityRuntime } from '../src/runtime.ts'
 import {
@@ -1381,34 +1383,54 @@ test('readSessionContextMetadata reads WAL SQLite metadata safely and rejects sy
   insert.run(2, unrelated, unrelated.length)
 
   // Skips newer row 2 lacking ContextWindowMetadata and finds row 1 from WAL while writer stays open.
-  assert.deepEqual(readSessionContextMetadata(home, 'sess-1'), {
-    maxContextTokens: 512_000,
-  })
+  assert.equal(
+    readSessionTurnData(home, 'sess-1', { metaFloorIdx: 0 })?.maxContextTokens,
+    512_000,
+  )
 
   const blob128k = genMetadataBlob([0x80, 0x80, 0x08])
   insert.run(3, blob128k, blob128k.length)
-  assert.deepEqual(readSessionContextMetadata(home, 'sess-1'), {
-    maxContextTokens: 131_072,
+  assert.equal(
+    readSessionTurnData(home, 'sess-1', { metaFloorIdx: 0 })?.maxContextTokens,
+    131_072,
+  )
+  assert.equal(
+    readSessionTurnData(home, 'sess-1', { metaFloorIdx: 4 })?.maxContextTokens,
+    undefined,
+  )
+  assert.equal(
+    readSessionTurnData(home, 'sess-1', { metaFloorIdx: -1 })?.maxContextTokens,
+    undefined,
+  )
+  assert.deepEqual(readSessionCursors(home, 'sess-1'), {
+    nextMetaIdx: 4,
+    lastStepIdx: -1,
   })
-  assert.deepEqual(readSessionContextMetadata(home, 'sess-1', 0), {
-    maxContextTokens: 131_072,
-  })
-  assert.equal(readSessionContextMetadata(home, 'sess-1', 4), undefined)
-  assert.equal(readSessionContextMetadata(home, 'sess-1', -1), undefined)
-  assert.equal(readSessionNextMetadataIndex(home, 'sess-1'), 4)
   db.close()
 
-  assert.equal(readSessionContextMetadata(home, 'missing'), undefined)
-  assert.equal(readSessionNextMetadataIndex(home, 'missing'), 0)
-  assert.equal(readSessionContextMetadata(home, ''), undefined)
-  assert.equal(readSessionContextMetadata(home, '.'), undefined)
-  assert.equal(readSessionContextMetadata(home, '../outside'), undefined)
-  assert.equal(readSessionNextMetadataIndex(home, '../outside'), null)
-  assert.equal(readSessionContextMetadata(home, 'a/b'), undefined)
+  assert.equal(
+    readSessionTurnData(home, 'missing', { metaFloorIdx: 0 }),
+    undefined,
+  )
+  assert.deepEqual(readSessionCursors(home, 'missing'), {
+    nextMetaIdx: 0,
+    lastStepIdx: -1,
+  })
+  assert.equal(readSessionTurnData(home, '', { metaFloorIdx: 0 }), undefined)
+  assert.equal(readSessionTurnData(home, '.', { metaFloorIdx: 0 }), undefined)
+  assert.equal(
+    readSessionTurnData(home, '../outside', { metaFloorIdx: 0 }),
+    undefined,
+  )
+  assert.equal(readSessionCursors(home, '../outside'), null)
+  assert.equal(readSessionTurnData(home, 'a/b', { metaFloorIdx: 0 }), undefined)
 
   writeFileSync(join(convDir, 'corrupt.db'), 'not-a-sqlite-file')
-  assert.equal(readSessionContextMetadata(home, 'corrupt'), undefined)
-  assert.equal(readSessionNextMetadataIndex(home, 'corrupt'), null)
+  assert.equal(
+    readSessionTurnData(home, 'corrupt', { metaFloorIdx: 0 }),
+    undefined,
+  )
+  assert.equal(readSessionCursors(home, 'corrupt'), null)
 
   const outside = join(home, 'outside')
   mkdirSync(outside)
@@ -1419,13 +1441,16 @@ test('readSessionContextMetadata reads WAL SQLite metadata safely and rejects sy
   outsideDb.close()
 
   symlinkSync(outsideDbPath, join(convDir, 'sym-file.db'))
-  assert.equal(readSessionContextMetadata(home, 'sym-file'), undefined)
-  assert.equal(readSessionNextMetadataIndex(home, 'sym-file'), null)
+  assert.equal(
+    readSessionTurnData(home, 'sym-file', { metaFloorIdx: 0 }),
+    undefined,
+  )
+  assert.equal(readSessionCursors(home, 'sym-file'), null)
 
   rmSync(convDir, { recursive: true, force: true })
   symlinkSync(outside, convDir, 'junction')
-  assert.equal(readSessionContextMetadata(home, 'ext'), undefined)
-  assert.equal(readSessionNextMetadataIndex(home, 'ext'), null)
+  assert.equal(readSessionTurnData(home, 'ext', { metaFloorIdx: 0 }), undefined)
+  assert.equal(readSessionCursors(home, 'ext'), null)
 })
 
 test('ModelCatalog persists contextWindows in catalog.json and ignores invalid values', (t) => {
@@ -1890,27 +1915,38 @@ test('extractContextWindowMetadata decodes estimated_tokens_used and SQLite reje
   }
 
   createDb('good')
-  assert.deepEqual(readSessionContextMetadata(home, 'good'), {
-    estimatedTokensUsed: 1234,
-    maxContextTokens: 512_000,
+  const good = readSessionTurnData(home, 'good', {
+    metaFloorIdx: 0,
+    turnMetaFloorIdx: 0,
   })
+  assert.equal(good?.estimatedTokensUsed, 1234)
+  assert.equal(good?.maxContextTokens, 512_000)
 
   createDb('sym-wal')
   const extWal = join(outside, 'ext.db-wal')
   writeFileSync(extWal, '')
   symlinkSync(extWal, join(convDir, 'sym-wal.db-wal'))
-  assert.equal(readSessionContextMetadata(home, 'sym-wal'), undefined)
-  assert.equal(readSessionNextMetadataIndex(home, 'sym-wal'), null)
+  assert.equal(
+    readSessionTurnData(home, 'sym-wal', { metaFloorIdx: 0 }),
+    undefined,
+  )
+  assert.equal(readSessionCursors(home, 'sym-wal'), null)
 
   createDb('sym-shm')
   const extShm = join(outside, 'ext.db-shm')
   writeFileSync(extShm, '')
   symlinkSync(extShm, join(convDir, 'sym-shm.db-shm'))
-  assert.equal(readSessionContextMetadata(home, 'sym-shm'), undefined)
-  assert.equal(readSessionNextMetadataIndex(home, 'sym-shm'), null)
+  assert.equal(
+    readSessionTurnData(home, 'sym-shm', { metaFloorIdx: 0 }),
+    undefined,
+  )
+  assert.equal(readSessionCursors(home, 'sym-shm'), null)
 
   createDb('dir-wal')
   mkdirSync(join(convDir, 'dir-wal.db-wal'))
-  assert.equal(readSessionContextMetadata(home, 'dir-wal'), undefined)
-  assert.equal(readSessionNextMetadataIndex(home, 'dir-wal'), null)
+  assert.equal(
+    readSessionTurnData(home, 'dir-wal', { metaFloorIdx: 0 }),
+    undefined,
+  )
+  assert.equal(readSessionCursors(home, 'dir-wal'), null)
 })

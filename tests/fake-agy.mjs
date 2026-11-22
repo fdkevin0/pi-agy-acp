@@ -10,6 +10,8 @@
 //   MAXCTX <n>              record max_context_tokens = <n> in gen_metadata
 //   NOMAXCTX                skip writing gen_metadata for this prompt
 //   PROMPT_ERR              fail session/prompt after recording gen_metadata
+//   STEP <type> <payload>   record a row in steps(idx, step_type, step_payload)
+//   STOP <reason>           return the given stopReason from session/prompt
 //   DENYCALL <tool> <json>  native tool whose rawInput merely embeds "mcp_pi_<tool>"
 //   SPOOFCALL <tool> <json> title fakes "mcp_pi_<tool>" but no structured metadata
 //   STALECALL <tool> <json> permission claims structured metadata never reported
@@ -394,6 +396,7 @@ async function runPrompt(s, text) {
   }
   const lines = text.split('\n')
   let output = []
+  let stopReason
   for (const line of lines) {
     if (line.startsWith('CALL ')) {
       const [, name, ...rest] = line.split(' ')
@@ -643,12 +646,25 @@ async function runPrompt(s, text) {
         used: Number(line.slice(9).trim()),
         size: 256_000,
       })
+    } else if (line.startsWith('STEP ')) {
+      const rest = line.slice('STEP '.length)
+      const sep = rest.indexOf(' ')
+      const stepType = Number(sep >= 0 ? rest.slice(0, sep) : rest)
+      const payload = sep >= 0 ? rest.slice(sep + 1) : ''
+      s.db
+        ?.prepare(
+          'INSERT INTO steps (idx, step_type, step_payload) VALUES (?, ?, ?)',
+        )
+        .run(s.stepSeq++, stepType, Buffer.from(payload, 'utf8'))
+    } else if (line.startsWith('STOP ')) {
+      stopReason = line.slice('STOP '.length).trim()
     } else if (line.startsWith('SLEEP ')) {
       await new Promise((r) => setTimeout(r, Number(line.slice(6))))
     }
   }
   if (text.includes('PROMPT_ERR')) throw new Error('synthetic prompt error')
   if (s.cancelled) return { stopReason: 'cancelled' }
+  if (stopReason !== undefined) return { stopReason }
   if (text.includes('MAXTOK') && !s.continued) {
     s.continued = true
     update(s.id, {
@@ -720,6 +736,7 @@ rl.on('line', async (line) => {
         system: params._meta?.antigravity?.systemPrompt?.append ?? '',
         tools: [],
         metaSeq: 0,
+        stepSeq: 0,
         db: undefined,
       }
       sessions.set(s.id, s)
@@ -730,7 +747,7 @@ rl.on('line', async (line) => {
         mkdirSync(brain, { recursive: true })
         const db = new DatabaseSync(join(conversations, `${s.id}.db`))
         db.exec(
-          'PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS gen_metadata (idx integer PRIMARY KEY, data blob, size integer NOT NULL DEFAULT 0);',
+          'PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS gen_metadata (idx integer PRIMARY KEY, data blob, size integer NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS steps (idx integer PRIMARY KEY, step_type integer NOT NULL, step_payload blob);',
         )
         s.db = db
         writeFileSync(join(brain, 'note.md'), 'fake session')

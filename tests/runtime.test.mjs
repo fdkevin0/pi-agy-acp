@@ -4503,3 +4503,233 @@ test('initialize promptCapabilities.image dynamically updates catalog input moda
     ['text'],
   )
 })
+
+test('runtime surfaces hidden SQLite QUOTA_EXHAUSTED on end_turn and refusal while preserving pure safety refusals', async (t) => {
+  const { adapter } = makeRuntime(t)
+  const quotaPayload = JSON.stringify({
+    error: {
+      code: 429,
+      status: 'RESOURCE_EXHAUSTED',
+      details: [
+        {
+          reason: 'QUOTA_EXHAUSTED',
+          metadata: {
+            quotaResetTimeStamp: '2026-11-22T20:00:00Z',
+            quotaResetDelay: '15m30s',
+          },
+        },
+      ],
+    },
+  })
+
+  await assert.rejects(
+    collect(
+      adapter.stream({
+        provider: 'antigravity',
+        model: 'gemini-4-argon',
+        sessionId: 'S-QUOTA-END',
+        messages: [sys, user('u1', `STEP 17 ${quotaPayload}\nhello`)],
+      }),
+    ),
+    (err) => {
+      assert.equal(err.code, 'QUOTA')
+      assert.match(err.message, /quota exceeded/i)
+      assert.match(err.message, /2026-11-22T20:00:00Z/)
+      assert.match(err.message, /15m30s/)
+      return true
+    },
+  )
+
+  await assert.rejects(
+    collect(
+      adapter.stream({
+        provider: 'antigravity',
+        model: 'gemini-4-argon',
+        sessionId: 'S-QUOTA-REFUSAL',
+        messages: [sys, user('u1', `STEP 17 ${quotaPayload}\nSTOP refusal`)],
+      }),
+    ),
+    (err) => {
+      assert.equal(err.code, 'QUOTA')
+      assert.match(err.message, /2026-11-22T20:00:00Z/)
+      return true
+    },
+  )
+
+  const refusalChunks = await collect(
+    adapter.stream({
+      provider: 'antigravity',
+      model: 'gemini-4-argon',
+      sessionId: 'S-PURE-REFUSAL',
+      messages: [sys, user('u1', 'STOP refusal')],
+    }),
+  )
+  assert.equal(finishOf(refusalChunks).reason.kind, 'error')
+  assert.equal(finishOf(refusalChunks).reason.failure.code, 'REFUSAL')
+})
+
+test('runtime marks session dirty and rebuilds after hidden INVALID_THINKING_SIGNATURE, while retried step 17 followed by step 15 succeeds', async (t) => {
+  const { adapter, prompts } = makeRuntime(t)
+  const base = {
+    provider: 'antigravity',
+    model: 'gemini-4-argon',
+    sessionId: 'S-THINK-SIG',
+  }
+
+  // Retried step_type=17 followed by step_type=15 must succeed normally.
+  const turn1 = await collect(
+    adapter.stream({
+      ...base,
+      messages: [
+        sys,
+        user(
+          'u1',
+          'STEP 17 {"reason":"QUOTA_EXHAUSTED"}\nSTEP 15 recovered\nhello',
+        ),
+      ],
+    }),
+  )
+  assert.equal(finishOf(turn1).reason.kind, 'stop')
+  const firstSession = prompts()[0].session
+
+  // Hidden INVALID_THINKING_SIGNATURE throws PROVIDER_ERROR and dirties the session.
+  await assert.rejects(
+    collect(
+      adapter.stream({
+        ...base,
+        messages: [
+          sys,
+          user(
+            'u1',
+            'STEP 17 {"reason":"QUOTA_EXHAUSTED"}\nSTEP 15 recovered\nhello',
+          ),
+          assistantFrom('a1', turn1),
+          user(
+            'u2',
+            'STEP 17 messages.2.content.0.thinking.signature: Field required\nnext',
+          ),
+        ],
+      }),
+    ),
+    (err) => {
+      assert.equal(err.code, 'PROVIDER_ERROR')
+      assert.match(err.message, /invalid thinking signature/i)
+      return true
+    },
+  )
+  assert.equal(prompts()[1].session, firstSession)
+
+  // Next turn rebuilds a fresh ACP session instead of reusing the poisoned one.
+  const turn3 = await collect(
+    adapter.stream({
+      ...base,
+      messages: [
+        sys,
+        user(
+          'u1',
+          'STEP 17 {"reason":"QUOTA_EXHAUSTED"}\nSTEP 15 recovered\nhello',
+        ),
+        assistantFrom('a1', turn1),
+        user('u3', 'after rebuild'),
+      ],
+    }),
+  )
+  assert.equal(finishOf(turn3).reason.kind, 'stop')
+  assert.notEqual(prompts()[2].session, firstSession)
+})
+
+test('streaming usage_update skips SQLite when contextWindow is cached and used > 0, and reads when used === 0', async (t) => {
+  const { runtime, adapter } = makeRuntime(t)
+  const base = {
+    provider: 'antigravity',
+    model: 'gemini-4-argon',
+    sessionId: 'S-STREAM-GATE',
+    tools: [bash],
+  }
+
+  // Turn 1 caches gemini-4-argon contextWindow = 512_000.
+  const turn1 = await collect(
+    adapter.stream({ ...base, messages: [sys, user('u1', 'seed cache')] }),
+  )
+  assert.equal(finishOf(turn1).reason.kind, 'stop')
+  assert.equal(runtime.contextWindowFor('gemini-4-argon'), 512_000)
+
+  // Turn 2: cached contextWindow + positive usage_update (848) skips SQLite during streaming.
+  const u2 = user(
+    'u2',
+    'MAXCTX 999999\nESTCTX 4321\nUSAGEUPD 848\nCALL bash {"command":"hi"}',
+  )
+  const turn2Step1 = await collect(
+    adapter.stream({
+      ...base,
+      messages: [sys, user('u1', 'seed cache'), assistantFrom('a1', turn1), u2],
+    }),
+  )
+  assert.equal(finishOf(turn2Step1).reason.kind, 'tool-calls')
+  assert.equal(runtime.contextWindowFor('gemini-4-argon'), 512_000)
+  const conv = runtime.conversations.get('S-STREAM-GATE')
+  assert.equal(conv.turn.contextUsed, 848)
+  assert.equal(conv.turn.estimatedContextUsed, undefined)
+
+  const [call2] = callsOf(turn2Step1)
+  const turn2Step2 = await collect(
+    adapter.stream({
+      ...base,
+      messages: [
+        sys,
+        user('u1', 'seed cache'),
+        assistantFrom('a1', turn1),
+        u2,
+        assistantFrom('a2-1', turn2Step1),
+        tool('t2', call2.id, 'ok2'),
+      ],
+    }),
+  )
+  assert.equal(finishOf(turn2Step2).reason.kind, 'stop')
+  // Un-gated end-of-turn harvest observes the committed 999_999 window.
+  assert.equal(runtime.contextWindowFor('gemini-4-argon'), 999_999)
+
+  // Turn 3: usage_update with used === 0 DOES read SQLite during streaming.
+  const u3 = user(
+    'u3',
+    'MAXCTX 777777\nESTCTX 6543\nUSAGEUPD 0\nCALL bash {"command":"hi3"}',
+  )
+  const turn3Step1 = await collect(
+    adapter.stream({
+      ...base,
+      messages: [
+        sys,
+        user('u1', 'seed cache'),
+        assistantFrom('a1', turn1),
+        u2,
+        assistantFrom('a2-1', turn2Step1),
+        tool('t2', call2.id, 'ok2'),
+        assistantFrom('a2-2', turn2Step2),
+        u3,
+      ],
+    }),
+  )
+  assert.equal(finishOf(turn3Step1).reason.kind, 'tool-calls')
+  assert.equal(runtime.contextWindowFor('gemini-4-argon'), 777_777)
+  assert.equal(conv.turn.estimatedContextUsed, 6543)
+
+  const [call3] = callsOf(turn3Step1)
+  const turn3Step2 = await collect(
+    adapter.stream({
+      ...base,
+      messages: [
+        sys,
+        user('u1', 'seed cache'),
+        assistantFrom('a1', turn1),
+        u2,
+        assistantFrom('a2-1', turn2Step1),
+        tool('t2', call2.id, 'ok2'),
+        assistantFrom('a2-2', turn2Step2),
+        u3,
+        assistantFrom('a3-1', turn3Step1),
+        tool('t3', call3.id, 'ok3'),
+      ],
+    }),
+  )
+  assert.equal(finishOf(turn3Step2).reason.kind, 'stop')
+})
