@@ -174,6 +174,13 @@ export type TurnEvent =
 /** Bound on buffered text/thought chars accumulated while a tool call is relayed. */
 const MAX_RELAY_BUFFER_CHARS = 65_536
 
+type RelayState = 'waiting' | 'unawaited' | 'notified'
+
+interface RelayEntry {
+  state: RelayState
+  resolved: boolean
+}
+
 /** One running ACP prompt turn. */
 export class AcpTurn {
   readonly cancellation = new AbortController()
@@ -194,6 +201,8 @@ export class AcpTurn {
   continuations = 0
   /** The agent ended the prompt. */
   finished = false
+  /** True while an ACP `session/prompt` RPC for this turn has not yet settled. */
+  private promptActive = false
   /** Settles after the current prompt's result or error has been queued. */
   promptSettled: Promise<void> = Promise.resolve()
   usage?: AcpPromptResult['usage']
@@ -203,8 +212,10 @@ export class AcpTurn {
   estimatedContextUsed?: number
   /** Lower `gen_metadata.idx` bound owned by the active turn segment, or `null` when unobservable. */
   metaFloorIdx: number | null = 0
-  /** Relayed call ids whose results the agent has not yet re-awaited via `pi_await_result`. */
-  readonly relayedCalls = new Set<string>()
+  /** Per-call relay lifecycle: waiting (gating `relayBuffer`) -> unawaited -> notified. */
+  private readonly relays = new Map<string, RelayEntry>()
+  /** Tool deltas and steering text deferred until an active MCP call returns a real result. */
+  private readonly pendingSuffix: string[] = []
   /** Bounded output buffered while one or more calls are relayed. */
   private relayBuffer: Array<Extract<TurnEvent, { kind: 'text' | 'thought' }>> = []
   private relayBufferChars = 0
@@ -222,6 +233,44 @@ export class AcpTurn {
     this.turnTag = turnTag
   }
 
+  /** Authoritative liveness of the underlying ACP `session/prompt` RPC. */
+  get isPromptActive(): boolean {
+    return this.promptActive && !this.finished && this.terminal === undefined
+  }
+
+  /**
+   * Bind one ACP `session/prompt` RPC promise to this turn's lifecycle.
+   * Clears `promptActive` the instant the RPC settles so tool-result delivery
+   * never has to guess liveness from the head of `events`.
+   */
+  bindPrompt(
+    promise: Promise<AcpPromptResult>,
+    options?: {
+      onSettled?: () => void
+      mapError?: (error: unknown) => Error
+    },
+  ): void {
+    this.promptActive = true
+    this.promptSettled = promise.then(
+      (result) => {
+        this.promptActive = false
+        options?.onSettled?.()
+        this.events.push({ kind: 'done', result })
+      },
+      (error: unknown) => {
+        this.promptActive = false
+        options?.onSettled?.()
+        this.fail(
+          options?.mapError !== undefined
+            ? options.mapError(error)
+            : error instanceof Error
+              ? error
+              : new Error(String(error)),
+        )
+      },
+    )
+  }
+
   /**
    * Register one agent tool call.
    * @param name - Pi tool name.
@@ -229,6 +278,10 @@ export class AcpTurn {
    * @returns the parked call.
    */
   park(name: string, args: Record<string, unknown>): ParkedCall {
+    // A new tool call means the agent moved on instead of only waiting on relayed call(s):
+    // flush buffered thought/text in chronological order before queueing the new call so
+    // subsequent steps stream live instead of accumulating in relayBuffer.
+    this.releaseRelayWait()
     const call: ParkedCall = {
       id: `agy_${this.turnTag}_${++this.nextCall}`,
       name,
@@ -240,29 +293,214 @@ export class AcpTurn {
     return call
   }
 
+  /** Park one Pi tool call and wait for its result, relaying if it outlives `relayAfterMs`. */
+  invokeTool(
+    name: string,
+    args: Record<string, unknown>,
+    relayAfterMs: number,
+    signal: AbortSignal,
+  ): Promise<BridgeToolResult> {
+    return this.awaitCall(this.park(name, args), relayAfterMs, signal)
+  }
+
+  /** Resume waiting on a previously parked call via `pi_await_result`, or return undefined if unknown. */
+  awaitRelayedCall(
+    callId: string,
+    relayAfterMs: number,
+    signal: AbortSignal,
+  ): Promise<BridgeToolResult> | undefined {
+    const call = this.calls.get(callId)
+    if (call === undefined) return undefined
+    this.resumeRelay(callId)
+    return this.awaitCall(call, relayAfterMs, signal)
+  }
+
   get isRelaying(): boolean {
-    return this.relayedCalls.size > 0
+    for (const entry of this.relays.values()) {
+      if (entry.state === 'waiting') return true
+    }
+    return false
   }
 
   /** Record that `callId` timed out into a relay notice and awaits `pi_await_result`. */
   markRelayed(callId: string): void {
-    this.relayedCalls.add(callId)
+    const prev = this.relays.get(callId)
+    this.relays.set(callId, {
+      state: 'waiting',
+      resolved: prev?.resolved ?? false,
+    })
   }
 
-  /** Clear one relayed call when `pi_await_result` resumes it, flushing buffered output once all relays clear. */
+  /** Clear one relayed call when `pi_await_result` resumes it, flushing buffered output once all waits clear. */
   resumeRelay(callId: string): void {
-    if (this.relayedCalls.delete(callId) && this.relayedCalls.size === 0) {
-      for (const event of this.relayBuffer) this.events.push(event)
-      this.clearRelayBuffer()
-      const held = this.recoverNoticeHold()
-      if (held.length > 0) this.events.push({ kind: 'text', text: held })
+    const wasWaiting = this.relays.get(callId)?.state === 'waiting'
+    this.relays.delete(callId)
+    if (wasWaiting && !this.isRelaying) this.flushRelayBuffer()
+  }
+
+  /**
+   * Deliver Pi's tool results for the currently pending batch.
+   * When the ACP prompt is still active, resolves the parked calls and defers any
+   * harness suffix onto the next delivered MCP result; otherwise returns the
+   * pending batch and combined suffix so the owner can open a continuation prompt.
+   */
+  deliverToolResults(
+    results: ReadonlyMap<string, BridgeToolResult>,
+    suffix: string,
+  ):
+    | { resumed: true }
+    | { resumed: false; pending: ParkedCall[]; suffix: string } {
+    const pending = [...this.pendingCalls.values()]
+    this.pendingCalls.clear()
+    if (!this.isPromptActive) {
+      const carried = this.consumePendingSuffix()
+      return {
+        resumed: false,
+        pending,
+        suffix: [carried, suffix].filter(Boolean).join('\n\n'),
+      }
+    }
+    if (suffix.length > 0) this.pendingSuffix.push(suffix)
+    for (const call of pending) {
+      const result = results.get(call.id)
+      if (result === undefined) continue
+      const entry = this.relays.get(call.id)
+      if (entry !== undefined) entry.resolved = true
+      call.result.resolve(result)
+    }
+    return { resumed: true }
+  }
+
+  /**
+   * Finalize relay tracking when the prompt finishes with `stop`.
+   * Always clears relay state and reports whether completion is clean (`ok`),
+   * has unretrieved relayed calls (`note`), or ended prematurely while still
+   * actively waiting on relayed calls (`premature`).
+   */
+  settleOnDone(
+    stop: AcpPromptResult['stopReason'],
+  ):
+    | { kind: 'ok' }
+    | { kind: 'note'; ids: string[] }
+    | { kind: 'premature' } {
+    if (stop !== 'end_turn' && stop !== 'max_tokens') {
+      this.clearRelay()
+      return { kind: 'ok' }
+    }
+    if (this.isRelaying) {
+      this.clearRelay()
+      return { kind: 'premature' }
+    }
+    const ids = [...this.relays.keys()]
+    this.clearRelay()
+    return ids.length > 0 ? { kind: 'note', ids } : { kind: 'ok' }
+  }
+
+  private async awaitCall(
+    call: ParkedCall,
+    relayAfterMs: number,
+    signal: AbortSignal,
+  ): Promise<BridgeToolResult> {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const relay = new Promise<'relay'>((resolve) => {
+      timer = setTimeout(() => resolve('relay'), relayAfterMs)
+    })
+    let onAbort: (() => void) | undefined
+    const aborted = new Promise<'aborted'>((resolve) => {
+      if (signal.aborted) resolve('aborted')
+      else {
+        onAbort = () => resolve('aborted')
+        signal.addEventListener('abort', onAbort, { once: true })
+      }
+    })
+    try {
+      const outcome = await Promise.race([call.result.promise, relay, aborted])
+      if (outcome === 'relay') {
+        this.markRelayed(call.id)
+        return relayNotice(call)
+      }
+      if (outcome === 'aborted') {
+        return {
+          content: [{ type: 'text', text: 'The tool call was cancelled.' }],
+          isError: true,
+        }
+      }
+      return this.deliverCallResult(call.id, outcome)
+    } finally {
+      if (timer !== undefined) clearTimeout(timer)
+      if (onAbort !== undefined) signal.removeEventListener('abort', onAbort)
     }
   }
 
-  /** Release all relay tracking and buffered output. */
-  clearRelay(): void {
-    this.relayedCalls.clear()
+  private consumePendingSuffix(): string {
+    if (this.pendingSuffix.length === 0) return ''
+    const combined = this.pendingSuffix.join('\n\n')
+    this.pendingSuffix.length = 0
+    return combined
+  }
+
+  /**
+   * Finalize one real tool result immediately before returning it over MCP:
+   * release any stale relay buffer wait (e.g. when a parallel sibling was never re-awaited)
+   * and attach deferred harness suffixes plus a one-time completion update for resolved unretrieved relays.
+   */
+  private deliverCallResult(
+    callId: string,
+    result: BridgeToolResult,
+  ): BridgeToolResult {
+    this.relays.delete(callId)
+    this.releaseRelayWait()
+    const notes: string[] = []
+    const suffix = this.consumePendingSuffix()
+    if (suffix.length > 0) notes.push(suffix)
+    const completedLines: string[] = []
+    for (const [id, entry] of this.relays) {
+      if (entry.state !== 'unawaited' || !entry.resolved) continue
+      entry.state = 'notified'
+      const completed = this.calls.get(id)
+      if (completed === undefined) continue
+      completedLines.push(
+        `[tool completed: ${completed.id} (${completed.name}) — call ${AGENT_TOOL_PREFIX}${AWAIT_TOOL_NAME} with {"call_id":"${completed.id}"} to read its result]`,
+      )
+    }
+    if (completedLines.length > 0) {
+      notes.push(
+        `<harness_relay_update>\n${completedLines.join('\n')}\n</harness_relay_update>`,
+      )
+    }
+    if (notes.length === 0) return result
+    return {
+      ...result,
+      content: [
+        ...result.content,
+        { type: 'text', text: `\n\n${notes.join('\n\n')}` },
+      ],
+    }
+  }
+
+  /** Release all relay tracking, deferred suffixes, and buffered output. */
+  private clearRelay(): void {
+    this.relays.clear()
+    this.pendingSuffix.length = 0
     this.clearRelayBuffer()
+  }
+
+  private releaseRelayWait(): void {
+    let released = false
+    for (const entry of this.relays.values()) {
+      if (entry.state === 'waiting') {
+        entry.state = 'unawaited'
+        released = true
+      }
+    }
+    if (released) this.flushRelayBuffer()
+  }
+
+  private flushRelayBuffer(): void {
+    for (const event of this.relayBuffer) this.events.push(event)
+    this.clearRelayBuffer()
+    const held = this.recoverNoticeHold()
+    if (held.length > 0) this.events.push({ kind: 'text', text: held })
   }
 
   private clearRelayBuffer(): void {
@@ -673,12 +911,18 @@ async function* stepChunks(
           turn.segmentToolSteps = 0
           turn.contextUsed = undefined
           turn.estimatedContextUsed = undefined
-          turn.promptSettled = host.continuePrompt().then(
-            (result) => turn.events.push({ kind: 'done', result }),
-            (error: unknown) =>
-              turn.fail(error instanceof Error ? error : new Error(String(error))),
-          )
+          turn.bindPrompt(host.continuePrompt())
           break
+        }
+        const relayOutcome = turn.settleOnDone(stop)
+        if (relayOutcome.kind === 'note') {
+          const prefix =
+            open?.type === 'text' && open.text.length > 0 ? '\n\n' : ''
+          turn.produced = true
+          yield* append(
+            'text',
+            `${prefix}[Antigravity ended the turn without retrieving the result of long-running tool call(s) ${relayOutcome.ids.join(', ')}; this reply may not reflect that result.]`,
+          )
         }
         turn.finished = true
         yield* close()
@@ -692,11 +936,7 @@ async function* stepChunks(
           lastSegmentUsage: event.result.usage ?? turn.usage,
         })
         if (usage !== undefined) yield { type: 'usage', usage }
-        if (
-          turn.isRelaying &&
-          (stop === 'end_turn' || stop === 'max_tokens')
-        ) {
-          turn.clearRelay()
+        if (relayOutcome.kind === 'premature') {
           throw new LlmError(
             'Antigravity ended the turn before retrieving relayed tool result(s)',
             'PROVIDER_ERROR',

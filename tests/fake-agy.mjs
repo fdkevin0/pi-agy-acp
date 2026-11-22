@@ -271,12 +271,28 @@ async function runToolCall(s, name, args, opts = {}) {
   })
   let text = res.result.content.map((c) => c.text ?? `[${c.type}]`).join('')
   // Follow still-running notices the way the instructed agent does.
-  for (let hop = 0; hop < 20; hop++) {
-    const match = /pi_await_result with \{"call_id":"([^"]+)"\}/.exec(text)
-    if (match === null) break
-    s.relays = (s.relays ?? 0) + 1
-    const next = await runToolCall(s, 'pi_await_result', { call_id: match[1] })
-    text = next
+  if (!opts.noAwaitRelay) {
+    for (let hop = 0; hop < 20; hop++) {
+      const match =
+        /still running[\s\S]*pi_await_result with \{"call_id":"([^"]+)"\}/.exec(
+          text,
+        )
+      if (match === null) break
+      s.relays = (s.relays ?? 0) + 1
+      text = await runToolCall(s, 'pi_await_result', { call_id: match[1] })
+    }
+  }
+  if (opts.followCompletedNote) {
+    const completed =
+      /<harness_relay_update>[\s\S]*pi_await_result with \{"call_id":"([^"]+)"\}/.exec(
+        text,
+      )
+    if (completed !== null) {
+      const awaited = await runToolCall(s, 'pi_await_result', {
+        call_id: completed[1],
+      })
+      text = `${text} | AWAITED=${awaited}`
+    }
   }
   return text
 }
@@ -383,6 +399,28 @@ async function runPrompt(s, text) {
       const [, name, ...rest] = line.split(' ')
       const result = await runToolCall(s, name, JSON.parse(rest.join(' ')))
       output.push(`RESULT(${name})=${result}`)
+    } else if (line.startsWith('NO_AWAIT_CALL ')) {
+      const [, name, ...rest] = line.split(' ')
+      const result = await runToolCall(s, name, JSON.parse(rest.join(' ')), {
+        noAwaitRelay: true,
+      })
+      output.push(`RESULT(${name})=${result}`)
+    } else if (line.startsWith('FOLLOW_CALL ')) {
+      const [, name, ...rest] = line.split(' ')
+      const result = await runToolCall(s, name, JSON.parse(rest.join(' ')), {
+        followCompletedNote: true,
+      })
+      output.push(`RESULT(${name})=${result}`)
+    } else if (line.startsWith('THOUGHT ')) {
+      update(s.id, {
+        sessionUpdate: 'agent_thought_chunk',
+        content: { type: 'text', text: line.slice('THOUGHT '.length) },
+      })
+    } else if (line.startsWith('SAY ')) {
+      update(s.id, {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: line.slice('SAY '.length) },
+      })
     } else if (line.startsWith('DENYCALL ')) {
       const [, name, ...rest] = line.split(' ')
       const result = await runToolCall(s, name, JSON.parse(rest.join(' ')), {

@@ -3430,6 +3430,325 @@ test('premature completion while relayed calls remain unawaited fails with PROVI
   assert.equal(turn.isRelaying, false)
 })
 
+test('parking a new tool call while relaying flushes in order, restores live streaming past 64 KiB, and notes unretrieved relays at done', async () => {
+  const turn = new AcpTurn('relay-park-moveon')
+  const c1 = turn.park('bash', { command: 'long' })
+  turn.events.shift()
+  turn.markRelayed(c1.id)
+  turn.onUpdate({ sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'pre-park-thought' } })
+  turn.onUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'pre-park-text' } })
+  const c2 = turn.park('bash', { command: 'status' })
+  assert.equal(turn.isRelaying, false)
+
+  const step2 = await collect(pumpStep(turn, {
+    parkSettleMs: 0, maxContinuations: 0,
+    continuePrompt: async () => ({ stopReason: 'end_turn' }), cancel() {},
+  }, undefined))
+  assert.equal(
+    step2.filter((c) => c.type === 'reasoning-delta').map((c) => c.text).join(''),
+    'pre-park-thought',
+  )
+  assert.equal(textOf(step2), 'pre-park-text')
+  assert.deepEqual(callsOf(step2).map((c) => c.id), [c2.id])
+  assert.equal(finishOf(step2).reason.kind, 'tool-calls')
+
+  const largeLiveReply = 'x'.repeat(70_000)
+  turn.onUpdate({ sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'live-thought' } })
+  turn.onUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: largeLiveReply } })
+  turn.events.push({ kind: 'done', result: { stopReason: 'end_turn' } })
+  const step3 = await collect(pumpStep(turn, {
+    parkSettleMs: 0, maxContinuations: 0,
+    continuePrompt: async () => ({ stopReason: 'end_turn' }), cancel() {},
+  }, undefined))
+  assert.equal(
+    step3.filter((c) => c.type === 'reasoning-delta').map((c) => c.text).join(''),
+    'live-thought',
+  )
+  assert.equal(
+    textOf(step3),
+    `${largeLiveReply}\n\n[Antigravity ended the turn without retrieving the result of long-running tool call(s) ${c1.id}; this reply may not reflect that result.]`,
+  )
+  assert.equal(finishOf(step3).reason.kind, 'stop')
+})
+
+test('partial parallel relay delivery releases buffering, attaches deferred suffix and one-time completion hint, and finishes max_tokens without leading blank lines', async () => {
+  const turn = new AcpTurn('relay-partial-parallel')
+  const prompt = deferred()
+  turn.bindPrompt(prompt.promise)
+  const controller = new AbortController()
+  const c1 = turn.park('bash', { command: 'a' })
+  const c2 = turn.park('bash', { command: 'b' })
+  const step1 = await collect(pumpStep(turn, {
+    parkSettleMs: 0, maxContinuations: 0,
+    continuePrompt: async () => ({ stopReason: 'end_turn' }), cancel() {},
+  }, undefined))
+  assert.deepEqual(callsOf(step1).map((c) => c.id), [c1.id, c2.id])
+  turn.markRelayed(c1.id)
+  turn.markRelayed(c2.id)
+  turn.onUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'while-waiting ' } })
+  const awaitedC1 = turn.awaitRelayedCall(c1.id, 60_000, controller.signal)
+  assert.equal(turn.isRelaying, true)
+
+  const delivery = turn.deliverToolResults(
+    new Map([
+      [c1.id, { content: [{ type: 'text', text: 'res-a' }] }],
+      [c2.id, { content: [{ type: 'text', text: 'res-b' }] }],
+    ]),
+    '<user>\nsteer-msg\n</user>',
+  )
+  assert.equal(delivery.resumed, true)
+  const delivered = await awaitedC1
+  assert.equal(turn.isRelaying, false)
+  assert.equal(delivered.content.length, 2)
+  assert.match(delivered.content[1].text, /steer-msg/)
+  assert.match(
+    delivered.content[1].text,
+    new RegExp(`<harness_relay_update>\\n\\[tool completed: ${c2.id} \\(bash\\) — call mcp_pi_pi_await_result with \\{"call_id":"${c2.id}"\\} to read its result\\]\\n</harness_relay_update>`),
+  )
+
+  // A repeated pi_await_result for c1 does not duplicate the one-time suffix or completion hint.
+  const secondDelivered = await turn.awaitRelayedCall(c1.id, 60_000, controller.signal)
+  assert.deepEqual(secondDelivered, { content: [{ type: 'text', text: 'res-a' }] })
+
+  // Drop the earlier buffered text to verify reasoning-only max_tokens omits leading blank lines.
+  turn.events.shift()
+  turn.onUpdate({ sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'only-thinking' } })
+  prompt.resolve({ stopReason: 'max_tokens' })
+  await turn.promptSettled
+  const finalStep = await collect(pumpStep(turn, {
+    parkSettleMs: 0, maxContinuations: 0,
+    continuePrompt: async () => ({ stopReason: 'end_turn' }), cancel() {},
+  }, undefined))
+  assert.equal(
+    textOf(finalStep),
+    `[Antigravity ended the turn without retrieving the result of long-running tool call(s) ${c2.id}; this reply may not reflect that result.]`,
+  )
+  assert.equal(finishOf(finalStep).reason.kind, 'max-tokens')
+})
+
+test('moving on to a new tool call after relay streams later steps live, preserves deferred suffix, and finishes with a note', async (t) => {
+  const { adapter, runtime } = makeRuntime(t, {
+    config: { parkSettleMs: 0 },
+    host: { relayAfterMs: 20 },
+  })
+  const base = {
+    provider: 'antigravity',
+    model: 'gemini-4-argon',
+    sessionId: 'S-RELAY-MOVEON',
+    tools: [bash],
+  }
+  const prompt = [
+    'NO_AWAIT_CALL bash {"command":"long-job"}',
+    'THOUGHT checking status instead',
+    'SAY checking status',
+    'CALL bash {"command":"status"}',
+    'THOUGHT final analysis',
+    'SAY final reply body',
+  ].join('\n')
+  const step1 = await collect(
+    adapter.stream({ ...base, messages: [sys, user('u1', prompt)] }),
+  )
+  const [call1] = callsOf(step1)
+  const conv = runtime.conversations.get('S-RELAY-MOVEON')
+  // Wait deterministically until call1 relays and fake-agy parks call2 (flushing pre-park output + park).
+  await conv.turn.events.wait()
+
+  const step2 = await collect(
+    adapter.stream({
+      ...base,
+      messages: [
+        sys,
+        user('u1', prompt),
+        assistantFrom('a1', step1),
+        tool('t1', call1.id, 'job-failed', true),
+        user('u2', 'steering-note'),
+      ],
+    }),
+  )
+  assert.equal(
+    step2.filter((c) => c.type === 'reasoning-delta').map((c) => c.text).join(''),
+    'checking status instead',
+  )
+  assert.equal(textOf(step2), 'checking status')
+  const [call2] = callsOf(step2)
+  assert.equal(call2.name, 'bash')
+  assert.equal(finishOf(step2).reason.kind, 'tool-calls')
+
+  const step3 = await collect(
+    adapter.stream({
+      ...base,
+      messages: [
+        sys,
+        user('u1', prompt),
+        assistantFrom('a1', step1),
+        tool('t1', call1.id, 'job-failed', true),
+        user('u2', 'steering-note'),
+        assistantFrom('a2', step2),
+        tool('t2', call2.id, 'queue-empty'),
+      ],
+    }),
+  )
+  assert.equal(
+    step3.filter((c) => c.type === 'reasoning-delta').map((c) => c.text).join(''),
+    'final analysis',
+  )
+  const finalText = textOf(step3)
+  assert.match(finalText, /final reply body/)
+  assert.match(finalText, /RESULT\(bash\)=queue-empty/)
+  assert.match(finalText, /steering-note/)
+  assert.match(
+    finalText,
+    new RegExp(`<harness_relay_update>\\n\\[tool completed: ${call1.id} \\(bash\\) — call mcp_pi_pi_await_result`),
+  )
+  assert.match(
+    finalText,
+    new RegExp(`Antigravity ended the turn without retrieving the result of long-running tool call\\(s\\) ${call1.id}`),
+  )
+  assert.equal(finishOf(step3).reason.kind, 'stop')
+  assert.equal(adapter.status().lastTurn.outcome, 'completed')
+  assert.equal(conv.dirty, false)
+})
+
+test('following the completed-relay harness note recovers the original tool result with no disclaimer', async (t) => {
+  const { adapter, runtime } = makeRuntime(t, {
+    config: { parkSettleMs: 0 },
+    host: { relayAfterMs: 20 },
+  })
+  const base = {
+    provider: 'antigravity',
+    model: 'gemini-4-argon',
+    sessionId: 'S-RELAY-RECOVER',
+    tools: [bash],
+  }
+  const prompt = [
+    'NO_AWAIT_CALL bash {"command":"long-job"}',
+    'FOLLOW_CALL bash {"command":"status"}',
+  ].join('\n')
+  const step1 = await collect(
+    adapter.stream({ ...base, messages: [sys, user('u1', prompt)] }),
+  )
+  const [call1] = callsOf(step1)
+  const conv = runtime.conversations.get('S-RELAY-RECOVER')
+  await conv.turn.events.wait()
+
+  const step2 = await collect(
+    adapter.stream({
+      ...base,
+      messages: [
+        sys,
+        user('u1', prompt),
+        assistantFrom('a1', step1),
+        tool('t1', call1.id, 'job-failed', true),
+      ],
+    }),
+  )
+  const [call2] = callsOf(step2)
+  const step3 = await collect(
+    adapter.stream({
+      ...base,
+      messages: [
+        sys,
+        user('u1', prompt),
+        assistantFrom('a1', step1),
+        tool('t1', call1.id, 'job-failed', true),
+        assistantFrom('a2', step2),
+        tool('t2', call2.id, 'queue-empty'),
+      ],
+    }),
+  )
+  const finalText = textOf(step3)
+  assert.match(finalText, /AWAITED=job-failed/)
+  assert.doesNotMatch(finalText, /ended the turn without retrieving/)
+  assert.equal(finishOf(step3).reason.kind, 'stop')
+  assert.equal(adapter.status().lastTurn.outcome, 'completed')
+})
+
+test('immediate end_turn while Pi is still running a relayed call recovers via fresh continuation prompt', async (t) => {
+  const { adapter, runtime, prompts } = makeRuntime(t, {
+    config: { parkSettleMs: 0 },
+    host: { relayAfterMs: 20 },
+  })
+  const base = {
+    provider: 'antigravity',
+    model: 'gemini-4-argon',
+    sessionId: 'S-RELAY-EARLY-DONE',
+    tools: [bash],
+  }
+  const prompt = 'NO_AWAIT_CALL bash {"command":"long-job"}'
+  const step1 = await collect(
+    adapter.stream({ ...base, messages: [sys, user('u1', prompt)] }),
+  )
+  const [call1] = callsOf(step1)
+  const conv = runtime.conversations.get('S-RELAY-EARLY-DONE')
+  // Relay buffer keeps premature text out of turn.events, so wait() wakes on the terminal done event.
+  await conv.turn.events.wait()
+  assert.equal(conv.turn.events.peek()?.kind, 'done')
+
+  const step2 = await collect(
+    adapter.stream({
+      ...base,
+      messages: [
+        sys,
+        user('u1', prompt),
+        assistantFrom('a1', step1),
+        tool('t1', call1.id, 'late-real-result'),
+      ],
+    }),
+  )
+  assert.equal(prompts().length, 2)
+  assert.match(prompts()[1].text, new RegExp(`<tool_result id="${call1.id}">[\\s\\S]*late-real-result`))
+  assert.match(prompts()[1].text, /Continue the task with these tool results\./)
+  assert.equal(finishOf(step2).reason.kind, 'stop')
+  assert.equal(adapter.status().lastTurn.outcome, 'completed')
+})
+
+test('double relay ending before Pi finishes skips zombie queued call and delivers original result via continuation prompt', async (t) => {
+  const { adapter, runtime, prompts } = makeRuntime(t, {
+    config: { parkSettleMs: 0 },
+    host: { relayAfterMs: 20 },
+  })
+  const base = {
+    provider: 'antigravity',
+    model: 'gemini-4-argon',
+    sessionId: 'S-RELAY-ZOMBIE-CALL',
+    tools: [bash],
+  }
+  const prompt = [
+    'NO_AWAIT_CALL bash {"command":"long-job"}',
+    'NO_AWAIT_CALL bash {"command":"zombie-status"}',
+  ].join('\n')
+  const step1 = await collect(
+    adapter.stream({ ...base, messages: [sys, user('u1', prompt)] }),
+  )
+  const [call1] = callsOf(step1)
+  const conv = runtime.conversations.get('S-RELAY-ZOMBIE-CALL')
+  // Wait until both calls relay and the ACP prompt settles while Pi is still running call1.
+  await conv.turn.promptSettled
+  assert.equal(conv.turn.events.peek()?.kind, 'park')
+  assert.equal(conv.turn.isPromptActive, false)
+
+  const step2 = await collect(
+    adapter.stream({
+      ...base,
+      messages: [
+        sys,
+        user('u1', prompt),
+        assistantFrom('a1', step1),
+        tool('t1', call1.id, 'real-call1-result'),
+      ],
+    }),
+  )
+  assert.deepEqual(callsOf(step2), [])
+  assert.equal(prompts().length, 2)
+  assert.match(
+    prompts()[1].text,
+    new RegExp(`<tool_result id="${call1.id}">[\\s\\S]*real-call1-result`),
+  )
+  assert.match(prompts()[1].text, /Continue the task with these tool results\./)
+  assert.equal(finishOf(step2).reason.kind, 'stop')
+  assert.equal(adapter.status().lastTurn.outcome, 'completed')
+})
+
 test('dynamic tool updates distinguish restored vs modified schemas and preserve compacted initial instructions', () => {
   const longDesc = `${'Detailed tool instruction. '.repeat(60)}UNIQUE_TAIL_MARKER`
   const initialRaw = toBridgeTools([
