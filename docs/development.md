@@ -53,8 +53,16 @@ pi -e ./index.ts
   credentials, and validates structured tool identity before granting permissions.
   On Unix, `agy acp` and helper commands run in detached process groups so
   termination and timeouts signal `-pid` (`SIGTERM`, then `SIGKILL`) without
-  orphaning `--process-per-session` workers. Session SQLite reads reject
-  symlinked or non-regular `.db`, `.db-wal`, and `.db-shm` files.
+  orphaning `--process-per-session` workers. Session SQLite reads
+  (`src/session-db.ts`) reject symlinked or non-regular `.db`, `.db-wal`,
+  `.db-shm`, and `.db-journal` files, gate streaming reads by cached context
+  window / positive `usage_update` and `(mtimeNs, size)` stamps, bound
+  `gen_metadata` scans with `LIMIT`, and inspect terminal `steps` (`step_type = 17`)
+  on `end_turn` and `refusal` to surface hidden API errors (`QUOTA_EXHAUSTED`,
+  `INVALID_THINKING_SIGNATURE`, `429`/`RESOURCE_EXHAUSTED`, and `404`/`NOT_FOUND`)
+  while preserving pure safety refusals and resetting poisoned sessions.
+  Startup and session cleanup also remove `.db-journal` sidecars and
+  `annotations/` files without traversing symlinks.
   Live `agy 1.5.10+` sessions issue `session/request_permission` only inside an
   active `session/prompt` turn (never during `session/new` or
   `session/set_config_option`), so session creation and idle pre-/post-turn
@@ -113,7 +121,7 @@ connections and destroys all tracked sockets without waiting for tool promises.
 | `src/pi-stream.ts`, `src/protocol.ts` | Pi message conversion and bridge event contracts. |
 | `src/runtime.ts`, `src/conversation.ts`, `src/history.ts` | Session orchestration, pending calls, tool identity metadata, streaming, and history replay. |
 | `src/acp-process.ts`, `src/jsonrpc.ts`, `src/mcp-bridge.ts` | ACP transport, local MCP server, tool schema compression, and tool deltas. |
-| `src/host.ts`, `src/preflight.ts`, `src/config.ts` | Process execution, executable discovery, and isolated home setup. |
+| `src/host.ts`, `src/preflight.ts`, `src/session-db.ts`, `src/config.ts` | Process execution, executable discovery, isolated home setup, and read-only session SQLite telemetry/error inspection. |
 | `src/catalog.ts`, `src/quota.ts`, `src/format.ts`, `src/util.ts` | Model catalog, quota queries, TUI notice formatting, and shared utilities. |
 | `src/version.ts` | ACP/MCP version read from `package.json`. |
 | `tests/` | Scripted agy fixture, runtime tests, and Pi integration tests. |

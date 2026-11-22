@@ -212,6 +212,8 @@ export class AcpTurn {
   estimatedContextUsed?: number
   /** Lower `gen_metadata.idx` bound owned by the active turn segment, or `null` when unobservable. */
   metaFloorIdx: number | null = 0
+  /** Highest `steps.idx` already persisted before the active prompt segment started, or `null` when unobservable. */
+  lastStepIdx: number | null = -1
   /** Per-call relay lifecycle: waiting (gating `relayBuffer`) -> unawaited -> notified. */
   private readonly relays = new Map<string, RelayEntry>()
   /** Tool deltas and steering text deferred until an active MCP call returns a real result. */
@@ -246,7 +248,6 @@ export class AcpTurn {
   bindPrompt(
     promise: Promise<AcpPromptResult>,
     options?: {
-      onSettled?: () => void
       mapError?: (error: unknown) => Error
     },
   ): void {
@@ -254,12 +255,10 @@ export class AcpTurn {
     this.promptSettled = promise.then(
       (result) => {
         this.promptActive = false
-        options?.onSettled?.()
         this.events.push({ kind: 'done', result })
       },
       (error: unknown) => {
         this.promptActive = false
-        options?.onSettled?.()
         this.fail(
           options?.mapError !== undefined
             ? options.mapError(error)

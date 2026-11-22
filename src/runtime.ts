@@ -71,15 +71,18 @@ import {
   defaultHome,
   isDefaultPiAgyHome,
   prepareHome,
-  readSessionContextMetadata,
-  readSessionNextMetadataIndex,
-  removeSessionArtifacts,
   readVersion,
   resolveAgyBinary,
   syncOAuthToken,
   type CommandRunner,
   type PreflightResult,
 } from './preflight.ts'
+import {
+  readSessionCursors,
+  readSessionTurnData,
+  removeSessionArtifacts,
+  type HiddenTurnError,
+} from './session-db.ts'
 import {
   QuotaReader,
   readLoggedEmail,
@@ -163,6 +166,8 @@ interface Conversation {
   model: string | undefined
   /** Lower `gen_metadata.idx` bound for `model`, or `null` when unobservable after a failed cursor read. */
   metaFloorIdx: number | null
+  /** Last observed SQLite file/sidecar stamp used to skip unchanged reads during streaming. */
+  lastDbStamp?: string
   effort: Effort | undefined
 }
 
@@ -271,39 +276,87 @@ export class AntigravityRuntime {
     }
   }
 
-  private nextTurnMetadataFloor(
-    sessionId: string | undefined,
-    modelFloor: number | null,
-  ): number | null {
-    if (!sessionId || modelFloor === null) return null
-    const nextIdx = readSessionNextMetadataIndex(this.home, sessionId)
-    return nextIdx === null ? null : Math.max(modelFloor, nextIdx)
-  }
-
-  private observeSessionContextWindow(
+  private harvestSessionTurnData(
+    conv: Conversation,
     sessionId: string | undefined,
     model: string | undefined,
-    minIdx: number | null,
-    turn?: AcpTurn,
-  ): void {
-    if (this.lifecycle !== 'active' || !sessionId) return
-    const turnFloor = turn?.metaFloorIdx ?? null
-    const turnMeta =
-      turn !== undefined && turnFloor !== null
-        ? readSessionContextMetadata(this.home, sessionId, turnFloor)
-        : undefined
-    if (turn !== undefined && turnMeta?.estimatedTokensUsed !== undefined) {
-      turn.estimatedContextUsed = turnMeta.estimatedTokensUsed
+    modelFloor: number | null,
+    options: {
+      turn?: AcpTurn
+      lastStepIdx?: number | null
+      checkStepsError?: boolean
+      ifChangedSince?: string
+    } = {},
+  ): HiddenTurnError | undefined {
+    if (this.lifecycle !== 'active' || !sessionId) return undefined
+    const data = readSessionTurnData(this.home, sessionId, {
+      metaFloorIdx: model ? modelFloor : null,
+      turnMetaFloorIdx: options.turn?.metaFloorIdx ?? null,
+      lastStepIdx: options.lastStepIdx,
+      checkStepsError: options.checkStepsError,
+      ifChangedSince: options.ifChangedSince,
+    })
+    if (data === undefined) return undefined
+    if (conv.sessionId === sessionId) conv.lastDbStamp = data.stamp
+    if (data.unchanged) return undefined
+    if (options.turn !== undefined && data.estimatedTokensUsed !== undefined) {
+      options.turn.estimatedContextUsed = data.estimatedTokensUsed
     }
-    if (!model || minIdx === null) return
-    const maxContextTokens =
-      turnMeta?.maxContextTokens ??
-      (turn !== undefined && turnFloor === minIdx
-        ? undefined
-        : readSessionContextMetadata(this.home, sessionId, minIdx)
-            ?.maxContextTokens)
-    if (this.catalog.observeContextWindow(model, maxContextTokens)) {
+    if (
+      model &&
+      this.catalog.observeContextWindow(model, data.maxContextTokens)
+    ) {
       this.host.onModelsChanged()
+    }
+    return data.hiddenError
+  }
+
+  private async runPromptSegment(
+    conv: Conversation,
+    turn: AcpTurn,
+    proc: AcpProcess,
+    sessionId: string,
+    model: string | undefined,
+    modelFloor: number | null,
+    blocks: AcpPromptBlock[],
+  ): Promise<AcpPromptResult> {
+    const cursors = readSessionCursors(this.home, sessionId)
+    turn.metaFloorIdx =
+      modelFloor === null || cursors === null
+        ? null
+        : Math.max(modelFloor, cursors.nextMetaIdx)
+    turn.lastStepIdx = cursors === null ? null : cursors.lastStepIdx
+    turn.estimatedContextUsed = undefined
+    let harvested = false
+    try {
+      const result = await proc.prompt(sessionId, blocks)
+      harvested = true
+      const checkStepsError =
+        result.stopReason === 'end_turn' || result.stopReason === 'refusal'
+      const hiddenError = this.harvestSessionTurnData(
+        conv,
+        sessionId,
+        model,
+        modelFloor,
+        {
+          turn,
+          lastStepIdx: turn.lastStepIdx,
+          checkStepsError,
+        },
+      )
+      if (hiddenError !== undefined) {
+        if (hiddenError.dirtySession) conv.dirty = true
+        throw new LlmError(hiddenError.message, hiddenError.code)
+      }
+      return result
+    } catch (error) {
+      if (!harvested) {
+        this.harvestSessionTurnData(conv, sessionId, model, modelFloor, {
+          turn,
+          checkStepsError: false,
+        })
+      }
+      throw error
     }
   }
 
@@ -932,20 +985,33 @@ export class AntigravityRuntime {
               if (this.catalog.observe(update.configOptions))
                 this.host.onModelsChanged()
             }
-            if (update.sessionUpdate === 'usage_update') {
-              this.observeSessionContextWindow(
-                conv.sessionId,
-                conv.model,
-                conv.metaFloorIdx,
-                conv.turn,
-              )
-            }
             if (recordReportedToolCall(conv, update) === 'conflict') {
               this.host.log.warn(
                 `antigravity-acp: agent reported conflicting identity for tool call ${String(update.toolCallId)}`,
               )
             }
             conv.turn?.onUpdate(update)
+            if (update.sessionUpdate === 'usage_update') {
+              const hasCachedContextWindow =
+                conv.model !== undefined &&
+                this.catalog.contextWindowFor(conv.model) !== undefined
+              const hasPositiveUsed =
+                typeof update.used === 'number' &&
+                Number.isFinite(update.used) &&
+                update.used > 0
+              if (!(hasCachedContextWindow && hasPositiveUsed)) {
+                this.harvestSessionTurnData(
+                  conv,
+                  conv.sessionId,
+                  conv.model,
+                  conv.metaFloorIdx,
+                  {
+                    turn: conv.turn,
+                    ifChangedSince: conv.lastDbStamp,
+                  },
+                )
+              }
+            }
           },
           onPermission: (request) => this.owns(proc, conv) && conv.tenantKey === tenantKey
             ? this.answerPermission(conv, request)
@@ -964,6 +1030,7 @@ export class AntigravityRuntime {
       conv.configOptions = result.configOptions ?? []
       conv.model = undefined
       conv.metaFloorIdx = 0
+      conv.lastDbStamp = undefined
       conv.effort = undefined
 
       conv.dirty = false
@@ -1121,8 +1188,9 @@ export class AntigravityRuntime {
     const previousModel = conv.model
     const previousFloor = conv.metaFloorIdx
     if (previousModel !== undefined && previousModel !== model) {
-      this.observeSessionContextWindow(sessionId, previousModel, previousFloor)
+      this.harvestSessionTurnData(conv, sessionId, previousModel, previousFloor)
       conv.metaFloorIdx = null
+      conv.lastDbStamp = undefined
     }
     if (conv.model !== model && modelOption?.currentValue !== model) {
       await this.applyConfigOption(
@@ -1134,11 +1202,12 @@ export class AntigravityRuntime {
       )
     }
     if (previousModel !== undefined && previousModel !== model) {
-      const nextIdx = readSessionNextMetadataIndex(this.home, sessionId)
+      const cursors = readSessionCursors(this.home, sessionId)
       conv.metaFloorIdx =
-        previousFloor === null || nextIdx === null
+        previousFloor === null || cursors === null
           ? null
-          : Math.max(previousFloor, nextIdx)
+          : Math.max(previousFloor, cursors.nextMetaIdx)
+      conv.lastDbStamp = undefined
     }
     conv.model = model
     const levelOption = conv.configOptions.find(
@@ -1261,7 +1330,9 @@ export class AntigravityRuntime {
   }
 
   private async resetSession(conv: Conversation): Promise<void> {
-    this.observeSessionContextWindow(conv.sessionId, conv.model, conv.metaFloorIdx)
+    this.harvestSessionTurnData(conv, conv.sessionId, conv.model, conv.metaFloorIdx, {
+      ifChangedSince: conv.lastDbStamp,
+    })
     let closing: Promise<void> | undefined
     if (conv.sessionId !== undefined && conv.process !== undefined) {
       closing = this.closeAndCleanSession(conv.process, conv.sessionId)
@@ -1279,6 +1350,7 @@ export class AntigravityRuntime {
     conv.tenantSecret = undefined
     conv.process = undefined
     conv.metaFloorIdx = null
+    conv.lastDbStamp = undefined
     conv.advertisedTools = []
     conv.advertisedToolDigests.clear()
     conv.knownTools.clear()
@@ -1298,12 +1370,18 @@ export class AntigravityRuntime {
       const sessionId = conv.sessionId as string
       const model = conv.model
       const modelFloor = conv.metaFloorIdx
-      turn.metaFloorIdx = this.nextTurnMetadataFloor(sessionId, modelFloor)
-      turn.bindPrompt(proc.prompt(sessionId, blocks), {
-        onSettled: () =>
-          this.observeSessionContextWindow(sessionId, model, modelFloor, turn),
-        mapError,
-      })
+      turn.bindPrompt(
+        this.runPromptSegment(
+          conv,
+          turn,
+          proc,
+          sessionId,
+          model,
+          modelFloor,
+          blocks,
+        ),
+        { mapError },
+      )
     } catch (error) {
       turn.fail(mapError(error))
     }
@@ -1358,33 +1436,16 @@ export class AntigravityRuntime {
         {
           parkSettleMs: this.host.config.parkSettleMs,
           maxContinuations: this.host.config.longDecodeContinuations,
-          continuePrompt: async () => {
-            turn.metaFloorIdx = this.nextTurnMetadataFloor(
+          continuePrompt: () =>
+            this.runPromptSegment(
+              conv,
+              turn,
+              proc,
               sessionId,
+              options.model,
               metaFloorIdx,
-            )
-            turn.estimatedContextUsed = undefined
-            try {
-              const result = await proc.prompt(sessionId, [
-                { type: 'text', text: CONTINUE_PROMPT },
-              ])
-              this.observeSessionContextWindow(
-                sessionId,
-                options.model,
-                metaFloorIdx,
-                turn,
-              )
-              return result
-            } catch (error) {
-              this.observeSessionContextWindow(
-                sessionId,
-                options.model,
-                metaFloorIdx,
-                turn,
-              )
-              throw error
-            }
-          },
+              [{ type: 'text', text: CONTINUE_PROMPT }],
+            ),
           cancel: () => {
             if (conv.turn === turn) proc.cancel(sessionId)
           },
@@ -1397,7 +1458,15 @@ export class AntigravityRuntime {
           conv.issuedIds.add(chunk.block.id)
         if (chunk.type === 'finish') {
           finishKind = chunk.reason.kind
-          this.observeSessionContextWindow(sessionId, options.model, metaFloorIdx)
+          if (
+            finishKind === 'aborted' ||
+            (finishKind === 'tool-calls' &&
+              this.catalog.contextWindowFor(options.model) === undefined)
+          ) {
+            this.harvestSessionTurnData(conv, sessionId, options.model, metaFloorIdx, {
+              ifChangedSince: conv.lastDbStamp,
+            })
+          }
         }
         yield chunk
         if (chunk.type === 'finish' && chunk.reason.kind === 'aborted') break
@@ -1405,13 +1474,17 @@ export class AntigravityRuntime {
       const interrupted = turn.guard(undefined, signal)
       if (interrupted !== undefined && finishKind !== 'aborted') {
         finishKind = 'aborted'
-        this.observeSessionContextWindow(sessionId, options.model, metaFloorIdx)
+        this.harvestSessionTurnData(conv, sessionId, options.model, metaFloorIdx, {
+          ifChangedSince: conv.lastDbStamp,
+        })
         yield interrupted
       }
       drained = true
     } catch (error) {
       finishKind = 'error'
-      this.observeSessionContextWindow(sessionId, options.model, metaFloorIdx)
+      this.harvestSessionTurnData(conv, sessionId, options.model, metaFloorIdx, {
+        ifChangedSince: conv.lastDbStamp,
+      })
       throw mapError(error)
     } finally {
       // Only a fully consumed tool handoff keeps the turn and its cancellation owner.
