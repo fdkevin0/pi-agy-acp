@@ -52,7 +52,7 @@ test('Pi to ACP tool loop, next turn, rewritten history, usage and images', asyn
   const runtime = new AntigravityRuntime({
     config: { ...defaults, command: fake, home },
     spawnAcp,
-    runCommand: async () => ({ code: 0, stdout: '1.5.0', stderr: '' }),
+    runCommand: async () => ({ code: 0, stdout: '1.5.14', stderr: '' }),
     log: { info() {}, warn() {} },
     onModelsChanged() {},
   })
@@ -327,7 +327,7 @@ test('a direct provider callback failure closes the runtime iterator and abandon
   const home = mkdtempSync(join(tmpdir(), 'pi-callback-'))
   const runtime = new AntigravityRuntime({
     config: { ...defaults, command: resolve('tests/fake-agy.mjs'), home },
-    spawnAcp, runCommand: async () => ({ code: 0, stdout: '1.5.0', stderr: '' }),
+    spawnAcp, runCommand: async () => ({ code: 0, stdout: '1.5.14', stderr: '' }),
     log: { info() {}, warn() {} }, onModelsChanged() {},
   })
   try {
@@ -397,7 +397,7 @@ test('streamPi preserves cumulative turn pricing while feeding live context occu
   const runtime = new AntigravityRuntime({
     config: { ...defaults, command: fake, home },
     spawnAcp,
-    runCommand: async () => ({ code: 0, stdout: '1.5.0', stderr: '' }),
+    runCommand: async () => ({ code: 0, stdout: '1.5.14', stderr: '' }),
     log: { info() {}, warn() {} },
     onModelsChanged() {},
   })
@@ -438,6 +438,58 @@ test('streamPi preserves cumulative turn pricing while feeding live context occu
     assert.ok(Math.abs(step2.message.usage.cost.cacheRead - 0.0002) < 1e-12)
     assert.equal(step2.message.usage.cost.cacheWrite, 0)
     assert.ok(Math.abs(step2.message.usage.cost.total - 0.0016) < 1e-12)
+  } finally {
+    await runtime.dispose()
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('streamPi forwards xhigh and max reasoning levels and runtime clamps them to offered efforts', async () => {
+  const seen = []
+  const captureRuntime = {
+    async *stream(request) {
+      seen.push(request.reasoningEffort)
+      yield { type: 'finish', reason: { kind: 'stop' } }
+    },
+  }
+  await result(captureRuntime, context(user('a')), { reasoning: 'off' })
+  await result(captureRuntime, context(user('b')), { reasoning: 'minimal' })
+  await result(captureRuntime, context(user('c')), { reasoning: 'xhigh' })
+  await result(captureRuntime, context(user('d')), { reasoning: 'max' })
+  assert.deepEqual(seen, [undefined, 'low', 'xhigh', 'max'])
+
+  const home = mkdtempSync(join(tmpdir(), 'pi-effort-clamp-'))
+  const fake = resolve('tests/fake-agy.mjs')
+  chmodSync(fake, 0o755)
+  const runtime = new AntigravityRuntime({
+    config: { ...defaults, command: fake, home },
+    spawnAcp,
+    runCommand: async () => ({ code: 0, stdout: '1.5.14', stderr: '' }),
+    log: { info() {}, warn() {} },
+    onModelsChanged() {},
+  })
+  try {
+    const rXhigh = await result(
+      runtime,
+      context(system, user('hello xhigh')),
+      { sessionId: 'clamp-xhigh', reasoning: 'xhigh' },
+    )
+    assert.equal(rXhigh.message.stopReason, 'stop', rXhigh.message.errorMessage)
+    assert.match(
+      rXhigh.message.content.find((b) => b.type === 'text').text,
+      /^echo:gemini-4-argon:high:/,
+    )
+
+    const rMax = await result(
+      runtime,
+      context(system, user('hello max')),
+      { sessionId: 'clamp-max', reasoning: 'max' },
+    )
+    assert.equal(rMax.message.stopReason, 'stop', rMax.message.errorMessage)
+    assert.match(
+      rMax.message.content.find((b) => b.type === 'text').text,
+      /^echo:gemini-4-argon:high:/,
+    )
   } finally {
     await runtime.dispose()
     rmSync(home, { recursive: true, force: true })

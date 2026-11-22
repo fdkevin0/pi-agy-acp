@@ -60,6 +60,20 @@ export interface AcpToolCallMeta {
   [key: string]: unknown
 }
 
+/** One selectable option entry inside an ACP select config option. */
+export interface AcpConfigOptionValue {
+  value: string
+  name?: string
+  description?: string
+}
+
+/** One grouped list of selectable option entries inside an ACP select config option. */
+export interface AcpConfigOptionGroup {
+  group: string
+  name?: string
+  options: AcpConfigOptionValue[]
+}
+
 /** One select-type session configuration option. */
 export interface AcpConfigOption {
   id: string
@@ -67,7 +81,23 @@ export interface AcpConfigOption {
   category?: string
   type?: string
   currentValue?: string
-  options?: { value: string; name?: string; description?: string }[]
+  options?: (AcpConfigOptionValue | AcpConfigOptionGroup)[]
+}
+
+/** `initialize` result. */
+export interface AcpInitializeResult {
+  protocolVersion?: number
+  agentInfo?: {
+    name?: string
+    version?: string
+  }
+  agentCapabilities?: {
+    promptCapabilities?: {
+      image?: boolean
+      audio?: boolean
+      embeddedContext?: boolean
+    }
+  }
 }
 
 /** `session/request_permission` parameters. */
@@ -169,7 +199,7 @@ export class AcpProcess {
    * Spawn the process and complete the ACP `initialize` handshake.
    * @param timeoutMs - handshake deadline.
    */
-  async start(timeoutMs: number): Promise<void> {
+  async start(timeoutMs: number): Promise<AcpInitializeResult | undefined> {
     const child = this.options.spawn(this.options.argv, this.options.cwd)
     this.child = child
     const peer = new JsonRpcPeer(child.stdout, child.stdin, {
@@ -188,7 +218,7 @@ export class AcpProcess {
       peer.close(error)
       this.fail(error)
     })
-    await peer.request(
+    return peer.request<AcpInitializeResult | undefined>(
       'initialize',
       {
         protocolVersion: 1,

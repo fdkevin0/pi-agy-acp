@@ -142,8 +142,8 @@ export function streamPi(
           low: 'low',
           medium: 'medium',
           high: 'high',
-          xhigh: 'high',
-          max: 'high',
+          xhigh: 'xhigh',
+          max: 'max',
         }[options.reasoning ?? 'off'],
       }
       // onPayload may replace request content, but harness-owned routing/cancellation

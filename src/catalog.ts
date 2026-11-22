@@ -7,8 +7,20 @@
  * @module pi-agy-acp/catalog
  */
 
-import { existsSync, readFileSync, writeFileSync } from 'node:fs'
-import type { AcpConfigOption, AcpTierInfo } from './acp-process.ts'
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs'
+import { basename, dirname, join } from 'node:path'
+import type {
+  AcpConfigOption,
+  AcpConfigOptionValue,
+  AcpTierInfo,
+} from './acp-process.ts'
 import { EFFORTS, type Effort } from './config.ts'
 
 /** One advertised model family. */
@@ -23,17 +35,37 @@ export interface AvailableModel {
   name?: string
 }
 
-/** Families shown before the first ACP session reports the account's catalog. */
-export const FALLBACK_MODELS: readonly CatalogModel[] = [
-  { id: 'gemini-4-argon', name: 'Gemini 4 Argon' },
-  { id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash' },
-  { id: 'claude-opus-5-5', name: 'Claude Opus 5.5' },
-  { id: 'claude-sonnet-5-5', name: 'Claude Sonnet 5.5' },
-  { id: 'gpt-oss-120b-medium', name: 'GPT-OSS 120B' },
-]
+/** Flatten flat or grouped ACP select option entries. */
+export function flattenConfigOptions(
+  options: AcpConfigOption['options'],
+): AcpConfigOptionValue[] {
+  if (!Array.isArray(options)) return []
+  return options.flatMap((entry) =>
+    'group' in entry
+      ? Array.isArray(entry.options)
+        ? entry.options
+        : []
+      : [entry],
+  )
+}
 
-/** An id that already names one fixed effort instead of a selectable family. */
-const FIXED_EFFORT = /-(low|medium|high)$/
+/** Effort suffixes ordered longest-first so `-<effort>-effort` beats `-<effort>`. */
+const EFFORT_SUFFIXES: readonly { suffix: string; effort: Effort }[] =
+  EFFORTS.flatMap((effort) => [
+    { suffix: `-${effort}-effort`, effort },
+    { suffix: `-${effort}`, effort },
+  ]).sort((a, b) => b.suffix.length - a.suffix.length)
+
+function splitEffortSuffix(
+  id: string,
+): { base: string; effort: Effort } | undefined {
+  for (const { suffix, effort } of EFFORT_SUFFIXES) {
+    if (id.length > suffix.length && id.endsWith(suffix)) {
+      return { base: id.slice(0, -suffix.length), effort }
+    }
+  }
+  return undefined
+}
 
 function normalizeTier(
   tier: AcpTierInfo | undefined,
@@ -68,25 +100,79 @@ function isValidContextWindow(value: unknown): value is number {
   return typeof value === 'number' && Number.isInteger(value) && value > 0
 }
 
-/** Observed catalog with a disk cache. */
+/** Observed catalog with a disk cache. Starts empty until loaded or observed from ACP. */
 export class ModelCatalog {
   private models: CatalogModel[]
   private tierInfo: { id?: string; name: string } | undefined
-  private efforts: Effort[] = [...EFFORTS]
-  /** Efforts per model family; an empty array marks a fixed-effort model. */
+  private efforts: Effort[] = []
+  /** Efforts per model family; an empty array marks a fixed-effort or non-selectable model. */
   private byModel = new Map<string, Effort[]>()
   /** Server-reported `max_context_tokens` keyed by model id. */
   private readonly contextWindows = new Map<string, number>()
+  /** Server-reported `agentCapabilities.promptCapabilities.image` from `initialize`. */
+  private supportsImageInput: boolean | undefined
   /** Latest `availableModels` snapshot, kept for later option updates. */
   private available: readonly AvailableModel[] | undefined
+  /** Subprocess-free fingerprint of the `agy` binary that produced the cached catalog. */
+  private binaryFingerprint: string | undefined
+  /** Set when `binaryFingerprint` differs from the value last persisted on disk. */
+  private fingerprintDirty = false
   /** Whether a live ACP session has reported the catalog. */
   observed = false
   private readonly cachePath: string
 
-  /** @param cachePath - JSON cache file. */
-  constructor(cachePath: string) {
+  /**
+   * @param cachePath - JSON cache file.
+   * @param binaryFingerprint - current `agy` binary fingerprint, if resolved.
+   */
+  constructor(cachePath: string, binaryFingerprint?: string) {
     this.cachePath = cachePath
-    this.models = this.load() ?? [...FALLBACK_MODELS]
+    this.models = this.load(binaryFingerprint) ?? []
+    if (binaryFingerprint && this.binaryFingerprint === undefined) {
+      this.binaryFingerprint = binaryFingerprint
+    }
+  }
+
+  /** Input modalities advertised to Pi, derived from `initialize` `promptCapabilities.image`. */
+  inputModalities(): ('text' | 'image')[] {
+    return this.supportsImageInput === false ? ['text'] : ['text', 'image']
+  }
+
+  /**
+   * Record `agentCapabilities.promptCapabilities.image` from ACP `initialize`.
+   * @returns whether the advertised input modalities changed.
+   */
+  observeImageSupport(supported: boolean | undefined): boolean {
+    if (typeof supported !== 'boolean') return false
+    const before = this.supportsImageInput !== false
+    const changed = this.supportsImageInput !== supported
+    if (!changed) return false
+    this.supportsImageInput = supported
+    this.save()
+    return before !== supported
+  }
+
+  /**
+   * Reconcile cached state against the current `agy` binary fingerprint.
+   * Invalidates cached `contextWindows` and `observed` when the binary changed
+   * so the next warmup or session re-probes fresh models and context limits.
+   * @returns whether cached context windows were invalidated.
+   */
+  syncBinaryFingerprint(fingerprint: string | undefined): boolean {
+    if (!fingerprint) return false
+    if (this.binaryFingerprint === fingerprint) return false
+    const hadContextWindows = this.contextWindows.size > 0
+    const hadState =
+      this.binaryFingerprint !== undefined || hadContextWindows || this.observed
+    this.binaryFingerprint = fingerprint
+    if (hadState) {
+      this.contextWindows.clear()
+      this.observed = false
+      this.fingerprintDirty = true
+      this.save()
+      return hadContextWindows
+    }
+    return false
   }
 
   /**
@@ -138,7 +224,7 @@ export class ModelCatalog {
 
   /**
    * Efforts one family actually offers. Empty means the family is a single
-   * fixed variant (for example `gpt-oss-120b-medium`).
+   * fixed variant (for example `gpt-oss-120b-medium`) or offers no selector.
    * @param id - family id.
    * @returns offered efforts.
    */
@@ -149,13 +235,22 @@ export class ModelCatalog {
   }
 
   /**
+   * Whether a model accepts `thought_level` writes on a live ACP session.
+   * Fixed-effort models and models observed with zero effort variants return false.
+   */
+  supportsEffortSelection(id: string): boolean {
+    const observed = this.byModel.get(id)
+    if (observed !== undefined) return observed.length > 0
+    return this.fixedEffort(id) === undefined
+  }
+
+  /**
    * Effort baked into a fixed-variant id.
    * @param id - family id.
    * @returns the effort, or undefined for a selectable family.
    */
   fixedEffort(id: string): Effort | undefined {
-    const match = FIXED_EFFORT.exec(id)
-    return match === null ? undefined : (match[1] as Effort)
+    return splitEffortSuffix(id)?.effort
   }
 
   /**
@@ -190,37 +285,61 @@ export class ModelCatalog {
     )
     const beforeEfforts = JSON.stringify(this.efforts)
     if (levelOption?.options !== undefined) {
-      const offered = levelOption.options
+      const offered = flattenConfigOptions(levelOption.options)
         .map((o) => o.value)
         .filter((v): v is Effort => (EFFORTS as readonly string[]).includes(v))
       if (offered.length > 0)
         this.efforts = EFFORTS.filter((e) => offered.includes(e))
     }
-    const next = modelOption?.options?.length
-      ? modelOption.options.map((o) => ({
-          id: o.value,
-          name: o.name ?? o.value,
-        }))
-      : this.models
+    const modelEntries = flattenConfigOptions(modelOption?.options)
+    const next =
+      modelEntries.length > 0
+        ? modelEntries.map((o) => ({
+            id: o.value,
+            name: o.name ?? o.value,
+          }))
+        : this.models
     this.observed = true
     const changed = JSON.stringify(next) !== JSON.stringify(this.models)
     if (changed) this.models = next
+    const derivedChanged = this.deriveEfforts()
+    if (this.efforts.length === 0 && this.byModel.size > 0) {
+      const union = new Set<Effort>()
+      for (const values of this.byModel.values()) {
+        for (const effort of values) union.add(effort)
+      }
+      if (union.size > 0) {
+        this.efforts = EFFORTS.filter((e) => union.has(e))
+      }
+    }
     const effortsChanged =
-      this.deriveEfforts() || beforeEfforts !== JSON.stringify(this.efforts)
-    if (changed || effortsChanged || tierChanged) this.save()
+      derivedChanged || beforeEfforts !== JSON.stringify(this.efforts)
+    if (changed || effortsChanged || tierChanged || this.fingerprintDirty)
+      this.save()
     return changed || effortsChanged
   }
 
   /** Recompute per-family efforts from the latest inventory. */
   private deriveEfforts(): boolean {
     if (this.available === undefined) return false
+    const byBase = new Map<string, Set<Effort>>()
+    for (const entry of this.available) {
+      const split = splitEffortSuffix(entry.modelId)
+      if (split === undefined) continue
+      let set = byBase.get(split.base)
+      if (set === undefined) {
+        set = new Set<Effort>()
+        byBase.set(split.base, set)
+      }
+      set.add(split.effort)
+    }
     let changed = false
     for (const model of this.models) {
-      const offered = EFFORTS.filter((effort) =>
-        this.available!.some(
-          (entry) => entry.modelId === `${model.id}-${effort}`,
-        ),
-      )
+      const matched = byBase.get(model.id)
+      const offered =
+        matched !== undefined
+          ? EFFORTS.filter((effort) => matched.has(effort))
+          : []
       if (offered.length > 0) {
         if (
           JSON.stringify(this.byModel.get(model.id)) !== JSON.stringify(offered)
@@ -236,18 +355,25 @@ export class ModelCatalog {
           entry.modelId.startsWith(`${model.id}-`),
       )
       if (!present) continue
-      if ((this.byModel.get(model.id) ?? []).length !== 0) {
+      const prevEfforts = this.effortsFor(model.id)
+      if (this.byModel.get(model.id)?.length !== 0) {
         this.byModel.set(model.id, [])
-        changed = true
+        if (prevEfforts.length !== 0) changed = true
       }
     }
     return changed
   }
 
   private save(): void {
+    const dir = dirname(this.cachePath)
+    const tempPath = join(
+      dir,
+      `.${basename(this.cachePath)}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2, 8)}.tmp`,
+    )
     try {
+      mkdirSync(dir, { recursive: true })
       writeFileSync(
-        this.cachePath,
+        tempPath,
         `${JSON.stringify(
           {
             models: this.models,
@@ -255,17 +381,30 @@ export class ModelCatalog {
             byModel: Object.fromEntries(this.byModel),
             contextWindows: Object.fromEntries(this.contextWindows),
             tier: this.tierInfo,
+            ...(this.supportsImageInput !== undefined
+              ? { supportsImage: this.supportsImageInput }
+              : {}),
+            ...(this.binaryFingerprint !== undefined
+              ? { binaryFingerprint: this.binaryFingerprint }
+              : {}),
           },
           null,
           2,
         )}\n`,
       )
+      renameSync(tempPath, this.cachePath)
+      this.fingerprintDirty = false
     } catch (_cacheWrite) {
+      try {
+        unlinkSync(tempPath)
+      } catch {
+        // Best-effort cleanup.
+      }
       // The cache only speeds up the next cold start.
     }
   }
 
-  private load(): CatalogModel[] | undefined {
+  private load(expectedFingerprint?: string): CatalogModel[] | undefined {
     if (!existsSync(this.cachePath)) return undefined
     try {
       const parsed = JSON.parse(readFileSync(this.cachePath, 'utf8')) as {
@@ -274,9 +413,26 @@ export class ModelCatalog {
         byModel?: Record<string, string[]>
         contextWindows?: Record<string, unknown>
         tier?: AcpTierInfo
+        supportsImage?: unknown
+        binaryFingerprint?: unknown
       } | null
       if (parsed === null || typeof parsed !== 'object') return undefined
+      const storedFingerprint =
+        typeof parsed.binaryFingerprint === 'string' &&
+        parsed.binaryFingerprint.length > 0
+          ? parsed.binaryFingerprint
+          : undefined
+      const fingerprintMatches =
+        expectedFingerprint === undefined ||
+        storedFingerprint === expectedFingerprint
+      this.binaryFingerprint = fingerprintMatches
+        ? (storedFingerprint ?? expectedFingerprint)
+        : expectedFingerprint
+      this.fingerprintDirty = !fingerprintMatches
       this.tierInfo = normalizeTier(parsed.tier)
+      if (typeof parsed.supportsImage === 'boolean') {
+        this.supportsImageInput = parsed.supportsImage
+      }
       if (Array.isArray(parsed.efforts)) {
         const efforts = parsed.efforts.filter((v): v is Effort =>
           (EFFORTS as readonly string[]).includes(v),
@@ -293,6 +449,7 @@ export class ModelCatalog {
         }
       }
       if (
+        fingerprintMatches &&
         parsed.contextWindows !== null &&
         typeof parsed.contextWindows === 'object'
       ) {
@@ -308,7 +465,7 @@ export class ModelCatalog {
         : []
       return models.length > 0 ? models : undefined
     } catch (_cacheRead) {
-      // A corrupt cache falls back to the built-in families.
+      // A corrupt cache starts empty until live ACP discovery populates it.
       return undefined
     }
   }

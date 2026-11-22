@@ -12,7 +12,7 @@ parallel tool calls.
 
 - Node.js >= 22.19.0.
 - Pi (`@earendil-works/pi-coding-agent`) 1.5.x.
-- The official `agy` CLI >= 1.4.12, signed in with your Google account.
+- The official `agy` CLI >= 1.5.10, signed in with your Google account.
   Run `agy` in your terminal to complete sign-in before using the extension.
 
 ## Install
@@ -39,10 +39,9 @@ installation. See [development setup](docs/development.md) for local testing.
 
 ## Usage
 
-Start `pi`, then use `/model` to select a model under `antigravity-acp`.
-Examples include `gemini-4-argon`, `gemini-3.8-flash`, `claude-opus-5-5`,
-`claude-sonnet-5-5`, and `gpt-oss-120b-medium`. The available list refreshes
-automatically from your account.
+Start `pi`, then use `/model` to refresh and select a model under `antigravity-acp`.
+The available models and reasoning levels are discovered dynamically from your
+Antigravity account and cached locally in `catalog.json`.
 
 | Command | Purpose |
 | --- | --- |

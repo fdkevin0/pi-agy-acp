@@ -23,26 +23,39 @@ import {
   type Stats,
 } from 'node:fs'
 import { homedir } from 'node:os'
-import { delimiter, isAbsolute, join, relative } from 'node:path'
+import { delimiter, isAbsolute, join, relative, resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { readJson } from './config.ts'
 
 /** Agent id installed in the isolated home. */
 export const BRIDGE_AGENT = 'pi-bridge'
-/** Minimum official CLI version supporting `agy acp --process-per-session`. */
-export const MIN_AGY_VERSION: readonly [number, number, number] = [1, 4, 12]
+/** Minimum official CLI version supported (`agy 1.5.10+`). */
+export const MIN_AGY_VERSION: readonly [number, number, number] = [1, 5, 10]
 
 /** Output of one finished helper command. */
 export interface CommandOutput {
   code: number | null
   stdout: string
   stderr: string
+  /** Set when aborted early by stderr match, stdout cap, timeout, or signal. */
+  abortedBy?: 'stderr' | 'maxStdout' | 'timeout' | 'signal'
+}
+
+/** Optional execution controls for one helper command. */
+export interface CommandOptions {
+  /** Maximum stdout bytes buffered before aborting the command. */
+  maxStdoutBytes?: number
+  /** Abort the command early when buffered stderr matches this pattern. */
+  abortOnStderr?: RegExp
+  /** Cancel the command externally. */
+  signal?: AbortSignal
 }
 
 /** Runs one helper command to completion. */
 export type CommandRunner = (
   argv: readonly string[],
   timeoutMs: number,
+  options?: CommandOptions,
 ) => Promise<CommandOutput>
 
 /** Prepared launch facts. */
@@ -153,6 +166,48 @@ export function assertSupportedAgyVersion(
 }
 
 /**
+ * Compute a subprocess-free identity fingerprint for a resolved `agy` binary.
+ * @param binary - path to the executable.
+ * @returns `${real}:${dev}:${ino}:${size}:${mtimeNs}`, or `undefined` when unavailable.
+ */
+export function binaryFingerprint(binary: string): string | undefined {
+  if (!binary) return undefined
+  try {
+    const real = realpathSync(binary)
+    const st = statSync(real, { bigint: true })
+    if (!st.isFile()) return undefined
+    return `${real}:${st.dev}:${st.ino}:${st.size}:${st.mtimeNs}`
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Default Antigravity CLI directories in priority order:
+ * `ANTIGRAVITY_CLI_HOME`, then `AGY_HOME`, then `~/.gemini/antigravity-cli`.
+ */
+export function defaultAgyHomes(
+  userHome: string = homedir(),
+  env: NodeJS.ProcessEnv = process.env,
+): string[] {
+  const candidates = [
+    env.ANTIGRAVITY_CLI_HOME?.trim(),
+    env.AGY_HOME?.trim(),
+    join(userHome, '.gemini', 'antigravity-cli'),
+  ]
+  const seen = new Set<string>()
+  const dirs: string[] = []
+  for (const dir of candidates) {
+    if (!dir) continue
+    const normalized = resolve(dir)
+    if (seen.has(normalized)) continue
+    seen.add(normalized)
+    dirs.push(normalized)
+  }
+  return dirs
+}
+
+/**
  * Default isolated home.
  * @returns `~/.pi/agent/cache/antigravity-acp`.
  */
@@ -165,45 +220,42 @@ export function defaultHome(): string {
 
 /**
  * Seed or refresh the isolated `antigravity-oauth-token` file from the user's
- * default CLI home (`~/.gemini/antigravity-cli` or `~/.gemini/antigravity`)
- * whenever the host uses file-backed token storage (Windows / headless Linux)
- * or the user signed in again from a terminal.
+ * Antigravity CLI home (`ANTIGRAVITY_CLI_HOME`, `AGY_HOME`, or
+ * `~/.gemini/antigravity-cli`) whenever the host uses file-backed token storage
+ * (Windows / headless Linux) or the user signed in again from a terminal.
  * @param home - isolated `--gemini-dir` root.
  * @param userHome - optional user home override for testing.
+ * @param env - optional environment override for testing.
  */
 export function syncOAuthToken(
   home: string,
   userHome: string = homedir(),
+  env: NodeJS.ProcessEnv = process.env,
 ): void {
   const appData = join(home, 'agy')
   const dst = join(appData, 'antigravity-oauth-token')
-  const sources = [
-    join(userHome, '.gemini', 'antigravity-cli', 'antigravity-oauth-token'),
-    join(userHome, '.gemini', 'antigravity', 'antigravity-oauth-token'),
-  ]
-  let newestSrc: { path: string; mtimeMs: number } | undefined
-  for (const candidate of sources) {
+  let chosen: { path: string; mtimeMs: number } | undefined
+  for (const dir of defaultAgyHomes(userHome, env)) {
+    const candidate = join(dir, 'antigravity-oauth-token')
     try {
       const st = statSync(candidate)
-      if (
-        st.size > 0 &&
-        (newestSrc === undefined || st.mtimeMs > newestSrc.mtimeMs)
-      ) {
-        newestSrc = { path: candidate, mtimeMs: st.mtimeMs }
+      if (st.isFile() && st.size > 0) {
+        chosen = { path: candidate, mtimeMs: st.mtimeMs }
+        break
       }
     } catch {
-      // Source token file does not exist.
+      // Directory has no token file; fall through to the next candidate.
     }
   }
-  if (newestSrc === undefined) return
+  if (chosen === undefined) return
   try {
     const dstStat = statSync(dst)
-    if (dstStat.size > 0 && dstStat.mtimeMs >= newestSrc.mtimeMs) return
+    if (dstStat.size > 0 && dstStat.mtimeMs >= chosen.mtimeMs) return
   } catch {
     // Destination token file does not exist yet.
   }
   mkdirSync(appData, { recursive: true })
-  copyFileSync(newestSrc.path, dst)
+  copyFileSync(chosen.path, dst)
   try {
     chmodSync(dst, 0o600)
   } catch {
@@ -301,22 +353,61 @@ function scanMessage<T>(
   return result
 }
 
+/** Context window telemetry decoded from `gen_metadata.data`. */
+export interface ContextWindowMetadata {
+  maxContextTokens?: number
+  estimatedTokensUsed?: number
+}
+
+function decodeCtxWindow(
+  ctxWindow: Uint8Array,
+): ContextWindowMetadata | undefined {
+  let maxContextTokens: number | undefined
+  let estimatedTokensUsed: number | undefined
+  let pos = 0
+  while (pos < ctxWindow.length) {
+    const tag = readVarint(ctxWindow, pos)
+    if (tag === undefined) break
+    pos = tag.next
+    const fieldNumber = Number(tag.value >> 3n)
+    const wireType = Number(tag.value & 7n)
+    if (fieldNumber <= 0) break
+    if (wireType === 0 && (fieldNumber === 1 || fieldNumber === 4)) {
+      const val = readVarint(ctxWindow, pos)
+      if (val === undefined) break
+      pos = val.next
+      const num = Number(val.value)
+      if (val.value > 0n && Number.isSafeInteger(num)) {
+        if (fieldNumber === 1) estimatedTokensUsed = num
+        else maxContextTokens = num
+      }
+      continue
+    }
+    const next = skipField(ctxWindow, pos, wireType)
+    if (next === undefined) break
+    pos = next
+  }
+  if (maxContextTokens === undefined && estimatedTokensUsed === undefined)
+    return undefined
+  return {
+    ...(maxContextTokens !== undefined ? { maxContextTokens } : {}),
+    ...(estimatedTokensUsed !== undefined ? { estimatedTokensUsed } : {}),
+  }
+}
+
 /**
- * Decode `max_context_tokens` from `gen_metadata.data` along protobuf wire path
- * `1 (bytes) -> 9 (bytes) -> 10 (bytes) -> 4 (varint)`.
+ * Decode context window telemetry from `gen_metadata.data` along protobuf wire path
+ * `1 (chatModel) -> 9 (chatStart) -> 10 (ctxWindow) -> {1: estimated_tokens_used, 4: max_context_tokens}`.
  * @param blob - raw protobuf bytes from `gen_metadata.data`.
- * @returns positive token count, or `undefined` when absent or malformed.
+ * @returns positive token counts, or `undefined` when absent or malformed.
  */
-export function extractMaxContextTokens(blob: Uint8Array): number | undefined {
+export function extractContextWindowMetadata(
+  blob: Uint8Array,
+): ContextWindowMetadata | undefined {
   if (!(blob instanceof Uint8Array) || blob.length === 0) return undefined
   return scanMessage(blob, 1, 2, (chatModel) =>
     scanMessage(chatModel, 9, 2, (chatStart) =>
-      scanMessage(chatStart, 10, 2, (ctxWindow) =>
-        scanMessage(ctxWindow, 4, 0, (_empty, value) => {
-          const num = Number(value)
-          return value > 0n && Number.isSafeInteger(num) ? num : undefined
-        }),
-      ),
+      scanMessage(chatStart, 10, 2, (ctxWindow) => decodeCtxWindow(ctxWindow)),
     ),
   )
 }
@@ -373,21 +464,35 @@ function resolveSessionDbPath(
   if (dbStat === 'invalid' || dbStat.isSymbolicLink() || !dbStat.isFile())
     return { kind: 'invalid' }
 
+  // Reject symlinked or non-regular SQLite WAL/SHM sidecar files before opening.
+  for (const suffix of ['-wal', '-shm']) {
+    const sidecarStat = lstatOrMissing(`${dbPath}${suffix}`)
+    if (sidecarStat === 'missing') continue
+    if (
+      sidecarStat === 'invalid' ||
+      sidecarStat.isSymbolicLink() ||
+      !sidecarStat.isFile()
+    ) {
+      return { kind: 'invalid' }
+    }
+  }
+
   return { kind: 'ok', dbPath }
 }
 
 /**
- * Read server-issued `max_context_tokens` from one ACP session's SQLite database.
+ * Read context window telemetry (`max_context_tokens` and `estimated_tokens_used`)
+ * from one ACP session's SQLite database.
  * @param home - isolated `--gemini-dir` root.
  * @param sessionId - ACP session id.
- * @param minIdx - lowest `gen_metadata.idx` owned by the current model.
- * @returns positive `max_context_tokens`, or `undefined` when unavailable.
+ * @param minIdx - lowest `gen_metadata.idx` owned by the current scope.
+ * @returns decoded positive counts, or `undefined` when unavailable.
  */
-export function readSessionMaxContextTokens(
+export function readSessionContextMetadata(
   home: string,
   sessionId: string,
   minIdx = 0,
-): number | undefined {
+): ContextWindowMetadata | undefined {
   if (typeof minIdx !== 'number' || !Number.isSafeInteger(minIdx) || minIdx < 0)
     return undefined
   const resolved = resolveSessionDbPath(home, sessionId)
@@ -398,12 +503,28 @@ export function readSessionMaxContextTokens(
     const stmt = db.prepare(
       'SELECT data FROM gen_metadata WHERE idx >= ? ORDER BY idx DESC',
     )
+    let maxContextTokens: number | undefined
+    let estimatedTokensUsed: number | undefined
     for (const row of stmt.iterate(minIdx) as Iterable<{ data?: unknown }>) {
       if (!(row.data instanceof Uint8Array)) continue
-      const tokens = extractMaxContextTokens(row.data)
-      if (tokens !== undefined) return tokens
+      const meta = extractContextWindowMetadata(row.data)
+      if (meta === undefined) continue
+      if (maxContextTokens === undefined && meta.maxContextTokens !== undefined)
+        maxContextTokens = meta.maxContextTokens
+      if (
+        estimatedTokensUsed === undefined &&
+        meta.estimatedTokensUsed !== undefined
+      )
+        estimatedTokensUsed = meta.estimatedTokensUsed
+      if (maxContextTokens !== undefined && estimatedTokensUsed !== undefined)
+        break
     }
-    return undefined
+    if (maxContextTokens === undefined && estimatedTokensUsed === undefined)
+      return undefined
+    return {
+      ...(maxContextTokens !== undefined ? { maxContextTokens } : {}),
+      ...(estimatedTokensUsed !== undefined ? { estimatedTokensUsed } : {}),
+    }
   } catch {
     return undefined
   } finally {
@@ -490,6 +611,7 @@ function removeArtifacts(directory: string, names: readonly string[]): void {
 export function prepareHome(
   home: string,
   userHome: string = homedir(),
+  env: NodeJS.ProcessEnv = process.env,
 ): string {
   const agentDir = join(home, 'config', 'plugins', BRIDGE_AGENT, 'agents')
   mkdirSync(agentDir, { recursive: true })
@@ -531,7 +653,7 @@ export function prepareHome(
   } catch {
     // Log cleanup is best-effort when the home cannot be listed.
   }
-  syncOAuthToken(home, userHome)
+  syncOAuthToken(home, userHome, env)
   const settingsPath = join(appData, 'settings.json')
   const settings = readJson(settingsPath)
   writeIfChanged(

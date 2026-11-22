@@ -3,9 +3,11 @@ import { test } from 'node:test'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { PassThrough, Writable } from 'node:stream'
 import { initTheme } from '@earendil-works/pi-coding-agent'
 import extension from '../index.ts'
 import { AntigravityRuntime } from '../src/runtime.ts'
+import { binaryFingerprint } from '../src/preflight.ts'
 import { QuotaReader } from '../src/quota.ts'
 import { formatQuotaStatus, quotaForModel } from '../src/format.ts'
 
@@ -130,7 +132,7 @@ function mountExtension(t, options = {}) {
         handlers.set(event, handler)
       },
     },
-    { runCommand: options.runCommand },
+    { runCommand: options.runCommand, spawnAcp: options.spawnAcp },
   )
   const ctx = {
     sessionManager: { getSessionId: () => 'events-session' },
@@ -1024,6 +1026,7 @@ test('/agy-acp status scopes context window summary to active antigravity-acp mo
     join(home, 'catalog.json'),
     JSON.stringify({
       tier: { name: 'Google AI Pro' },
+      binaryFingerprint: binaryFingerprint(process.execPath),
       contextWindows: { 'gemini-4-argon': 512_000 },
     }),
   )
@@ -1045,4 +1048,128 @@ test('/agy-acp status scopes context window summary to active antigravity-acp mo
     model: { provider: 'anthropic', id: 'gemini-4-argon', name: 'Foreign' },
   })
   assert.match(h.notices.at(-1).text, /Context:\s+dynamic \(unprobed\)/)
+})
+
+test('extension thinkingLevelMap exposes xhigh and max only when offered and invalidates stale binaryFingerprint contextWindows', async (t) => {
+  const home = isolateHome(t)
+  writeFileSync(
+    join(home, 'catalog.json'),
+    JSON.stringify({
+      tier: { name: 'Google AI Pro' },
+      models: [{ id: 'gemini-4-argon', name: 'Gemini 4 Argon' }],
+      binaryFingerprint: 'stale-binary-fingerprint',
+      contextWindows: { 'gemini-4-argon': 512_000 },
+    }),
+  )
+  const spawnAcp = () => {
+    const stdout = new PassThrough()
+    const exited = Promise.withResolvers()
+    const replies = {
+      initialize: {
+        protocolVersion: 1,
+        agentInfo: { name: 'Antigravity ACP Server', version: '1.5.14' },
+        agentCapabilities: { promptCapabilities: { image: false, audio: false } },
+      },
+      'session/new': {
+        sessionId: 's-ext-1',
+        configOptions: [
+          {
+            id: 'model',
+            options: [
+              {
+                group: 'primary',
+                options: [
+                  { value: 'claude-opus-5-5', name: 'Claude Opus 5.5' },
+                  { value: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash' },
+                  { value: 'foo-max-effort', name: 'Foo Max' },
+                ],
+              },
+            ],
+          },
+          {
+            id: 'thought_level',
+            options: [
+              { value: 'low' },
+              { value: 'medium' },
+              { value: 'high' },
+              { value: 'xhigh' },
+              { value: 'max' },
+            ],
+          },
+        ],
+        models: {
+          availableModels: [
+            { modelId: 'claude-opus-5-5-low' },
+            { modelId: 'claude-opus-5-5-high' },
+            { modelId: 'claude-opus-5-5-xhigh' },
+            { modelId: 'claude-opus-5-5-max' },
+            { modelId: 'gemini-3.8-flash-low-effort' },
+            { modelId: 'gemini-3.8-flash-high-effort' },
+            { modelId: 'foo-max-effort' },
+          ],
+        },
+      },
+      'session/close': {},
+    }
+    return {
+      stdout,
+      exited: exited.promise,
+      stderrTail: () => '',
+      terminate: () => exited.resolve({ code: 0, signal: null }),
+      stdin: new Writable({
+        write(data, _encoding, done) {
+          const req = JSON.parse(data)
+          stdout.write(
+            `${JSON.stringify({ jsonrpc: '2.0', id: req.id, result: replies[req.method] })}\n`,
+          )
+          done()
+        },
+      }),
+    }
+  }
+  const h = mountExtension(t, {
+    model: { provider, id: 'gemini-4-argon', name: 'Gemini 4 Argon' },
+    runCommand: async () => ({ code: 0, stdout: '1.5.14', stderr: '' }),
+    spawnAcp,
+  })
+  assert.equal(
+    h.registrations[0].models.find((m) => m.id === 'gemini-4-argon').contextWindow,
+    0,
+  )
+  await h.command.handler('status', h.ctx)
+  assert.match(h.notices.at(-1).text, /Context:\s+dynamic \(unprobed\)/)
+
+  const refreshed = await h.registrations[0].refreshModels({ allowNetwork: true })
+  assert.deepEqual(
+    refreshed.find((m) => m.id === 'claude-opus-5-5').input,
+    ['text'],
+  )
+  assert.deepEqual(
+    refreshed.find((m) => m.id === 'claude-opus-5-5').thinkingLevelMap,
+    {
+      off: null,
+      minimal: null,
+      low: 'low',
+      medium: null,
+      high: 'high',
+      xhigh: 'xhigh',
+      max: 'max',
+    },
+  )
+  assert.deepEqual(
+    refreshed.find((m) => m.id === 'gemini-3.8-flash').thinkingLevelMap,
+    {
+      off: null,
+      minimal: null,
+      low: 'low',
+      medium: null,
+      high: 'high',
+      xhigh: null,
+      max: null,
+    },
+  )
+  assert.equal(
+    refreshed.find((m) => m.id === 'foo-max-effort').thinkingLevelMap,
+    undefined,
+  )
 })

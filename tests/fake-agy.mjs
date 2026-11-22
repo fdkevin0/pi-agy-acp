@@ -300,14 +300,23 @@ function encodeBytesField(fieldNum, payload) {
   ])
 }
 
-function encodeGenMetadataMaxContextTokens(tokens) {
-  const ctxWindow = Buffer.concat([
-    encodeVarint((4 << 3) | 0),
-    encodeVarint(tokens),
-  ])
+function encodeGenMetadataContextWindow(maxTokens, estimatedUsed) {
+  const parts = []
+  if (estimatedUsed !== undefined) {
+    parts.push(encodeVarint((1 << 3) | 0), encodeVarint(estimatedUsed))
+  }
+  if (maxTokens !== undefined) {
+    parts.push(encodeVarint((4 << 3) | 0), encodeVarint(maxTokens))
+  }
+  const ctxWindow = Buffer.concat(parts)
   const chatStart = encodeBytesField(10, ctxWindow)
   const chatModel = encodeBytesField(9, chatStart)
   return encodeBytesField(1, chatModel)
+}
+
+function estimatedTokensForFakePrompt(text) {
+  const match = /\bESTCTX\s+(\d+)/.exec(text)
+  return match !== null ? Number(match[1]) : undefined
 }
 
 function contextWindowForFakeModel(modelId, text) {
@@ -329,8 +338,9 @@ function contextWindowForFakeModel(modelId, text) {
 function recordGenMetadata(s, text) {
   if (!s.db) return
   const tokens = contextWindowForFakeModel(s.model, text)
-  if (tokens === undefined) return
-  const blob = encodeGenMetadataMaxContextTokens(tokens)
+  const estimated = estimatedTokensForFakePrompt(text)
+  if (tokens === undefined && estimated === undefined) return
+  const blob = encodeGenMetadataContextWindow(tokens, estimated)
   s.db
     .prepare('INSERT INTO gen_metadata (idx, data, size) VALUES (?, ?, ?)')
     .run(s.metaSeq++, blob, blob.length)
@@ -649,8 +659,17 @@ rl.on('line', async (line) => {
         id,
         result: {
           protocolVersion: 1,
-          agentCapabilities: { mcpCapabilities: { http: true } },
-          agentInfo: { name: 'fake-agy', version: '0.0.1' },
+          agentCapabilities: {
+            mcpCapabilities: { http: true },
+            promptCapabilities: {
+              image: process.env.FAKE_AGY_IMAGE !== '0',
+              audio: false,
+            },
+          },
+          agentInfo: {
+            name: 'fake-agy',
+            version: process.env.FAKE_AGY_VERSION ?? '1.5.14',
+          },
         },
       })
     }

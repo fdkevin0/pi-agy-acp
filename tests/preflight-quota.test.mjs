@@ -5,9 +5,14 @@ import {
   mkdirSync,
   writeFileSync,
   readFileSync,
+  readdirSync,
   rmSync,
   existsSync,
   symlinkSync,
+  utimesSync,
+  chmodSync,
+  statSync,
+  realpathSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, delimiter } from 'node:path'
@@ -15,30 +20,50 @@ import { DatabaseSync } from 'node:sqlite'
 import {
   resolveAgyBinary,
   assertSupportedAgyVersion,
+  binaryFingerprint,
+  defaultAgyHomes,
   prepareHome,
+  syncOAuthToken,
   removeSessionArtifacts,
-  extractMaxContextTokens,
-  readSessionMaxContextTokens,
+  extractContextWindowMetadata,
+  readSessionContextMetadata,
   readSessionNextMetadataIndex,
 } from '../src/preflight.ts'
 import { defaults } from '../src/config.ts'
 import { AntigravityRuntime } from '../src/runtime.ts'
-import { ModelCatalog, FALLBACK_MODELS } from '../src/catalog.ts'
+import {
+  ModelCatalog,
+  flattenConfigOptions,
+  nearestEffort,
+} from '../src/catalog.ts'
 import extension from '../index.ts'
 import { formatQuota, formatStatus } from '../src/format.ts'
+import { runCommand, spawnAcp } from '../src/host.ts'
 import { parseUsage, QuotaReader, readLoggedEmail } from '../src/quota.ts'
+
+function restoreEnv(key, value) {
+  delete process.env[key]
+  Object.assign(
+    process.env,
+    ...[value].filter((v) => v !== undefined).map((v) => ({ [key]: v })),
+  )
+}
 
 function isolateHome(t) {
   const root = mkdtempSync(join(tmpdir(), 'pi-account-'))
   const previous = process.env.PI_AGY_HOME
   const prevDisplay = process.env.PI_AGY_QUOTA_DISPLAY
+  const prevCliHome = process.env.ANTIGRAVITY_CLI_HOME
+  const prevAgyHome = process.env.AGY_HOME
   process.env.PI_AGY_HOME = root
   delete process.env.PI_AGY_QUOTA_DISPLAY
+  delete process.env.ANTIGRAVITY_CLI_HOME
+  delete process.env.AGY_HOME
   t.after(() => {
-    if (previous === undefined) delete process.env.PI_AGY_HOME
-    else process.env.PI_AGY_HOME = previous
-    if (prevDisplay === undefined) delete process.env.PI_AGY_QUOTA_DISPLAY
-    else process.env.PI_AGY_QUOTA_DISPLAY = prevDisplay
+    restoreEnv('PI_AGY_HOME', previous)
+    restoreEnv('PI_AGY_QUOTA_DISPLAY', prevDisplay)
+    restoreEnv('ANTIGRAVITY_CLI_HOME', prevCliHome)
+    restoreEnv('AGY_HOME', prevAgyHome)
     rmSync(root, { recursive: true, force: true })
   })
   return root
@@ -153,23 +178,31 @@ test('tier-only metadata is validated and persisted without model changes', (t) 
   assert.equal(new ModelCatalog(path).tier(), undefined)
 })
 
-test('login logs use the last match in the first readable matching tail', (t) => {
+test('login logs scan tail 64 KiB first, fall back to head 64 KiB, and ignore buried middle lines', (t) => {
   const root = isolateHome(t)
   const primary = join(root, 'acp.log')
   const fallback = join(root, 'cli.log')
+  const buried = join(root, 'buried.log')
   const missing = join(root, 'missing')
   writeFileSync(
     primary,
-    'applyAuthResult: email=old@example.com, token omitted\n' +
+    'applyAuthResult: email=head@example.com, token omitted\n' +
       'x'.repeat(70_000),
+  )
+  writeFileSync(
+    buried,
+    'x'.repeat(70_000) +
+      '\napplyAuthResult: email=middle@example.com\n' +
+      'y'.repeat(70_000),
   )
   writeFileSync(
     fallback,
     'OAuth: authenticated successfully as fallback@example.com\n',
   )
-  assert.equal(readLoggedEmail([primary]), undefined)
+  assert.equal(readLoggedEmail([primary]), 'head@example.com')
+  assert.equal(readLoggedEmail([buried]), undefined)
   assert.equal(
-    readLoggedEmail([missing, root, primary, fallback]),
+    readLoggedEmail([missing, buried, fallback]),
     'fallback@example.com',
   )
   writeFileSync(
@@ -264,7 +297,7 @@ test('failed account discovery leaves quota usable, cleans startup, and attempts
   })
   runtime.preflight = {
     binary: 'fake',
-    version: '1.4.12',
+    version: '1.5.10',
     home,
     workspace: home,
     logFile: join(home, 'acp.log'),
@@ -332,10 +365,10 @@ test('binary discovery skips same-name directories and version error matches min
   )
   assert.throws(() => resolveAgyBinary(join(bad, 'agy')), /not found/)
   assert.throws(
-    () => assertSupportedAgyVersion('1.4.11', binary),
-    /requires >= 1\.4\.12/,
+    () => assertSupportedAgyVersion('1.5.9', binary),
+    /requires >= 1\.5\.10/,
   )
-  assert.doesNotThrow(() => assertSupportedAgyVersion('1.4.12', binary))
+  assert.doesNotThrow(() => assertSupportedAgyVersion('1.5.10', binary))
 })
 
 test('quota reads without ACP startup, coalesces requests and preserves command errors', async (t) => {
@@ -380,11 +413,8 @@ test('quota reads without ACP startup, coalesces requests and preserves command 
   assert.equal(runtime.status().state, 'idle')
   assert.equal(runtime.status().home, root)
   assert.equal(runtime.status().binary, undefined)
-  assert.equal(
-    runtime.status().models.find((m) => m.id === 'gpt-oss-120b-medium')
-      .fixedEffort,
-    'medium',
-  )
+  assert.deepEqual(runtime.status().models, [])
+  assert.deepEqual(runtime.status().efforts, [])
   assert.equal(runtime.status().liveSessions, 0)
   result = { code: 7, stdout: '', stderr: ' sign in required ' }
   assert.match(
@@ -437,22 +467,48 @@ test('quota command survives failed optional model discovery', async (t) => {
   }
 })
 
-test('all fallback and server-advertised models remain visible, including cached models', (t) => {
+test('catalog starts empty without hardcoded models and persists server-advertised models and image capability', (t) => {
   const root = mkdtempSync(join(tmpdir(), 'pi-catalog-'))
   t.after(() => rmSync(root, { recursive: true, force: true }))
   const path = join(root, 'catalog.json')
   const catalog = new ModelCatalog(path)
-  assert.equal(catalog.list().length, 5)
-  catalog.observe([
-    {
-      id: 'model',
-      options: FALLBACK_MODELS.map((m) => ({ value: m.id, name: m.name })),
-    },
-  ])
-  assert.deepEqual(
-    new ModelCatalog(path).list().map((m) => m.id),
-    FALLBACK_MODELS.map((m) => m.id),
+  assert.deepEqual(catalog.list(), [])
+  assert.deepEqual(catalog.effortList(), [])
+  assert.deepEqual(catalog.inputModalities(), ['text', 'image'])
+  const advertised = [
+    { id: 'gemini-4-neon', name: 'Gemini 4 Neon' },
+    { id: 'gemini-pro-orchestrator-neon', name: 'Orchestrator (Neon)' },
+    { id: 'gpt-oss-120b-medium', name: 'GPT-OSS 120B (Medium)' },
+  ]
+  catalog.observe(
+    [
+      {
+        id: 'model',
+        options: advertised.map((m) => ({ value: m.id, name: m.name })),
+      },
+    ],
+    [
+      { modelId: 'gemini-4-neon-low' },
+      { modelId: 'gemini-4-neon-xhigh' },
+      { modelId: 'gemini-pro-orchestrator-neon' },
+      { modelId: 'gpt-oss-120b-medium' },
+    ],
   )
+  assert.equal(catalog.observeImageSupport(false), true)
+  const reloaded = new ModelCatalog(path)
+  assert.deepEqual(
+    reloaded.list().map((m) => m.id),
+    advertised.map((m) => m.id),
+  )
+  assert.deepEqual(reloaded.effortList(), ['low', 'xhigh'])
+  assert.deepEqual(reloaded.effortsFor('gemini-pro-orchestrator-neon'), [])
+  assert.equal(
+    reloaded.supportsEffortSelection('gemini-pro-orchestrator-neon'),
+    false,
+  )
+  assert.equal(reloaded.supportsEffortSelection('gpt-oss-120b-medium'), false)
+  assert.equal(reloaded.supportsEffortSelection('gemini-4-neon'), true)
+  assert.deepEqual(reloaded.inputModalities(), ['text'])
 })
 
 test('provider registration is lazy, refresh respects context, and catalog changes republish models', async (t) => {
@@ -506,23 +562,7 @@ test('provider registration is lazy, refresh respects context, and catalog chang
     await Promise.all(offlineRefreshes)
     assert.equal(warmups, 0)
     const provider = registrations[0]
-    assert.deepEqual(
-      provider.models.find((m) => m.id === 'gemini-4-argon').thinkingLevelMap,
-      {
-        off: null,
-        minimal: null,
-        low: 'low',
-        medium: 'medium',
-        high: 'high',
-        xhigh: null,
-        max: null,
-      },
-    )
-    assert.equal(
-      provider.models.find((m) => m.id === 'gpt-oss-120b-medium')
-        .thinkingLevelMap,
-      undefined,
-    )
+    assert.deepEqual(provider.models, [])
     await provider.refreshModels({
       allowNetwork: true,
       signal: AbortSignal.abort(),
@@ -535,7 +575,15 @@ test('provider registration is lazy, refresh respects context, and catalog chang
     await Promise.all(offlineRefreshes)
     assert.equal(warmups, 1)
     assert.equal(registrations.length, 1)
-    assert.equal(refreshed[0].thinkingLevelMap.medium, null)
+    assert.deepEqual(refreshed[0].thinkingLevelMap, {
+      off: null,
+      minimal: null,
+      low: 'low',
+      medium: null,
+      high: 'high',
+      xhigh: null,
+      max: null,
+    })
     assert.equal(
       runtime.catalog.observe([
         { id: 'thought_level', options: [{ value: 'high' }] },
@@ -814,6 +862,13 @@ test('status panel distinguishes lazy startup, live resources, model efforts and
     unprobed.text,
     /gemini-4-argon \(Gemini 4 Argon\) — \[low, high\] · 500K/,
   )
+  const cold = formatStatus({
+    ...statusSnapshot,
+    contextWindow: undefined,
+    efforts: [],
+    models: [],
+  })
+  assert.match(cold.text, /default effort: high\n  Models:\n    No models available\./)
 })
 
 test('commands route formatted notices and reject unknown arguments without querying quota', async (t) => {
@@ -1050,12 +1105,16 @@ function genMetadataBlob(varintBytes) {
   return pbField(0x0a, pbField(0x4a, pbField(0x52, ctxWindow)))
 }
 
-test('extractMaxContextTokens decodes GeneratorMetadata protobuf blobs and ignores unknown or malformed fields', () => {
+test('extractContextWindowMetadata decodes GeneratorMetadata protobuf blobs and ignores unknown or malformed fields', () => {
   const blob512k = genMetadataBlob([0x80, 0xa0, 0x1f])
-  assert.equal(extractMaxContextTokens(blob512k), 512_000)
+  assert.deepEqual(extractContextWindowMetadata(blob512k), {
+    maxContextTokens: 512_000,
+  })
 
   const blob128k = genMetadataBlob([0x80, 0x80, 0x08])
-  assert.equal(extractMaxContextTokens(blob128k), 131_072)
+  assert.deepEqual(extractContextWindowMetadata(blob128k), {
+    maxContextTokens: 131_072,
+  })
 
   // Unknown fields across wire types 0, 1, 2, 5 before match + empty trailing field 1 after match.
   const padded = Uint8Array.from([
@@ -1066,29 +1125,33 @@ test('extractMaxContextTokens decodes GeneratorMetadata protobuf blobs and ignor
     ...blob512k,
     0x0a, 0x02, 0x10, 0x00,
   ])
-  assert.equal(extractMaxContextTokens(padded), 512_000)
+  assert.deepEqual(extractContextWindowMetadata(padded), {
+    maxContextTokens: 512_000,
+  })
 
   // Last-wins across repeated field 4 entries.
   const repeated = pbField(
     0x0a,
     pbField(0x4a, pbField(0x52, Uint8Array.from([0x20, 0x80, 0xa0, 0x1f, 0x20, 0x80, 0x80, 0x08]))),
   )
-  assert.equal(extractMaxContextTokens(repeated), 131_072)
+  assert.deepEqual(extractContextWindowMetadata(repeated), {
+    maxContextTokens: 131_072,
+  })
 
-  assert.equal(extractMaxContextTokens(new Uint8Array(0)), undefined)
-  assert.equal(extractMaxContextTokens(genMetadataBlob([0x00])), undefined)
+  assert.equal(extractContextWindowMetadata(new Uint8Array(0)), undefined)
+  assert.equal(extractContextWindowMetadata(genMetadataBlob([0x00])), undefined)
   assert.equal(
-    extractMaxContextTokens(
+    extractContextWindowMetadata(
       genMetadataBlob([0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01]),
     ),
     undefined,
   )
-  assert.equal(extractMaxContextTokens(Uint8Array.from([0x0a, 0x10, 0x4a])), undefined)
-  assert.equal(extractMaxContextTokens(Uint8Array.from([0x0b, 0x01])), undefined)
-  assert.equal(extractMaxContextTokens(null), undefined)
+  assert.equal(extractContextWindowMetadata(Uint8Array.from([0x0a, 0x10, 0x4a])), undefined)
+  assert.equal(extractContextWindowMetadata(Uint8Array.from([0x0b, 0x01])), undefined)
+  assert.equal(extractContextWindowMetadata(null), undefined)
 })
 
-test('readSessionMaxContextTokens reads WAL SQLite metadata safely and rejects symlinks or invalid session ids', (t) => {
+test('readSessionContextMetadata reads WAL SQLite metadata safely and rejects symlinks or invalid session ids', (t) => {
   const home = isolateHome(t)
   const convDir = join(home, 'agy', 'conversations')
   mkdirSync(convDir, { recursive: true })
@@ -1106,27 +1169,33 @@ test('readSessionMaxContextTokens reads WAL SQLite metadata safely and rejects s
   insert.run(2, unrelated, unrelated.length)
 
   // Skips newer row 2 lacking ContextWindowMetadata and finds row 1 from WAL while writer stays open.
-  assert.equal(readSessionMaxContextTokens(home, 'sess-1'), 512_000)
+  assert.deepEqual(readSessionContextMetadata(home, 'sess-1'), {
+    maxContextTokens: 512_000,
+  })
 
   const blob128k = genMetadataBlob([0x80, 0x80, 0x08])
   insert.run(3, blob128k, blob128k.length)
-  assert.equal(readSessionMaxContextTokens(home, 'sess-1'), 131_072)
-  assert.equal(readSessionMaxContextTokens(home, 'sess-1', 0), 131_072)
-  assert.equal(readSessionMaxContextTokens(home, 'sess-1', 4), undefined)
-  assert.equal(readSessionMaxContextTokens(home, 'sess-1', -1), undefined)
+  assert.deepEqual(readSessionContextMetadata(home, 'sess-1'), {
+    maxContextTokens: 131_072,
+  })
+  assert.deepEqual(readSessionContextMetadata(home, 'sess-1', 0), {
+    maxContextTokens: 131_072,
+  })
+  assert.equal(readSessionContextMetadata(home, 'sess-1', 4), undefined)
+  assert.equal(readSessionContextMetadata(home, 'sess-1', -1), undefined)
   assert.equal(readSessionNextMetadataIndex(home, 'sess-1'), 4)
   db.close()
 
-  assert.equal(readSessionMaxContextTokens(home, 'missing'), undefined)
+  assert.equal(readSessionContextMetadata(home, 'missing'), undefined)
   assert.equal(readSessionNextMetadataIndex(home, 'missing'), 0)
-  assert.equal(readSessionMaxContextTokens(home, ''), undefined)
-  assert.equal(readSessionMaxContextTokens(home, '.'), undefined)
-  assert.equal(readSessionMaxContextTokens(home, '../outside'), undefined)
+  assert.equal(readSessionContextMetadata(home, ''), undefined)
+  assert.equal(readSessionContextMetadata(home, '.'), undefined)
+  assert.equal(readSessionContextMetadata(home, '../outside'), undefined)
   assert.equal(readSessionNextMetadataIndex(home, '../outside'), null)
-  assert.equal(readSessionMaxContextTokens(home, 'a/b'), undefined)
+  assert.equal(readSessionContextMetadata(home, 'a/b'), undefined)
 
   writeFileSync(join(convDir, 'corrupt.db'), 'not-a-sqlite-file')
-  assert.equal(readSessionMaxContextTokens(home, 'corrupt'), undefined)
+  assert.equal(readSessionContextMetadata(home, 'corrupt'), undefined)
   assert.equal(readSessionNextMetadataIndex(home, 'corrupt'), null)
 
   const outside = join(home, 'outside')
@@ -1138,12 +1207,12 @@ test('readSessionMaxContextTokens reads WAL SQLite metadata safely and rejects s
   outsideDb.close()
 
   symlinkSync(outsideDbPath, join(convDir, 'sym-file.db'))
-  assert.equal(readSessionMaxContextTokens(home, 'sym-file'), undefined)
+  assert.equal(readSessionContextMetadata(home, 'sym-file'), undefined)
   assert.equal(readSessionNextMetadataIndex(home, 'sym-file'), null)
 
   rmSync(convDir, { recursive: true, force: true })
   symlinkSync(outside, convDir, 'junction')
-  assert.equal(readSessionMaxContextTokens(home, 'ext'), undefined)
+  assert.equal(readSessionContextMetadata(home, 'ext'), undefined)
   assert.equal(readSessionNextMetadataIndex(home, 'ext'), null)
 })
 
@@ -1172,4 +1241,458 @@ test('ModelCatalog persists contextWindows in catalog.json and ignores invalid v
     'gemini-4-argon': 512_000,
     'gpt-oss-120b-medium': 131_072,
   })
+})
+
+test('ModelCatalog flattens grouped configOptions and handles xhigh, max, and -effort suffixes', (t) => {
+  const root = isolateHome(t)
+  const catalog = new ModelCatalog(join(root, 'catalog.json'))
+
+  assert.deepEqual(
+    flattenConfigOptions([
+      {
+        group: 'google',
+        options: [
+          { value: 'gemini-4-argon', name: 'Gemini 4 Argon' },
+          { value: 'foo-xhigh', name: 'Foo XHigh' },
+        ],
+      },
+      { value: 'claude-opus-5-5', name: 'Claude Opus 5.5' },
+      {
+        group: 'fixed',
+        options: [
+          { value: 'bar-max', name: 'Bar Max' },
+          { value: 'baz-high-effort', name: 'Baz High' },
+        ],
+      },
+    ]).map((entry) => entry.value),
+    ['gemini-4-argon', 'foo-xhigh', 'claude-opus-5-5', 'bar-max', 'baz-high-effort'],
+  )
+
+  const changed = catalog.observe(
+    [
+      {
+        id: 'model',
+        options: [
+          {
+            group: 'primary',
+            options: [
+              { value: 'gemini-4-argon', name: 'Gemini 4 Argon' },
+              { value: 'claude-opus-5-5', name: 'Claude Opus 5.5' },
+            ],
+          },
+          { value: 'foo-xhigh', name: 'Foo XHigh' },
+          { value: 'bar-max', name: 'Bar Max' },
+          { value: 'baz-high-effort', name: 'Baz High' },
+        ],
+      },
+      {
+        id: 'thought_level',
+        options: [
+          {
+            group: 'standard',
+            options: [{ value: 'low' }, { value: 'medium' }, { value: 'high' }],
+          },
+          {
+            group: 'extended',
+            options: [{ value: 'xhigh' }, { value: 'max' }],
+          },
+        ],
+      },
+    ],
+    [
+      { modelId: 'gemini-4-argon-low' },
+      { modelId: 'gemini-4-argon-high' },
+      { modelId: 'gemini-4-argon-xhigh' },
+      { modelId: 'claude-opus-5-5-low-effort' },
+      { modelId: 'claude-opus-5-5-high-effort' },
+      { modelId: 'claude-opus-5-5-xhigh-effort' },
+      { modelId: 'claude-opus-5-5-max-effort' },
+      { modelId: 'foo-xhigh' },
+      { modelId: 'bar-max' },
+      { modelId: 'baz-high-effort' },
+    ],
+  )
+  assert.equal(changed, true)
+  assert.deepEqual(catalog.effortList(), ['low', 'medium', 'high', 'xhigh', 'max'])
+  assert.deepEqual(catalog.effortsFor('gemini-4-argon'), ['low', 'high', 'xhigh'])
+  assert.deepEqual(catalog.effortsFor('claude-opus-5-5'), ['low', 'high', 'xhigh', 'max'])
+  assert.deepEqual(catalog.effortsFor('foo-xhigh'), [])
+  assert.deepEqual(catalog.effortsFor('bar-max'), [])
+  assert.deepEqual(catalog.effortsFor('baz-high-effort'), [])
+  assert.equal(catalog.fixedEffort('foo-xhigh'), 'xhigh')
+  assert.equal(catalog.fixedEffort('bar-max'), 'max')
+  assert.equal(catalog.fixedEffort('baz-high-effort'), 'high')
+  assert.equal(catalog.fixedEffort('qux-xhigh-effort'), 'xhigh')
+  assert.equal(catalog.fixedEffort('gemini-4-argon'), undefined)
+  assert.equal(catalog.fixedEffort('-high'), undefined)
+  assert.equal(nearestEffort('xhigh', ['low', 'medium', 'high']), 'high')
+  assert.equal(nearestEffort('max', ['low', 'medium', 'high']), 'high')
+  assert.equal(nearestEffort('xhigh', ['low', 'high', 'xhigh']), 'xhigh')
+  assert.equal(nearestEffort('max', ['low', 'high', 'xhigh', 'max']), 'max')
+})
+
+test('readLoggedEmail scans directory cli.log and newest 10 rotated logs with containment and dedup', (t) => {
+  const root = isolateHome(t)
+  const agyDir = join(root, 'agy-home')
+  const logDir = join(agyDir, 'log')
+  const outsideDir = join(root, 'outside')
+  mkdirSync(logDir, { recursive: true })
+  mkdirSync(outsideDir, { recursive: true })
+
+  // 12 rotated logs: only the newest 10 are eligible, so emails in the 2 oldest are ignored.
+  const writeLog = (name, content, ts) => {
+    const file = join(logDir, name)
+    writeFileSync(file, content)
+    utimesSync(file, ts, ts)
+  }
+  writeLog('cli-01.log', 'applyAuthResult: email=too-old-1@example.com\n', 1_700_000_010)
+  writeLog('acp-server-02.log', 'applyAuthResult: email=too-old-2@example.com\n', 1_700_000_020)
+  writeLog('cli-03.log', 'no auth line\n', 1_700_000_030)
+  writeLog('acp-server-04.log', 'no auth line\n', 1_700_000_040)
+  writeLog('cli-05.log', 'no auth line\n', 1_700_000_050)
+  writeLog('acp-server-06.log', 'no auth line\n', 1_700_000_060)
+  writeLog('cli-07.log', 'no auth line\n', 1_700_000_070)
+  writeLog('acp-server-08.log', 'no auth line\n', 1_700_000_080)
+  writeLog('cli-09.log', 'no auth line\n', 1_700_000_090)
+  writeLog('acp-server-10.log', 'no auth line\n', 1_700_000_100)
+  writeLog('cli-11.log', 'no auth line\n', 1_700_000_110)
+  writeLog('acp-server-12.log', 'no auth line\n', 1_700_000_120)
+  assert.equal(readLoggedEmail([agyDir]), undefined)
+
+  // Escaping symlink inside log/ with the newest mtime must be rejected.
+  const secretLog = join(outsideDir, 'escaped.log')
+  writeFileSync(secretLog, 'applyAuthResult: email=escaped@example.com\n')
+  utimesSync(secretLog, 1_700_009_000, 1_700_009_000)
+  symlinkSync(secretLog, join(logDir, 'cli-99.log'))
+  assert.equal(readLoggedEmail([agyDir]), undefined)
+
+  // Match inside one of the newest 10 rotated logs is found; newer rotated log beats older cli.log.
+  const olderCli = join(agyDir, 'cli.log')
+  writeFileSync(olderCli, 'applyAuthResult: email=older-cli@example.com\n')
+  utimesSync(olderCli, 1_700_000_050, 1_700_000_050)
+  const newerAcp = join(logDir, 'acp-server-12.log')
+  writeFileSync(
+    newerAcp,
+    'applyAuthResult: email=newest-acp@example.com\n' + 'z'.repeat(70_000),
+  )
+  utimesSync(newerAcp, 1_700_001_000, 1_700_001_000)
+  assert.equal(readLoggedEmail([agyDir]), 'newest-acp@example.com')
+
+  // Newer cli.log wins over older rotated logs.
+  writeFileSync(olderCli, 'OAuth: authenticated successfully as fresh-cli@example.com\n')
+  utimesSync(olderCli, 1_700_002_000, 1_700_002_000)
+  assert.equal(readLoggedEmail([agyDir]), 'fresh-cli@example.com')
+
+  // Intra-root symlink (cli.log -> log/cli-*.log, as created by agy 1.5.14) is contained and deduplicated.
+  const linkedHome = join(root, 'linked-home')
+  const linkedLogDir = join(linkedHome, 'log')
+  mkdirSync(linkedLogDir, { recursive: true })
+  const linkedTarget = join(linkedLogDir, 'cli-20261122.log')
+  writeFileSync(linkedTarget, 'applyAuthResult: email=linked-user@example.com\n')
+  symlinkSync(linkedTarget, join(linkedHome, 'cli.log'))
+  assert.equal(readLoggedEmail([linkedHome]), 'linked-user@example.com')
+
+  // Escaping log directory symlink is rejected completely.
+  const escapedHome = join(root, 'escaped-home')
+  mkdirSync(escapedHome, { recursive: true })
+  const outsideLogs = join(outsideDir, 'logs')
+  mkdirSync(outsideLogs, { recursive: true })
+  writeFileSync(
+    join(outsideLogs, 'cli-01.log'),
+    'applyAuthResult: email=dir-escape@example.com\n',
+  )
+  symlinkSync(outsideLogs, join(escapedHome, 'log'), 'junction')
+  assert.equal(readLoggedEmail([escapedHome]), undefined)
+})
+
+test('defaultAgyHomes, syncOAuthToken, and accountInfo respect ANTIGRAVITY_CLI_HOME and AGY_HOME', (t) => {
+  const root = isolateHome(t)
+  const userHome = join(root, 'user')
+  const cliEnvDir = join(root, 'env-cli-home')
+  const agyEnvDir = join(root, 'env-agy-home')
+  const defaultDir = join(userHome, '.gemini', 'antigravity-cli')
+  mkdirSync(cliEnvDir, { recursive: true })
+  mkdirSync(agyEnvDir, { recursive: true })
+  mkdirSync(defaultDir, { recursive: true })
+
+  assert.deepEqual(
+    defaultAgyHomes(userHome, {
+      ANTIGRAVITY_CLI_HOME: cliEnvDir,
+      AGY_HOME: agyEnvDir,
+    }),
+    [cliEnvDir, agyEnvDir, defaultDir],
+  )
+  assert.deepEqual(
+    defaultAgyHomes(userHome, {
+      ANTIGRAVITY_CLI_HOME: defaultDir,
+      AGY_HOME: defaultDir,
+    }),
+    [defaultDir],
+  )
+
+  // ANTIGRAVITY_CLI_HOME takes priority over AGY_HOME and ~/.gemini/antigravity-cli.
+  writeFileSync(join(defaultDir, 'antigravity-oauth-token'), 'default-token')
+  writeFileSync(join(agyEnvDir, 'antigravity-oauth-token'), 'agy-home-token')
+  writeFileSync(join(cliEnvDir, 'antigravity-oauth-token'), 'cli-home-token')
+  const dst1 = join(root, 'iso-1')
+  syncOAuthToken(dst1, userHome, {
+    ANTIGRAVITY_CLI_HOME: cliEnvDir,
+    AGY_HOME: agyEnvDir,
+  })
+  assert.equal(
+    readFileSync(join(dst1, 'agy', 'antigravity-oauth-token'), 'utf8'),
+    'cli-home-token',
+  )
+
+  // When ANTIGRAVITY_CLI_HOME has no token, falls back to AGY_HOME.
+  const emptyCliDir = join(root, 'empty-cli-home')
+  mkdirSync(emptyCliDir, { recursive: true })
+  const dst2 = join(root, 'iso-2')
+  syncOAuthToken(dst2, userHome, {
+    ANTIGRAVITY_CLI_HOME: emptyCliDir,
+    AGY_HOME: agyEnvDir,
+  })
+  assert.equal(
+    readFileSync(join(dst2, 'agy', 'antigravity-oauth-token'), 'utf8'),
+    'agy-home-token',
+  )
+
+  // Custom PI_AGY_HOME remains isolated and does not read global ANTIGRAVITY_CLI_HOME logs.
+  writeFileSync(
+    join(cliEnvDir, 'cli.log'),
+    'applyAuthResult: email=global-user@example.com\n',
+  )
+  process.env.ANTIGRAVITY_CLI_HOME = cliEnvDir
+  const runtime = new AntigravityRuntime({
+    config: { ...defaults, home: join(root, 'custom-pi-home') },
+    spawnAcp() {
+      throw new Error('Unexpected ACP startup')
+    },
+    runCommand() {
+      throw new Error('Unexpected command')
+    },
+    log: { info() {}, warn() {} },
+    onModelsChanged() {},
+  })
+  t.after(() => runtime.dispose())
+  assert.equal(runtime.status().account, undefined)
+})
+
+test('runCommand ignores stdin, caps stdout, aborts early on auth-required stderr, and cleans Unix process groups', async (t) => {
+  const root = isolateHome(t)
+
+  // 1. Stdin is ignored (immediate EOF, does not block).
+  const stdinRes = await runCommand(
+    [
+      process.execPath,
+      '-e',
+      "process.stdin.on('end', () => { process.stdout.write('eof'); process.exit(0) }); process.stdin.resume()",
+    ],
+    5_000,
+  )
+  assert.equal(stdinRes.code, 0)
+  assert.equal(stdinRes.stdout, 'eof')
+
+  // 2. Early stderr match aborts promptly instead of waiting for full timeout, and QuotaReader surfaces auth error.
+  const authScript = join(root, 'auth-agy.mjs')
+  writeFileSync(
+    authScript,
+    "#!/usr/bin/env node\nprocess.stderr.write('Authentication required. Please run agy to sign in.\\n'); setTimeout(() => {}, 30000)\n",
+  )
+  chmodSync(authScript, 0o755)
+  const started = Date.now()
+  const reader = new QuotaReader(() => authScript, runCommand, 60_000)
+  const authSnap = await reader.read(true)
+  assert.equal(authSnap.status, 'error')
+  assert.match(authSnap.error, /Authentication required/i)
+  assert.ok(
+    Date.now() - started < 5_000,
+    'auth-required stderr should abort long before the 45s timeout',
+  )
+
+  // 3. Stdout exceeding 1 MiB aborts QuotaReader cleanly.
+  const bigStdoutScript = join(root, 'big-agy.mjs')
+  writeFileSync(
+    bigStdoutScript,
+    "#!/usr/bin/env node\nprocess.stdout.write('x'.repeat(1024 * 1024 + 64)); setTimeout(() => {}, 30000)\n",
+  )
+  chmodSync(bigStdoutScript, 0o755)
+  const bigReader = new QuotaReader(() => bigStdoutScript, runCommand, 60_000)
+  const bigSnap = await bigReader.read(true)
+  assert.equal(bigSnap.status, 'error')
+  assert.match(bigSnap.error, /stdout exceeded/i)
+})
+
+test(
+  'runCommand and spawnAcp clean Unix process groups so grandchildren do not become orphans',
+  { skip: process.platform === 'win32' },
+  async (t) => {
+    const root = isolateHome(t)
+    const gcMarker = join(root, 'run-grandchild.terminated')
+    const gcScript = join(root, 'grandchild.mjs')
+    writeFileSync(
+      gcScript,
+      `import { writeFileSync } from 'node:fs'
+const marker = process.argv[2]
+process.on('SIGTERM', () => {
+  writeFileSync(marker, 'sigterm')
+  process.exit(0)
+})
+process.stderr.write('GC_READY\\n')
+setInterval(() => {}, 60000)
+`,
+    )
+    const parentScript = join(root, 'parent.mjs')
+    writeFileSync(
+      parentScript,
+      `import { spawn } from 'node:child_process'
+spawn(process.execPath, [${JSON.stringify(gcScript)}, process.argv[2]], {
+  stdio: ['ignore', 'inherit', 'inherit'],
+})
+setInterval(() => {}, 60000)
+`,
+    )
+
+    // 1. runCommand aborts the entire process group (-pid) when triggered.
+    const runRes = await runCommand(
+      [process.execPath, parentScript, gcMarker],
+      10_000,
+      { abortOnStderr: /GC_READY/ },
+    )
+    assert.equal(runRes.abortedBy, 'stderr')
+    assert.equal(readFileSync(gcMarker, 'utf8'), 'sigterm')
+
+    // 2. spawnAcp.terminate() signals the entire process group (-pid).
+    const acpMarker = join(root, 'acp-grandchild.terminated')
+    const acpParentScript = join(root, 'acp-parent.mjs')
+    writeFileSync(
+      acpParentScript,
+      `import { spawn } from 'node:child_process'
+const gc = spawn(process.execPath, [${JSON.stringify(gcScript)}, ${JSON.stringify(acpMarker)}], {
+  stdio: ['ignore', 'inherit', 'pipe'],
+})
+gc.stderr.on('data', (chunk) => process.stdout.write(chunk))
+setInterval(() => {}, 60000)
+`,
+    )
+    const acpChild = spawnAcp([process.execPath, acpParentScript], root)
+    await new Promise((resolveReady) => {
+      acpChild.stdout.once('data', () => resolveReady())
+    })
+    const closed = new Promise((resolveClose) => {
+      acpChild.stdout.once('close', () => resolveClose())
+    })
+    acpChild.terminate()
+    await Promise.all([acpChild.exited, closed])
+    assert.equal(readFileSync(acpMarker, 'utf8'), 'sigterm')
+  },
+)
+
+test('binaryFingerprint and ModelCatalog invalidate cached contextWindows and observed on binary change', (t) => {
+  const root = isolateHome(t)
+  const binPath = join(root, 'fake-bin')
+  writeFileSync(binPath, 'v1')
+  const real = realpathSync(binPath)
+  const st = statSync(real, { bigint: true })
+  const fp1 = binaryFingerprint(binPath)
+  assert.equal(fp1, `${real}:${st.dev}:${st.ino}:${st.size}:${st.mtimeNs}`)
+  assert.equal(binaryFingerprint(join(root, 'missing-bin')), undefined)
+  assert.equal(binaryFingerprint(root), undefined)
+
+  const cachePath = join(root, 'catalog.json')
+  const catalog = new ModelCatalog(cachePath, fp1)
+  catalog.observe([
+    { id: 'model', options: [{ value: 'gemini-4-argon', name: 'Gemini 4 Argon' }] },
+  ])
+  assert.equal(catalog.observeContextWindow('gemini-4-argon', 512_000), true)
+  assert.equal(catalog.observed, true)
+
+  // Atomic save leaves no temporary files behind and persists binaryFingerprint.
+  assert.deepEqual(
+    readdirSync(root).filter((name) => name.endsWith('.tmp')),
+    [],
+  )
+  assert.equal(JSON.parse(readFileSync(cachePath, 'utf8')).binaryFingerprint, fp1)
+
+  // Reload with same fingerprint preserves contextWindows.
+  const same = new ModelCatalog(cachePath, fp1)
+  assert.equal(same.contextWindowFor('gemini-4-argon'), 512_000)
+
+  // Rewrite binary -> fingerprint changes -> reload invalidates contextWindows and observed.
+  writeFileSync(binPath, 'v2-longer-binary')
+  const fp2 = binaryFingerprint(binPath)
+  assert.notEqual(fp2, fp1)
+  const updated = new ModelCatalog(cachePath, fp2)
+  assert.equal(updated.contextWindowFor('gemini-4-argon'), undefined)
+  assert.equal(updated.observed, false)
+
+  // Live catalog syncBinaryFingerprint also clears contextWindows and observed immediately.
+  assert.equal(catalog.syncBinaryFingerprint(fp2), true)
+  assert.equal(catalog.contextWindowFor('gemini-4-argon'), undefined)
+  assert.equal(catalog.observed, false)
+  assert.equal(JSON.parse(readFileSync(cachePath, 'utf8')).binaryFingerprint, fp2)
+  assert.deepEqual(JSON.parse(readFileSync(cachePath, 'utf8')).contextWindows, {})
+})
+
+test('extractContextWindowMetadata decodes estimated_tokens_used and SQLite rejects symlinked WAL/SHM sidecars', (t) => {
+  const home = isolateHome(t)
+  const bothCtx = pbField(
+    0x0a,
+    pbField(
+      0x4a,
+      pbField(
+        0x52,
+        Uint8Array.from([0x08, 0xd2, 0x09, 0x20, 0x80, 0xa0, 0x1f]),
+      ),
+    ),
+  )
+  assert.deepEqual(extractContextWindowMetadata(bothCtx), {
+    estimatedTokensUsed: 1234,
+    maxContextTokens: 512_000,
+  })
+  const onlyEst = pbField(
+    0x0a,
+    pbField(0x4a, pbField(0x52, Uint8Array.from([0x08, 0xd2, 0x09]))),
+  )
+  assert.deepEqual(extractContextWindowMetadata(onlyEst), {
+    estimatedTokensUsed: 1234,
+  })
+  assert.equal(extractContextWindowMetadata(onlyEst)?.maxContextTokens, undefined)
+
+  const convDir = join(home, 'agy', 'conversations')
+  const outside = join(home, 'outside')
+  mkdirSync(convDir, { recursive: true })
+  mkdirSync(outside, { recursive: true })
+
+  const createDb = (name) => {
+    const db = new DatabaseSync(join(convDir, `${name}.db`))
+    db.exec('CREATE TABLE gen_metadata (idx integer PRIMARY KEY, data blob);')
+    db.prepare('INSERT INTO gen_metadata (idx, data) VALUES (?, ?)').run(1, bothCtx)
+    db.close()
+  }
+
+  createDb('good')
+  assert.deepEqual(readSessionContextMetadata(home, 'good'), {
+    estimatedTokensUsed: 1234,
+    maxContextTokens: 512_000,
+  })
+
+  createDb('sym-wal')
+  const extWal = join(outside, 'ext.db-wal')
+  writeFileSync(extWal, '')
+  symlinkSync(extWal, join(convDir, 'sym-wal.db-wal'))
+  assert.equal(readSessionContextMetadata(home, 'sym-wal'), undefined)
+  assert.equal(readSessionNextMetadataIndex(home, 'sym-wal'), null)
+
+  createDb('sym-shm')
+  const extShm = join(outside, 'ext.db-shm')
+  writeFileSync(extShm, '')
+  symlinkSync(extShm, join(convDir, 'sym-shm.db-shm'))
+  assert.equal(readSessionContextMetadata(home, 'sym-shm'), undefined)
+  assert.equal(readSessionNextMetadataIndex(home, 'sym-shm'), null)
+
+  createDb('dir-wal')
+  mkdirSync(join(convDir, 'dir-wal.db-wal'))
+  assert.equal(readSessionContextMetadata(home, 'dir-wal'), undefined)
+  assert.equal(readSessionNextMetadataIndex(home, 'dir-wal'), null)
 })
