@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.2.1](https://github.com/fdkevin0/pi-agy-acp/compare/v0.2.0...v0.2.1) (2026-11-22)
+
+
+### Features
+
+* sync agy 1.5.10+ features, dynamic catalog, and process hardening ([#34](https://github.com/fdkevin0/pi-agy-acp/issues/34)) ([44d2d36](https://github.com/fdkevin0/pi-agy-acp/commit/44d2d3690f927adacda8c37ae281714992736844)), closes [#28](https://github.com/fdkevin0/pi-agy-acp/issues/28) [#31](https://github.com/fdkevin0/pi-agy-acp/issues/31) [#32](https://github.com/fdkevin0/pi-agy-acp/issues/32)
+
+
+### Bug Fixes
+
+* encapsulate turn prompt liveness and relay lifecycle ([#33](https://github.com/fdkevin0/pi-agy-acp/issues/33)) ([#36](https://github.com/fdkevin0/pi-agy-acp/issues/36)) ([f661d8d](https://github.com/fdkevin0/pi-agy-acp/commit/f661d8d49564a83aada3617936e564f9b352eb44))
+
+
+### Miscellaneous Chores
+
+* **release:** prepare 0.2.1 ([#37](https://github.com/fdkevin0/pi-agy-acp/issues/37)) ([5ca8a16](https://github.com/fdkevin0/pi-agy-acp/commit/5ca8a164e0b40e4040401ff7455cb34c54d0b9c9))
+
 ## [0.2.0](https://github.com/fdkevin0/pi-agy-acp/compare/v0.1.4...v0.2.0) (2026-11-17)
 
 
