@@ -3439,7 +3439,7 @@ test('parking a new tool call while relaying flushes in order, restores live str
   turn.onUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'pre-park-text' } })
   const c2 = turn.park('bash', { command: 'status' })
   assert.equal(turn.isRelaying, false)
-  assert.equal(turn.unretrievedRelays.has(c1.id), true)
+  assert.deepEqual(turn.unretrievedRelayIds, [c1.id])
 
   const step2 = await collect(pumpStep(turn, {
     parkSettleMs: 0, maxContinuations: 0,
@@ -3470,7 +3470,7 @@ test('parking a new tool call while relaying flushes in order, restores live str
     `${largeLiveReply}\n\n[Antigravity ended the turn without retrieving the result of long-running tool call(s) ${c1.id}; this reply may not reflect that result.]`,
   )
   assert.equal(finishOf(step3).reason.kind, 'stop')
-  assert.equal(turn.unretrievedRelays.size, 0)
+  assert.deepEqual(turn.unretrievedRelayIds, [])
 })
 
 test('partial parallel relay delivery releases buffering, attaches deferred suffix and one-time completion hint, and finishes max_tokens without leading blank lines', async () => {
@@ -3486,22 +3486,22 @@ test('partial parallel relay delivery releases buffering, attaches deferred suff
   assert.equal(turn.isRelaying, true)
 
   turn.pushPendingSuffix('<user>\nsteer-msg\n</user>')
-  turn.noteCallResolved(c1.id)
-  turn.noteCallResolved(c2.id)
-  const delivered = turn.finalizeDeliveredResult(c1.id, {
+  turn.resolveCall(c1, { content: [{ type: 'text', text: 'res-a' }] })
+  turn.resolveCall(c2, { content: [{ type: 'text', text: 'res-b' }] })
+  const delivered = turn.deliverCallResult(c1.id, {
     content: [{ type: 'text', text: 'res-a' }],
   })
   assert.equal(turn.isRelaying, false)
-  assert.equal(turn.unretrievedRelays.has(c2.id), true)
+  assert.deepEqual(turn.unretrievedRelayIds, [c2.id])
   assert.equal(delivered.content.length, 2)
   assert.match(delivered.content[1].text, /steer-msg/)
   assert.match(
     delivered.content[1].text,
-    new RegExp(`tool call ${c2.id} \\(bash\\) has completed; call mcp_pi_pi_await_result with \\{"call_id":"${c2.id}"\\}`),
+    new RegExp(`<harness_relay_update>\\n\\[tool completed: ${c2.id} \\(bash\\) — call mcp_pi_pi_await_result with \\{"call_id":"${c2.id}"\\} to read its result\\]\\n</harness_relay_update>`),
   )
 
   // A second delivery does not repeat the already-announced completion hint or suffix.
-  const secondDelivered = turn.finalizeDeliveredResult(c1.id, {
+  const secondDelivered = turn.deliverCallResult(c1.id, {
     content: [{ type: 'text', text: 'res-a' }],
   })
   assert.deepEqual(secondDelivered, { content: [{ type: 'text', text: 'res-a' }] })
@@ -3593,7 +3593,7 @@ test('moving on to a new tool call after relay streams later steps live, preserv
   assert.match(finalText, /steering-note/)
   assert.match(
     finalText,
-    new RegExp(`tool call ${call1.id} \\(bash\\) has completed; call mcp_pi_pi_await_result`),
+    new RegExp(`<harness_relay_update>\\n\\[tool completed: ${call1.id} \\(bash\\) — call mcp_pi_pi_await_result`),
   )
   assert.match(
     finalText,

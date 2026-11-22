@@ -284,7 +284,9 @@ async function runToolCall(s, name, args, opts = {}) {
   }
   if (opts.followCompletedNote) {
     const completed =
-      /has completed; call [^\s]+ with \{"call_id":"([^"]+)"\}/.exec(text)
+      /<harness_relay_update>[\s\S]*pi_await_result with \{"call_id":"([^"]+)"\}/.exec(
+        text,
+      )
     if (completed !== null) {
       const awaited = await runToolCall(s, 'pi_await_result', {
         call_id: completed[1],

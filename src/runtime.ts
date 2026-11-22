@@ -1502,8 +1502,7 @@ export class AntigravityRuntime {
         message.content,
         message.isError === true,
       )
-      turn.noteCallResolved(call.id)
-      call.result.resolve(result)
+      turn.resolveCall(call, result)
     }
     return turn
   }
@@ -1667,7 +1666,7 @@ export class AntigravityRuntime {
       }
       if (outcome === 'aborted')
         return toolError('The tool call was cancelled.')
-      return turn.finalizeDeliveredResult(call.id, outcome)
+      return turn.deliverCallResult(call.id, outcome)
     } finally {
       if (timer !== undefined) clearTimeout(timer)
       if (onAbort !== undefined) signal.removeEventListener('abort', onAbort)
