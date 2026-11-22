@@ -37,8 +37,6 @@ import {
   AWAIT_TOOL_NAME,
   CALL_TOOL,
   pumpStep,
-  relayNotice,
-  type ParkedCall,
   type ReportedToolCall,
   structuredToolMeta,
   recordReportedToolCall,
@@ -1293,16 +1291,11 @@ export class AntigravityRuntime {
       const model = conv.model
       const modelFloor = conv.metaFloorIdx
       turn.metaFloorIdx = this.nextTurnMetadataFloor(sessionId, modelFloor)
-      turn.promptSettled = proc.prompt(sessionId, blocks).then(
-        (result) => {
-          this.observeSessionContextWindow(sessionId, model, modelFloor, turn)
-          turn.events.push({ kind: 'done', result })
-        },
-        (error: unknown) => {
-          this.observeSessionContextWindow(sessionId, model, modelFloor, turn)
-          turn.fail(mapError(error))
-        },
-      )
+      turn.bindPrompt(proc.prompt(sessionId, blocks), {
+        onSettled: () =>
+          this.observeSessionContextWindow(sessionId, model, modelFloor, turn),
+        mapError,
+      })
     } catch (error) {
       turn.fail(mapError(error))
     }
@@ -1471,14 +1464,18 @@ export class AntigravityRuntime {
     const extraText = extras.length > 0 ? renderTranscript(extras) : ''
     const toolDelta = consumeToolDelta(conv, tools)
     const suffix = [toolDelta, extraText].filter(Boolean).join('\n\n')
-    const pending = [...turn.pendingCalls.values()]
-    turn.pendingCalls.clear()
-    if (turn.finished || !this.isTurnLive(turn)) {
-      const carried = turn.consumePendingSuffix()
-      const combinedSuffix = [carried, suffix].filter(Boolean).join('\n\n')
+    const bridgeResults = new Map<string, BridgeToolResult>()
+    for (const [id, message] of results) {
+      bridgeResults.set(
+        id,
+        this.toBridgeResult(message.content, message.isError === true),
+      )
+    }
+    const delivery = turn.deliverToolResults(bridgeResults, suffix)
+    if (!delivery.resumed) {
       // The agent ended its turn while the harness ran the tools: hand the results over as new input.
       const transcript = renderTranscript(
-        pending.map((call) => results.get(call.id) as RequestMessage),
+        delivery.pending.map((call) => results.get(call.id) as RequestMessage),
       )
       // The old turn is over: its reported identities do not carry into the continuation.
       turn.abandon('The agent ended the tool-waiting prompt.')
@@ -1487,29 +1484,12 @@ export class AntigravityRuntime {
       this.startPrompt(conv, next, proc, [
         {
           type: 'text',
-          text: `${transcript}${combinedSuffix ? `\n\n${combinedSuffix}` : ''}\n\nContinue the task with these tool results.`,
+          text: `${transcript}${delivery.suffix ? `\n\n${delivery.suffix}` : ''}\n\nContinue the task with these tool results.`,
         },
       ])
       return next
     }
-    if (suffix.length > 0) turn.pushPendingSuffix(suffix)
-    for (const call of pending) {
-      const message = results.get(call.id) as Extract<
-        RequestMessage,
-        { role: 'tool' }
-      >
-      const result = this.toBridgeResult(
-        message.content,
-        message.isError === true,
-      )
-      turn.resolveCall(call, result)
-    }
     return turn
-  }
-
-  private isTurnLive(turn: AcpTurn): boolean {
-    const head = turn.events.peek()
-    return head?.kind !== 'done' && head?.kind !== 'error'
   }
 
   private toBridgeResult(
@@ -1603,16 +1583,19 @@ export class AntigravityRuntime {
     const turn = conv.turn
     if (turn === undefined || turn.finished)
       return toolError('No harness turn is waiting for this tool call.')
+    const relayAfterMs =
+      this.host.relayAfterMs ??
+      this.host.config.relayAfterMs ??
+      defaults.relayAfterMs
     if (request.name === AWAIT_TOOL_NAME) {
       const callId =
         typeof request.arguments.call_id === 'string'
           ? request.arguments.call_id
           : ''
-      const call = turn.calls.get(callId)
-      if (call === undefined)
-        return toolError(`Unknown harness call id ${callId}.`)
-      turn.resumeRelay(callId)
-      return this.awaitCall(turn, call, request.signal)
+      return (
+        turn.awaitRelayedCall(callId, relayAfterMs, request.signal) ??
+        toolError(`Unknown harness call id ${callId}.`)
+      )
     }
     let name = request.name
     let args = request.arguments
@@ -1634,43 +1617,7 @@ export class AntigravityRuntime {
     }
     if (!conv.toolNames.has(name))
       return toolError(`The harness has no tool named ${name}.`)
-    return this.awaitCall(turn, turn.park(name, args), request.signal)
-  }
-
-  private async awaitCall(
-    turn: AcpTurn,
-    call: ParkedCall,
-    signal: AbortSignal,
-  ): Promise<BridgeToolResult> {
-    let timer: ReturnType<typeof setTimeout> | undefined
-    const relayAfterMs =
-      this.host.relayAfterMs ??
-      this.host.config.relayAfterMs ??
-      defaults.relayAfterMs
-    const relay = new Promise<'relay'>((resolve) => {
-      timer = setTimeout(() => resolve('relay'), relayAfterMs)
-    })
-    let onAbort: (() => void) | undefined
-    const aborted = new Promise<'aborted'>((resolve) => {
-      if (signal.aborted) resolve('aborted')
-      else {
-        onAbort = () => resolve('aborted')
-        signal.addEventListener('abort', onAbort, { once: true })
-      }
-    })
-    try {
-      const outcome = await Promise.race([call.result.promise, relay, aborted])
-      if (outcome === 'relay') {
-        turn.markRelayed(call.id)
-        return relayNotice(call)
-      }
-      if (outcome === 'aborted')
-        return toolError('The tool call was cancelled.')
-      return turn.deliverCallResult(call.id, outcome)
-    } finally {
-      if (timer !== undefined) clearTimeout(timer)
-      if (onAbort !== undefined) signal.removeEventListener('abort', onAbort)
-    }
+    return turn.invokeTool(name, args, relayAfterMs, request.signal)
   }
 
   private sweep(): void {

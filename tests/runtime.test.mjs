@@ -3439,7 +3439,6 @@ test('parking a new tool call while relaying flushes in order, restores live str
   turn.onUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'pre-park-text' } })
   const c2 = turn.park('bash', { command: 'status' })
   assert.equal(turn.isRelaying, false)
-  assert.deepEqual(turn.unretrievedRelayIds, [c1.id])
 
   const step2 = await collect(pumpStep(turn, {
     parkSettleMs: 0, maxContinuations: 0,
@@ -3470,29 +3469,36 @@ test('parking a new tool call while relaying flushes in order, restores live str
     `${largeLiveReply}\n\n[Antigravity ended the turn without retrieving the result of long-running tool call(s) ${c1.id}; this reply may not reflect that result.]`,
   )
   assert.equal(finishOf(step3).reason.kind, 'stop')
-  assert.deepEqual(turn.unretrievedRelayIds, [])
 })
 
 test('partial parallel relay delivery releases buffering, attaches deferred suffix and one-time completion hint, and finishes max_tokens without leading blank lines', async () => {
   const turn = new AcpTurn('relay-partial-parallel')
+  const prompt = deferred()
+  turn.bindPrompt(prompt.promise)
+  const controller = new AbortController()
   const c1 = turn.park('bash', { command: 'a' })
   const c2 = turn.park('bash', { command: 'b' })
-  turn.events.shift()
-  turn.events.shift()
+  const step1 = await collect(pumpStep(turn, {
+    parkSettleMs: 0, maxContinuations: 0,
+    continuePrompt: async () => ({ stopReason: 'end_turn' }), cancel() {},
+  }, undefined))
+  assert.deepEqual(callsOf(step1).map((c) => c.id), [c1.id, c2.id])
   turn.markRelayed(c1.id)
   turn.markRelayed(c2.id)
   turn.onUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'while-waiting ' } })
-  turn.resumeRelay(c1.id)
+  const awaitedC1 = turn.awaitRelayedCall(c1.id, 60_000, controller.signal)
   assert.equal(turn.isRelaying, true)
 
-  turn.pushPendingSuffix('<user>\nsteer-msg\n</user>')
-  turn.resolveCall(c1, { content: [{ type: 'text', text: 'res-a' }] })
-  turn.resolveCall(c2, { content: [{ type: 'text', text: 'res-b' }] })
-  const delivered = turn.deliverCallResult(c1.id, {
-    content: [{ type: 'text', text: 'res-a' }],
-  })
+  const delivery = turn.deliverToolResults(
+    new Map([
+      [c1.id, { content: [{ type: 'text', text: 'res-a' }] }],
+      [c2.id, { content: [{ type: 'text', text: 'res-b' }] }],
+    ]),
+    '<user>\nsteer-msg\n</user>',
+  )
+  assert.equal(delivery.resumed, true)
+  const delivered = await awaitedC1
   assert.equal(turn.isRelaying, false)
-  assert.deepEqual(turn.unretrievedRelayIds, [c2.id])
   assert.equal(delivered.content.length, 2)
   assert.match(delivered.content[1].text, /steer-msg/)
   assert.match(
@@ -3500,16 +3506,15 @@ test('partial parallel relay delivery releases buffering, attaches deferred suff
     new RegExp(`<harness_relay_update>\\n\\[tool completed: ${c2.id} \\(bash\\) — call mcp_pi_pi_await_result with \\{"call_id":"${c2.id}"\\} to read its result\\]\\n</harness_relay_update>`),
   )
 
-  // A second delivery does not repeat the already-announced completion hint or suffix.
-  const secondDelivered = turn.deliverCallResult(c1.id, {
-    content: [{ type: 'text', text: 'res-a' }],
-  })
+  // A repeated pi_await_result for c1 does not duplicate the one-time suffix or completion hint.
+  const secondDelivered = await turn.awaitRelayedCall(c1.id, 60_000, controller.signal)
   assert.deepEqual(secondDelivered, { content: [{ type: 'text', text: 'res-a' }] })
 
-  // Flush the earlier buffered text in a reasoning-only max_tokens turn to verify note spacing.
+  // Drop the earlier buffered text to verify reasoning-only max_tokens omits leading blank lines.
   turn.events.shift()
   turn.onUpdate({ sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'only-thinking' } })
-  turn.events.push({ kind: 'done', result: { stopReason: 'max_tokens' } })
+  prompt.resolve({ stopReason: 'max_tokens' })
+  await turn.promptSettled
   const finalStep = await collect(pumpStep(turn, {
     parkSettleMs: 0, maxContinuations: 0,
     continuePrompt: async () => ({ stopReason: 'end_turn' }), cancel() {},
@@ -3692,6 +3697,53 @@ test('immediate end_turn while Pi is still running a relayed call recovers via f
   )
   assert.equal(prompts().length, 2)
   assert.match(prompts()[1].text, new RegExp(`<tool_result id="${call1.id}">[\\s\\S]*late-real-result`))
+  assert.match(prompts()[1].text, /Continue the task with these tool results\./)
+  assert.equal(finishOf(step2).reason.kind, 'stop')
+  assert.equal(adapter.status().lastTurn.outcome, 'completed')
+})
+
+test('double relay ending before Pi finishes skips zombie queued call and delivers original result via continuation prompt', async (t) => {
+  const { adapter, runtime, prompts } = makeRuntime(t, {
+    config: { parkSettleMs: 0 },
+    host: { relayAfterMs: 20 },
+  })
+  const base = {
+    provider: 'antigravity',
+    model: 'gemini-4-argon',
+    sessionId: 'S-RELAY-ZOMBIE-CALL',
+    tools: [bash],
+  }
+  const prompt = [
+    'NO_AWAIT_CALL bash {"command":"long-job"}',
+    'NO_AWAIT_CALL bash {"command":"zombie-status"}',
+  ].join('\n')
+  const step1 = await collect(
+    adapter.stream({ ...base, messages: [sys, user('u1', prompt)] }),
+  )
+  const [call1] = callsOf(step1)
+  const conv = runtime.conversations.get('S-RELAY-ZOMBIE-CALL')
+  // Wait until both calls relay and the ACP prompt settles while Pi is still running call1.
+  await conv.turn.promptSettled
+  assert.equal(conv.turn.events.peek()?.kind, 'park')
+  assert.equal(conv.turn.isPromptActive, false)
+
+  const step2 = await collect(
+    adapter.stream({
+      ...base,
+      messages: [
+        sys,
+        user('u1', prompt),
+        assistantFrom('a1', step1),
+        tool('t1', call1.id, 'real-call1-result'),
+      ],
+    }),
+  )
+  assert.deepEqual(callsOf(step2), [])
+  assert.equal(prompts().length, 2)
+  assert.match(
+    prompts()[1].text,
+    new RegExp(`<tool_result id="${call1.id}">[\\s\\S]*real-call1-result`),
+  )
   assert.match(prompts()[1].text, /Continue the task with these tool results\./)
   assert.equal(finishOf(step2).reason.kind, 'stop')
   assert.equal(adapter.status().lastTurn.outcome, 'completed')
