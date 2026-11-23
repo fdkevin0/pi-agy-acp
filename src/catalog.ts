@@ -172,24 +172,15 @@ export class ModelCatalog {
    * @returns whether cached context windows were invalidated.
    */
   syncBinaryFingerprint(fingerprint: string | undefined): boolean {
-    if (!fingerprint) return false
-    if (this.currentFingerprint === fingerprint) return false
-    const matchesObserved = this.observedFingerprint === fingerprint
-    const hadContextWindows = this.contextWindows.size > 0
-    const hadState =
-      this.currentFingerprint !== undefined ||
-      this.observedFingerprint !== undefined ||
-      hadContextWindows ||
-      this.observed
+    if (!fingerprint || this.currentFingerprint === fingerprint) return false
     this.currentFingerprint = fingerprint
-    if (hadState && !matchesObserved) {
-      this.contextWindows.clear()
-      this.observed = false
-      // Persist cleared contextWindows while keeping observedFingerprint intact until live ACP re-observes.
-      if (hadContextWindows) this.save()
-      return hadContextWindows
-    }
-    return false
+    if (this.observedFingerprint === fingerprint) return false
+    const hadContextWindows = this.contextWindows.size > 0
+    this.contextWindows.clear()
+    this.observed = false
+    // Persist cleared contextWindows while keeping observedFingerprint intact until live ACP re-observes.
+    if (hadContextWindows) this.save()
+    return hadContextWindows
   }
 
   /**

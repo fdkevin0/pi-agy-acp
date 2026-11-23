@@ -282,6 +282,7 @@ export class AntigravityRuntime {
     ) {
       const canRestart =
         this.starting === undefined &&
+        this.warmupPromise === undefined &&
         this.activeStreams === 0 &&
         [...this.conversations.values()].every((c) => this.isIdle(c))
       if (!canRestart) {
@@ -547,14 +548,18 @@ export class AntigravityRuntime {
       try {
         proc = await this.ensureReady()
         this.assertOwner(proc)
-        const result = await proc.newSession(
-          {
-            cwd: this.preflight?.workspace ?? this.home,
-            mcpServers: [],
-          },
-          { onUpdate: () => undefined },
-          120_000,
-        )
+        const result = await proc
+          .newSession(
+            {
+              cwd: this.preflight?.workspace ?? this.home,
+              mcpServers: [],
+            },
+            { onUpdate: () => undefined },
+            120_000,
+          )
+          .catch((error: unknown) => {
+            throw mapError(error)
+          })
         try {
           this.assertOwner(proc)
           if (
@@ -607,8 +612,7 @@ export class AntigravityRuntime {
     this.shutdown.abort(
       new LlmError('Antigravity provider was disposed', 'TRANSPORT'),
     )
-    if (this.sweeper !== undefined) clearInterval(this.sweeper)
-    this.sweeper = undefined
+    this.stopSweeper()
     for (const conv of this.conversations.values()) {
       conv.turn?.abandon('The harness provider was unloaded.')
       this.clearSession(conv)
@@ -936,8 +940,7 @@ export class AntigravityRuntime {
       if (this.lifecycle !== 'active') throw this.shutdown.signal.reason
       await this.bridge.close()
       this.assertActive()
-      if (this.sweeper !== undefined) clearInterval(this.sweeper)
-      this.sweeper = undefined
+      this.stopSweeper()
       this.state = 'error'
       this.lastError = error instanceof Error ? error.message : String(error)
       throw mapError(error)
@@ -978,10 +981,7 @@ export class AntigravityRuntime {
   private onProcessExit(proc: AcpProcess, error: Error): void {
     const current = this.process === proc
     if (current) {
-      if (this.sweeper !== undefined) {
-        clearInterval(this.sweeper)
-        this.sweeper = undefined
-      }
+      this.stopSweeper()
       this.process = undefined
       this.processFingerprint = undefined
       this.processIdleMs = 0
@@ -1816,6 +1816,13 @@ export class AntigravityRuntime {
     )
   }
 
+  private stopSweeper(): void {
+    if (this.sweeper !== undefined) {
+      clearInterval(this.sweeper)
+      this.sweeper = undefined
+    }
+  }
+
   private hasLiveConversations(): boolean {
     for (const conv of this.conversations.values()) {
       if (conv.sessionId !== undefined || !this.isIdle(conv)) return true
@@ -1823,22 +1830,9 @@ export class AntigravityRuntime {
     return false
   }
 
-  private canStopIdleProcess(
-    options: { ignoreWarmup?: boolean } = {},
-  ): boolean {
-    if (this.lifecycle !== 'active') return false
-    if (this.starting !== undefined) return false
-    if (this.activeStreams > 0) return false
-    if (!options.ignoreWarmup && this.warmupPromise !== undefined) return false
-    return !this.hasLiveConversations()
-  }
-
   private detachProcess(proc: AcpProcess): void {
     if (this.process !== proc) return
-    if (this.sweeper !== undefined) {
-      clearInterval(this.sweeper)
-      this.sweeper = undefined
-    }
+    this.stopSweeper()
     this.process = undefined
     this.processFingerprint = undefined
     this.processIdleMs = 0
@@ -1850,7 +1844,16 @@ export class AntigravityRuntime {
     proc: AcpProcess,
     options: { ignoreWarmup?: boolean } = {},
   ): Promise<void> {
-    if (this.process !== proc || !this.canStopIdleProcess(options)) return
+    if (
+      this.process !== proc ||
+      this.lifecycle !== 'active' ||
+      this.starting !== undefined ||
+      this.activeStreams > 0 ||
+      (!options.ignoreWarmup && this.warmupPromise !== undefined) ||
+      this.hasLiveConversations()
+    ) {
+      return
+    }
     this.detachProcess(proc)
     await this.bridge.close()
   }

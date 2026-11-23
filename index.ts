@@ -310,6 +310,22 @@ export default function (
       }
     }
   }
+  const withLoader = <T>(
+    ctx: ExtensionContext,
+    label: string,
+    cancelled: T,
+    run: (signal?: AbortSignal) => Promise<T>,
+  ): Promise<T> =>
+    ctx.mode === 'tui' && typeof ctx.ui.custom === 'function'
+      ? ctx.ui.custom<T>((tui, theme, _kb, done) => {
+          const loader = new BorderedLoader(tui, theme, label)
+          loader.onAbort = () => done(cancelled)
+          void run(loader.signal).then((result) => {
+            if (!loader.signal.aborted) done(result)
+          })
+          return loader
+        })
+      : run()
   pi.registerCommand('agy-acp', {
     description: 'Antigravity ACP status, quota, refresh, or reset',
     getArgumentCompletions: (prefix) => {
@@ -335,21 +351,12 @@ export default function (
           ? asQuotaDisplay(tokens[1])
           : undefined
       if (command === 'refresh' && tokens.length === 1) {
-        const outcome =
-          ctx.mode === 'tui' && typeof ctx.ui.custom === 'function'
-            ? await ctx.ui.custom<RefreshOutcome>((tui, theme, _kb, done) => {
-                const loader = new BorderedLoader(
-                  tui,
-                  theme,
-                  'Refreshing Antigravity models...',
-                )
-                loader.onAbort = () => done({ status: 'cancelled' })
-                void refreshModelsSafe(loader.signal).then((result) => {
-                  if (!loader.signal.aborted) done(result)
-                })
-                return loader
-              })
-            : await refreshModelsSafe()
+        const outcome = await withLoader<RefreshOutcome>(
+          ctx,
+          'Refreshing Antigravity models...',
+          { status: 'cancelled' },
+          refreshModelsSafe,
+        )
         if (shutDown) return
         if (outcome.status === 'cancelled') {
           ctx.ui.notify('Model refresh cancelled', 'info')
@@ -393,24 +400,13 @@ export default function (
       let snapshot: QuotaSnapshot | null = null
       const epoch = uiEpoch
       if (command === 'quota') {
-        snapshot =
-          ctx.mode === 'tui' && typeof ctx.ui.custom === 'function'
-            ? await ctx.ui.custom<QuotaSnapshot | null>(
-                (tui, theme, _kb, done) => {
-                  const loader = new BorderedLoader(
-                    tui,
-                    theme,
-                    'Fetching Antigravity quota...',
-                  )
-                  loader.onAbort = () => done(null)
-                  // readQuotaSafe converts runtime errors into snapshots so loaders always close cleanly.
-                  void readQuotaSafe().then((result) => {
-                    if (!loader.signal.aborted) done(result)
-                  })
-                  return loader
-                },
-              )
-            : await readQuotaSafe()
+        // readQuotaSafe converts runtime errors into snapshots so loaders always close cleanly.
+        snapshot = await withLoader<QuotaSnapshot | null>(
+          ctx,
+          'Fetching Antigravity quota...',
+          null,
+          () => readQuotaSafe(),
+        )
         if (shutDown) return
         if (snapshot === null) {
           if (epoch === uiEpoch) updateStatus(ctx, activeRuntime?.quota.peek())
