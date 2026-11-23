@@ -33,7 +33,7 @@ export interface Config {
   defaultEffort: Effort
   /** Maximum concurrent ACP sessions kept alive across conversations, subagents, and auxiliary calls. */
   maxLiveSessions: number
-  /** Idle time after which an inactive ACP session is closed. */
+  /** Idle time after which inactive ACP sessions and an otherwise idle ACP process are closed. */
   idleSessionTtlMs: number
   /** Window that groups parallel tool calls into one Pi step. */
   parkSettleMs: number

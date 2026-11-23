@@ -618,9 +618,14 @@ test('provider registration is lazy, refresh respects context, and catalog chang
     assert.equal(lightReset.mock.callCount(), 2)
     assert.deepEqual(
       command.getArgumentCompletions(''),
-      ['status', 'quota', 'quota used', 'quota remaining', 'reset'].map(
-        (value) => ({ value, label: value }),
-      ),
+      [
+        'status',
+        'quota',
+        'quota used',
+        'quota remaining',
+        'refresh',
+        'reset',
+      ].map((value) => ({ value, label: value })),
     )
     assert.deepEqual(
       command.getArgumentCompletions(' q'),
@@ -1123,7 +1128,7 @@ test('commands route formatted notices and reject unknown arguments without quer
     assert.equal(notice.level, 'info')
     await command.handler('unknown', ctx)
     assert.deepEqual(notice, {
-      text: 'Usage: /agy-acp [status|quota [used|remaining]|reset]',
+      text: 'Usage: /agy-acp [status|quota [used|remaining]|refresh|reset]',
       level: 'warning',
     })
     assert.equal(read.mock.callCount(), 0)
@@ -1857,24 +1862,78 @@ test('binaryFingerprint and ModelCatalog invalidate cached contextWindows and ob
   )
   assert.equal(JSON.parse(readFileSync(cachePath, 'utf8')).binaryFingerprint, fp1)
 
-  // Reload with same fingerprint preserves contextWindows.
+  // Reload with same fingerprint preserves contextWindows and marks cache fresh.
   const same = new ModelCatalog(cachePath, fp1)
   assert.equal(same.contextWindowFor('gemini-4-argon'), 512_000)
+  assert.equal(same.hasFreshCache(), true)
+  assert.equal(same.isCurrent(), true)
+  assert.equal(same.observed, false)
 
-  // Rewrite binary -> fingerprint changes -> reload invalidates contextWindows and observed.
+  // Rewrite binary -> fingerprint changes -> reload invalidates contextWindows and cache freshness.
   writeFileSync(binPath, 'v2-longer-binary')
   const fp2 = binaryFingerprint(binPath)
   assert.notEqual(fp2, fp1)
   const updated = new ModelCatalog(cachePath, fp2)
   assert.equal(updated.contextWindowFor('gemini-4-argon'), undefined)
   assert.equal(updated.observed, false)
+  assert.equal(updated.hasFreshCache(), false)
+  assert.equal(updated.isCurrent(), false)
 
-  // Live catalog syncBinaryFingerprint also clears contextWindows and observed immediately.
+  // Image capability write before live model observation must not stamp fp2 onto stale models.
+  assert.equal(updated.observeImageSupport(false), true)
+  assert.equal(JSON.parse(readFileSync(cachePath, 'utf8')).binaryFingerprint, fp1)
+  assert.equal(updated.hasFreshCache(), false)
+
+  // Live catalog syncBinaryFingerprint clears contextWindows and observed without forging fp2.
   assert.equal(catalog.syncBinaryFingerprint(fp2), true)
   assert.equal(catalog.contextWindowFor('gemini-4-argon'), undefined)
   assert.equal(catalog.observed, false)
-  assert.equal(JSON.parse(readFileSync(cachePath, 'utf8')).binaryFingerprint, fp2)
+  assert.equal(catalog.hasFreshCache(), false)
+  assert.equal(catalog.isCurrent(), false)
+  assert.equal(JSON.parse(readFileSync(cachePath, 'utf8')).binaryFingerprint, fp1)
   assert.deepEqual(JSON.parse(readFileSync(cachePath, 'utf8')).contextWindows, {})
+
+  // Re-observing live models on fp2 advances persisted provenance and restores freshness.
+  catalog.observe([
+    { id: 'model', options: [{ value: 'gemini-4-argon', name: 'Gemini 4 Argon' }] },
+  ])
+  assert.equal(JSON.parse(readFileSync(cachePath, 'utf8')).binaryFingerprint, fp2)
+  assert.equal(catalog.hasFreshCache(), true)
+  assert.equal(catalog.isCurrent(), true)
+
+  // Legacy cache without binaryFingerprint and tier-only cache without models are not fresh.
+  const legacyPath = join(root, 'legacy-catalog.json')
+  writeFileSync(
+    legacyPath,
+    JSON.stringify({ models: [{ id: 'gemini-4-argon', name: 'Gemini 4 Argon' }] }),
+  )
+  const legacy = new ModelCatalog(legacyPath, fp2)
+  assert.equal(legacy.hasFreshCache(), false)
+  assert.equal(legacy.isCurrent(), false)
+
+  const tierOnlyPath = join(root, 'tier-only-catalog.json')
+  writeFileSync(
+    tierOnlyPath,
+    JSON.stringify({ tier: { name: 'Google AI Pro' }, binaryFingerprint: fp2 }),
+  )
+  const tierOnly = new ModelCatalog(tierOnlyPath, fp2)
+  assert.equal(tierOnly.hasFreshCache(), false)
+  assert.equal(tierOnly.isCurrent(), false)
+
+  // Resolving the same binary after constructing with undefined fingerprint keeps cached contextWindows.
+  const delayedPath = join(root, 'delayed-fp-catalog.json')
+  writeFileSync(
+    delayedPath,
+    JSON.stringify({
+      models: [{ id: 'gemini-4-argon', name: 'Gemini 4 Argon' }],
+      contextWindows: { 'gemini-4-argon': 512_000 },
+      binaryFingerprint: fp2,
+    }),
+  )
+  const delayed = new ModelCatalog(delayedPath)
+  assert.equal(delayed.syncBinaryFingerprint(fp2), false)
+  assert.equal(delayed.contextWindowFor('gemini-4-argon'), 512_000)
+  assert.equal(delayed.hasFreshCache(), true)
 })
 
 test('extractContextWindowMetadata decodes estimated_tokens_used and SQLite rejects symlinked WAL/SHM sidecars', (t) => {

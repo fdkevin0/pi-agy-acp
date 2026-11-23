@@ -5189,3 +5189,328 @@ test('accountInfo caches logged email across status calls for 10s monotonic TTL 
   utimesSync(rotated2, new Date(Date.now() + 60_000), new Date(Date.now() + 60_000))
   assert.equal(runtime.status().account?.email, 'fourth@example.com')
 })
+
+test('standalone warmup stops its temporary process after discovery and warm disk cache skips spawning entirely', async (t) => {
+  const { home, runtime, inits, mcps } = makeRuntime(t)
+
+  // Cold start discovers once and tears down the temporary front and bridge immediately.
+  await runtime.warmup()
+  assert.equal(inits().length, 1)
+  assert.equal(mcps().length, 1)
+  assert.equal(runtime.status().state, 'idle')
+  assert.equal(runtime.process, undefined)
+  assert.equal(runtime.bridge.server, undefined)
+  assert.equal(runtime.sweeper, undefined)
+  assert.ok(runtime.catalog.list().length > 0)
+
+  // Fresh runtime reusing the same home with matching binaryFingerprint spawns nothing on warmup().
+  let spawnCalls = 0
+  let commandCalls = 0
+  const second = new AntigravityRuntime({
+    config: { ...defaults, command: fake, home },
+    spawnAcp: () => {
+      spawnCalls++
+      throw new Error('unexpected spawn on warm cache')
+    },
+    runCommand: async () => {
+      commandCalls++
+      return { code: 0, stdout: '{}', stderr: '' }
+    },
+    log: { info: () => undefined, warn: () => undefined },
+    onModelsChanged: () => undefined,
+  })
+  t.after(() => second.dispose())
+  assert.equal(second.catalog.hasFreshCache(), true)
+  await second.warmup()
+  assert.equal(spawnCalls, 0)
+  assert.equal(commandCalls, 0)
+  assert.equal(second.status().state, 'idle')
+  assert.equal(second.process, undefined)
+  assert.equal(second.bridge.server, undefined)
+})
+
+test('stream arriving during standalone warmup adopts the front instead of tearing it down', async (t) => {
+  const gate = deferred()
+  const entered = deferred()
+  const configOptions = [
+    {
+      id: 'model',
+      options: [{ value: 'gemini-4-argon', name: 'Gemini 4 Argon' }],
+    },
+    { id: 'thought_level', options: [{ value: 'high' }] },
+  ]
+  const availableModels = [{ modelId: 'gemini-4-argon-high' }]
+  let spawns = 0
+  const { runtime } = makeRuntime(t, {
+    host: {
+      spawnAcp: () => {
+        spawns++
+        const stdout = new PassThrough()
+        const exited = Promise.withResolvers()
+        const sessionNewHandlers = [
+          async () => {
+            entered.resolve()
+            await gate.promise
+            return {
+              sessionId: 's-disc',
+              configOptions,
+              models: { availableModels },
+            }
+          },
+          async () => ({
+            sessionId: 's-live',
+            configOptions,
+            models: { availableModels },
+          }),
+        ]
+        const handlers = {
+          initialize: async () => ({
+            protocolVersion: 1,
+            agentInfo: { name: 'Fake ACP', version: '1.5.14' },
+            agentCapabilities: { promptCapabilities: { image: true } },
+          }),
+          'session/new': () => sessionNewHandlers.shift()(),
+          'session/set_config_option': async () => ({ configOptions }),
+          'session/prompt': async (params) => {
+            stdout.write(
+              `${JSON.stringify({
+                jsonrpc: '2.0',
+                method: 'session/update',
+                params: {
+                  sessionId: params.sessionId,
+                  update: {
+                    sessionUpdate: 'agent_message_chunk',
+                    content: { type: 'text', text: 'adopted' },
+                  },
+                },
+              })}\n`,
+            )
+            return { stopReason: 'end_turn' }
+          },
+          'session/close': async () => ({}),
+        }
+        return {
+          stdout,
+          exited: exited.promise,
+          stderrTail: () => '',
+          terminate: () => exited.resolve({ code: 0, signal: null }),
+          stdin: new Writable({
+            write(data, _encoding, done) {
+              const req = JSON.parse(data)
+              void handlers[req.method](req.params).then((result) => {
+                stdout.write(
+                  `${JSON.stringify({ jsonrpc: '2.0', id: req.id, result })}\n`,
+                )
+              })
+              done()
+            },
+          }),
+        }
+      },
+    },
+  })
+
+  const warming = runtime.warmup()
+  await entered.promise
+  const streaming = collect(
+    runtime.stream({
+      model: 'gemini-4-argon',
+      sessionId: 'ADOPT',
+      messages: [sys, user('u1', 'hello')],
+    }),
+  )
+  gate.resolve()
+  const [, chunks] = await Promise.all([warming, streaming])
+  assert.equal(finishOf(chunks).reason.kind, 'stop')
+  assert.equal(textOf(chunks), 'adopted')
+  assert.equal(spawns, 1)
+  assert.equal(runtime.status().state, 'ready')
+  assert.equal(runtime.process?.alive, true)
+  assert.equal(runtime.status().liveSessions, 1)
+})
+
+test('readQuota discovers missing tier once on a warm model cache and stops the temporary front', async (t) => {
+  const { home, runtime: seed } = makeRuntime(t)
+  await seed.warmup()
+  const cached = JSON.parse(readFileSync(join(home, 'catalog.json'), 'utf8'))
+  delete cached.tier
+  writeFileSync(join(home, 'catalog.json'), `${JSON.stringify(cached)}\n`)
+
+  const commandReplies = {
+    '--version': 'fake-agy 0.0.1',
+    '-p': JSON.stringify({ command: { data: { groups: [] } } }),
+  }
+  const { runtime, inits, mcps } = makeRuntime(t, {
+    config: { home },
+    host: {
+      runCommand: async (argv) => ({
+        code: 0,
+        stdout: commandReplies[argv[1]],
+        stderr: '',
+      }),
+    },
+  })
+  assert.equal(runtime.catalog.hasFreshCache(), true)
+  assert.equal(runtime.catalog.tier(), undefined)
+
+  const snapshot = await runtime.readQuota(true)
+  assert.equal(snapshot.account?.plan, 'Google AI Ultra')
+  assert.equal(inits().length, 1)
+  assert.equal(mcps().length, 1)
+  assert.equal(runtime.status().state, 'idle')
+  assert.equal(runtime.process, undefined)
+  assert.equal(runtime.bridge.server, undefined)
+})
+
+test('mid-stream agy upgrade defers fingerprint sync so stale process observations never forge the new fingerprint', async (t) => {
+  const binDir = mkdtempSync(join(tmpdir(), 'agy-mid-upgrade-'))
+  t.after(() => rmSync(binDir, { recursive: true, force: true }))
+  const customFake = join(binDir, 'agy')
+  copyFileSync(fake, customFake)
+  chmodSync(customFake, 0o755)
+
+  const { home, runtime, mcps } = makeRuntime(t, {
+    config: { command: customFake },
+  })
+  const parked = await collect(
+    runtime.stream({
+      model: 'gemini-4-argon',
+      sessionId: 'BUSY-FP',
+      tools: [bash],
+      messages: [sys, user('u1', 'CALL bash {"command":"ls"}')],
+    }),
+  )
+  assert.equal(finishOf(parked).reason.kind, 'tool-calls')
+  const savedV1 = JSON.parse(readFileSync(join(home, 'catalog.json'), 'utf8'))
+  assert.equal(mcps().length, 1)
+
+  // Upgrade binary while BUSY-FP holds a live parked turn; forced warmup on stale proc must not stamp fp2.
+  writeFileSync(customFake, `${readFileSync(customFake, 'utf8')}\n// upgraded\n`)
+  chmodSync(customFake, 0o755)
+  await runtime.warmup({ force: true })
+  const duringBusy = JSON.parse(readFileSync(join(home, 'catalog.json'), 'utf8'))
+  assert.equal(duringBusy.binaryFingerprint, savedV1.binaryFingerprint)
+  assert.equal(mcps().length, 2)
+
+  // Once the active turn settles and the runtime is idle, non-forced warmup detaches stale proc and probes fp2.
+  runtime.settleSession('BUSY-FP')
+  await runtime.warmup()
+  const afterUpgrade = JSON.parse(readFileSync(join(home, 'catalog.json'), 'utf8'))
+  assert.notEqual(afterUpgrade.binaryFingerprint, savedV1.binaryFingerprint)
+  assert.equal(mcps().length, 3)
+  assert.equal(runtime.status().state, 'idle')
+  assert.equal(runtime.process, undefined)
+  assert.equal(runtime.bridge.server, undefined)
+})
+
+test('unexpected ACP child exit during standalone warmup closes MCP bridge and clears sweeper', async (t) => {
+  const { runtime } = makeRuntime(t, {
+    host: {
+      spawnAcp: () => {
+        const stdout = new PassThrough()
+        const exited = Promise.withResolvers()
+        const handlers = {
+          initialize: (id) => {
+            stdout.write(
+              `${JSON.stringify({
+                jsonrpc: '2.0',
+                id,
+                result: {
+                  protocolVersion: 1,
+                  agentInfo: { name: 'Fake ACP', version: '1.5.14' },
+                  agentCapabilities: { promptCapabilities: { image: true } },
+                },
+              })}\n`,
+            )
+          },
+          'session/new': () => {
+            exited.resolve({ code: 1, signal: null })
+            stdout.end()
+          },
+        }
+        return {
+          stdout,
+          exited: exited.promise,
+          stderrTail: () => 'fatal crash',
+          terminate: () => exited.resolve({ code: 1, signal: 'SIGTERM' }),
+          stdin: new Writable({
+            write(data, _encoding, done) {
+              const req = JSON.parse(data)
+              handlers[req.method](req.id)
+              done()
+            },
+          }),
+        }
+      },
+    },
+  })
+
+  await assert.rejects(runtime.warmup(), /agy acp exited/)
+  assert.equal(runtime.process, undefined)
+  assert.equal(runtime.bridge.server, undefined)
+  assert.equal(runtime.sweeper, undefined)
+  assert.equal(runtime.status().state, 'error')
+})
+
+test('sweep reaps an idle front after evicting its last session and after resetConversations exceeds idleSessionTtlMs', async (t) => {
+  let clock = 1_000
+  const { runtime } = makeRuntime(t, {
+    config: { idleSessionTtlMs: 150_000 },
+    host: { monotonicNow: () => clock },
+  })
+  await collect(
+    runtime.stream({
+      model: 'gemini-4-argon',
+      sessionId: 'REAP-1',
+      messages: [sys, user('u1', 'hello')],
+    }),
+  )
+  const proc1 = runtime.process
+  const proc1Exited = new Promise((resolve) => proc1.onExit(resolve))
+  assert.equal(proc1?.alive, true)
+
+  clock += 60_000
+  runtime.sweep()
+  clock += 60_000
+  runtime.sweep()
+  assert.equal(runtime.process, proc1)
+
+  // Third tick exceeds 150s TTL: evicts session and stops the idle front after closeSession settles.
+  clock += 60_000
+  runtime.sweep()
+  assert.equal(runtime.conversations.size, 0)
+  await proc1Exited
+  assert.equal(proc1.alive, false)
+  assert.equal(runtime.process, undefined)
+  assert.equal(runtime.bridge.server, undefined)
+  assert.equal(runtime.sweeper, undefined)
+  assert.equal(runtime.status().state, 'idle')
+
+  // Restarting works cleanly; resetConversations keeps the front warm until idleSessionTtlMs elapses.
+  await collect(
+    runtime.stream({
+      model: 'gemini-4-argon',
+      sessionId: 'REAP-2',
+      messages: [sys, user('u2', 'again')],
+    }),
+  )
+  const proc2 = runtime.process
+  const proc2Exited = new Promise((resolve) => proc2.onExit(resolve))
+  await runtime.resetConversations()
+  assert.equal(proc2?.alive, true)
+  assert.equal(runtime.status().state, 'ready')
+
+  clock += 60_000
+  runtime.sweep()
+  clock += 60_000
+  runtime.sweep()
+  assert.equal(runtime.process, proc2)
+
+  clock += 60_000
+  runtime.sweep()
+  await proc2Exited
+  assert.equal(proc2.alive, false)
+  assert.equal(runtime.process, undefined)
+  assert.equal(runtime.bridge.server, undefined)
+  assert.equal(runtime.status().state, 'idle')
+})
