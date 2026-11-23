@@ -40,7 +40,7 @@ installation. See [development setup](docs/development.md) for local testing.
 ## Usage
 
 Start `pi`, then use `/model` to select a model under `antigravity-acp` (or run
-`/agy-acp refresh` to force a live catalog refresh). The available models and
+`/agy-acp refresh` to force a live catalog refresh). Available models and
 reasoning levels are discovered dynamically from your Antigravity account and
 cached locally in `catalog.json`.
 
@@ -49,18 +49,20 @@ cached locally in `catalog.json`.
 | `/agy-acp` or `/agy-acp status` | Show runtime state, account details, models, sessions, and the last turn. |
 | `/agy-acp quota [used\|remaining]` | Show account details, grouped quota bars, and reset countdowns (remembers the last selected mode). |
 | `/agy-acp refresh` | Force a live model catalog refresh from `agy` without starting a conversation. |
-| `/agy-acp reset` | Close ACP sessions; the next request rebuilds the connection. |
+| `/agy-acp reset` | Dispose the ACP runtime and clear sessions, quota cache, and warning history; the next request rebuilds from Pi's history. |
 
 After an Antigravity turn settles, the status bar shows quota usage (for example,
-`AGY 20%`, or `AGY 80%` in `remaining` mode) and warns when quota is low; see [quota status](docs/reference.md#quota-status-and-warnings).
+`AGY 20%`, or `AGY 80%` in `remaining` mode) and warns when quota is low; see
+[quota status](docs/reference.md#quota-status-and-warnings).
 
 Default prices are zero, not a promise of free calls. Pi pricing overrides are
 used when configured.
 
 ## More information
 
-- [Reference](docs/reference.md): commands, configuration, stored data, model discovery, and limitations.
-- [Development](docs/development.md): setup, request flow, source layout, and verification.
+- [Reference](docs/reference.md): commands, quota UI, configuration, stored data, model discovery, and limits.
+- [Development](docs/development.md): local setup, source layout, verification, and CI.
+- [Architecture](docs/architecture.md): runtime, transport, security boundaries, and SQLite telemetry internals.
 - [Changelog](CHANGELOG.md): release history and upcoming changes.
 - [Attribution](NOTICE) and [MIT license](LICENSE).
 
