@@ -1,9 +1,13 @@
 # Development
 
 Start with the [installation guide](../README.md#install) to use the extension.
-For settings and user-visible limits, see the [reference](reference.md).
+For user-facing behavior and settings, see the [reference](reference.md). For
+subsystem invariants, transport limits, and protocol details, see
+[architecture](architecture.md).
 
-Clone the repository and install its dependencies:
+## Setup
+
+Clone the repository and run the extension locally:
 
 ```sh
 git clone https://github.com/fdkevin0/pi-agy-acp.git
@@ -14,132 +18,38 @@ pi -e ./index.ts
 
 ## Request flow
 
-1. The extension registers `antigravity-acp` with Pi. The first request starts
-   `agy acp --process-per-session` and a loopback MCP bridge.
+1. `index.ts` registers the `antigravity-acp` provider and Pi lifecycle hooks.
+   The first live request starts `agy acp --process-per-session` and a loopback
+   MCP HTTP/SSE bridge.
 2. Session creation appends only a static MCP tool-routing preamble to `agy`'s
-   system prompt; Pi's system prompt, compacted initial tool schemas, and any
-   replayed history travel in the session's opening prompt within the 160 KB
-   replay budget. Later turns on an intact history prefix reuse the session and
-   send only new input (plus any dynamic tool deltas).
-3. Model tool calls reach the bridge and remain pending while Pi executes them.
-   Pi receives a `toolUse` result, then supplies tool results on its next request.
-4. Those results resolve the pending MCP requests, allowing the same ACP turn to
-   continue (or, if the ACP prompt already settled while Pi was running tools,
-   starting a fresh continuation prompt with those results and any deferred
-   suffixes without executing zombie queued calls). Long-running tools use a
-   relay (`pi_await_result`) to keep the agent waiting; if the agent instead
-   moves on to a new tool call or another awaited result, buffered output
-   flushes in order so later steps stream live, deferred tool/steering suffixes
-   and a one-time `<harness_relay_update>` hint carry onto the next delivered
-   tool result, and `end_turn`/`max_tokens` finishes with a note if any relayed
-   call remained unretrieved (while immediate premature completion with no
-   further tool progress still fails with `PROVIDER_ERROR`).
-5. The adapter drains the runtime's generator before publishing completion, so
-   session cleanup finishes before Pi can start its next step.
+   system prompt. Pi's system prompt, compacted tool schemas, and replayed
+   history travel in the opening prompt within the 160,000-byte replay budget;
+   subsequent turns on an intact history prefix reuse the session and send only
+   new input and tool deltas.
+3. Model tool calls pause at the MCP bridge while Pi executes them. Pi receives
+   a `toolUse` turn result and supplies tool results on its next request.
+4. Those tool results resolve pending MCP requests so the same ACP turn
+   continues (or start a continuation prompt if ACP settled early). Long-running
+   tools relay via `pi_await_result` to keep the agent waiting cleanly.
+5. `src/pi-stream.ts` drains the runtime generator before publishing completion
+   so turn cleanup finishes before Pi starts the next step.
 
-- **Model discovery:** Registration and cache-only refresh start no processes,
-  sockets, or timers; before the first ACP discovery (`catalog.json` absent),
-  the catalog starts empty with no hardcoded model list. `catalog.json` is
-  written atomically and persists models, per-model efforts, `promptCapabilities.image`,
-  tier, `contextWindows`, and the subprocess-free `agy` binary fingerprint
-  (`realpath`, `dev`, `ino`, `size`, `mtimeNs`) that observed those models.
-  Non-forced refreshes (`refreshModels` at Pi startup or `/model`) reuse a
-  cached catalog without spawning `agy` whenever `catalog.json` contains models
-  whose persisted fingerprint matches the current `agy` binary. A changed binary
-  clears cached `contextWindows` and `observed` without advancing the persisted
-  fingerprint until live ACP re-observes models, so the next refresh or session
-  re-probes cleanly. The ACP `initialize` handshake also validates
-  `agentInfo.version` against `MIN_AGY_VERSION`. Concurrent refreshes share a
-  discovery session; `/agy-acp refresh` (or `force: true`) bypasses the cache.
-  When standalone discovery starts the front process on an otherwise idle
-  runtime, it stops the temporary process, bridge, and sweeper once discovery
-  completes unless a concurrent `stream()` adopted them. Refresh suppresses
-  provider re-registration so it cannot cancel itself. Cancellation ends the
-  caller's wait; shared discovery still closes its session, cleans its files,
-  and tears down an ephemeral process.
-- **Session lifecycle:** The bridge binds to `127.0.0.1`, uses per-session bearer
-  credentials, and validates structured tool identity before granting permissions.
-  On Unix, `agy acp` and helper commands run in detached process groups so
-  termination and timeouts signal `-pid` (`SIGTERM`, then `SIGKILL`) without
-  orphaning `--process-per-session` workers. Session SQLite reads
-  (`src/session-db.ts`) reject symlinked or non-regular `.db`, `.db-wal`,
-  `.db-shm`, and `.db-journal` files, gate streaming reads by cached context
-  window / positive `usage_update` and `(mtimeNs, size)` stamps, bound
-  `gen_metadata` scans with `LIMIT`, and inspect terminal `steps` (`step_type = 17`)
-  on `end_turn` and `refusal` to surface hidden API errors (`QUOTA_EXHAUSTED`,
-  `INVALID_THINKING_SIGNATURE`, `429`/`RESOURCE_EXHAUSTED`, and `404`/`NOT_FOUND`)
-  while preserving pure safety refusals and resetting poisoned sessions.
-  Startup and session cleanup also remove `.db-journal` sidecars and
-  `annotations/` files without traversing symlinks.
-  Live `agy 1.5.10+` sessions issue `session/request_permission` only inside an
-  active `session/prompt` turn (never during `session/new` or
-  `session/set_config_option`), so session creation and idle pre-/post-turn
-  windows remain fail-closed (`cancelled` before `session/new` completes;
-  `reject_once` when no live turn owns the session, even after MCP handshake).
-  Tree navigation and compaction close conversation sessions and their files,
-  retaining the process, bridge, and caches. `session_start` (`new`, `resume`, or
-  `fork`) uses the same light reset if the runtime survives; `session_shutdown`
-  and `/agy-acp reset` dispose the runtime. A monotonic sleep-resilient sweeper
-  evicts idle sessions after `idleSessionTtlMs` (default 30 minutes) and stops
-  the idle ACP front, MCP bridge, and sweeper once no live sessions or in-flight
-  streams remain and the front itself has been idle past `idleSessionTtlMs`
-  (waiting for any evicted sessions to finish closing first). Upgrading the
-  on-disk `agy` binary while idle uses the same teardown path before restarting.
-  Disposal is idempotent, drains in-flight startup and bridge binding, cancels
-  waiters, and rolls back late session replies from obsolete processes or
-  conversations. A turn owns cancellation through streaming and parked tool
-  execution until its step drains, `agent_settled` runs, or the process exits;
-  only a fully drained `tool-calls` handoff preserves parked tool calls.
-  First interruption wins (`abandon` vs. `fail`), cancellation takes priority
-  over buffered output, and turn/tenant identities guard all async callbacks.
-- **Quota and TUI:** Settled checks share the reader's TTL and in-flight request
-  without blocking Pi. `/usage` commands close stdin, cap stdout at 1 MiB, and
-  abort early if stderr matches `Authentication required`. Model selection reads
-  memory only. UI generation checks discard stale background results; warning
-  keys include group, bucket, reset time, and threshold. An explicit quota query
-  can force one tool-less ACP discovery session per runtime when no tier is
-  cached and no live session has been observed yet, persisting the tier in
-  `catalog.json` and stopping the temporary process afterward if the runtime was
-  idle. Email lookup scans `cli.log`
-  and the newest 10 contained `log/cli-*.log` and `log/acp-server-*.log` files
-  (newest first, deduplicated), checking the tail 64 KiB first and falling back
-  to the head 64 KiB when larger. Runtime warnings stay off stderr by default to
-  preserve TUI rendering (diagnostics use status and agy's logs); set
-  `PI_AGY_DEBUG=1` to print runtime warnings on stderr.
-- **Pi stream and error contracts:** `onPayload` can replace the request, and
-  `onProviderStreamEvent` observes events before conversion. At the first stream
-  event, `onResponse` receives synthetic status `200` and empty headers before
-  normalization; startup failures and an initial aborted finish emit no response.
-  ACP supplies no HTTP response metadata. Context overflow and exhausted quota
-  receive `context_length_exceeded` and `quota exceeded` markers for Pi's
-  compaction and retry decisions; transport timeouts remain distinct.
-
-## MCP HTTP boundary
-
-The loopback bridge returns 400 for invalid URLs and 413 for authenticated POST
-bodies exceeding 8 MiB (8,388,608 bytes), including chunked uploads. Rejected
-oversized uploads close their connection after the error response. JSON parse
-errors retain the MCP parse-error response. Unexpected handler failures return
-500 before headers or destroy an already-started response; listener errors go to
-the diagnostic sink.
-
-Node's HTTP parser enforces a 10-second header reception deadline and a 30-second
-whole-request reception deadline, checked every second. These are reception limits
-only and do not cap completed SSE tool streams. Shutdown stops accepting
-connections and destroys all tracked sockets without waiting for tool promises.
+See [architecture](architecture.md) for the full lifecycle, relay, permission,
+SQLite telemetry, and transport boundary invariants.
 
 ## Source layout
 
 | File or group | Responsibility |
 | --- | --- |
-| `index.ts` | Provider registration, commands, and Pi lifecycle hooks. |
-| `src/pi-stream.ts`, `src/protocol.ts` | Pi message conversion and bridge event contracts. |
-| `src/runtime.ts`, `src/conversation.ts`, `src/history.ts` | Session orchestration, pending calls, tool identity metadata, streaming, and history replay. |
-| `src/acp-process.ts`, `src/jsonrpc.ts`, `src/mcp-bridge.ts` | ACP transport, local MCP server, tool schema compression, and tool deltas. |
-| `src/host.ts`, `src/preflight.ts`, `src/session-db.ts`, `src/config.ts` | Process execution, executable discovery, isolated home setup, and read-only session SQLite telemetry/error inspection. |
-| `src/catalog.ts`, `src/quota.ts`, `src/format.ts`, `src/util.ts` | Model catalog, quota queries, TUI notice formatting, and shared utilities. |
-| `src/version.ts` | ACP/MCP version read from `package.json`. |
-| `tests/` | Scripted agy fixture, runtime tests, and Pi integration tests. |
+| `index.ts` | Provider registration, `/agy-acp` commands, TUI loaders/warnings, and Pi lifecycle hooks. |
+| `src/pi-stream.ts`, `src/protocol.ts` | Pi message/stream conversion, hook contracts, and internal bridge event types. |
+| `src/runtime.ts`, `src/conversation.ts`, `src/history.ts` | Session orchestration, capacity/sweeper lifecycle, pending/relayed tool calls, usage accounting, and history replay. |
+| `src/acp-process.ts`, `src/jsonrpc.ts`, `src/mcp-bridge.ts` | ACP stdio transport, NDJSON JSON-RPC peer, loopback MCP HTTP/SSE bridge, schema compression, and tool deltas. |
+| `src/config.ts` | Default runtime thresholds, effort/display types, and atomic `settings.json` persistence. |
+| `src/host.ts`, `src/preflight.ts`, `src/session-db.ts` | Subprocess management and env/stderr hardening, binary discovery/fingerprinting/OAuth sync, and read-only session SQLite telemetry/error inspection and artifact cleanup. |
+| `src/catalog.ts`, `src/quota.ts`, `src/format.ts`, `src/util.ts` | Model catalog persistence, `/usage` quota reader and login-log email lookup, TUI notice formatting and model-to-group matching, and shared utilities. |
+| `src/version.ts` | Package version read from `package.json` for ACP/MCP handshakes. |
+| `tests/` | Scripted local `agy` fixture (`fake-agy.mjs`), unit tests, and Pi integration tests. |
 
 Upstream provenance and licensing are recorded in [NOTICE](../NOTICE) and
 [LICENSE](../LICENSE).
@@ -152,72 +62,50 @@ npm test
 pi --no-extensions -e ./index.ts --list-models antigravity-acp
 ```
 
-Tests run directly with Node's native TypeScript support; `tsx` is not required.
-Automated tests use a scripted local `agy` substitute so `npm test` runs offline
-without consuming account quota. They need permission to listen on `127.0.0.1`.
+Tests run directly with Node's native TypeScript support (`tsx` is not
+required) using a scripted local `agy` substitute so `npm test` runs offline
+without consuming account quota. Tests bind ephemeral loopback sockets on
+`127.0.0.1`.
 
-Tests cover ACP transport and sessions, tool routing and permissions, model and
-account discovery, Pi streaming and cancellation, and quota UI behavior.
-Listing models verifies extension loading, not access to the real service.
+Automated tests cover ACP transport and sessions, JSON-RPC framing, MCP bridge
+boundaries and permissions, model/account discovery, session SQLite inspection,
+Pi streaming and cancellation, and quota UI behavior. `--list-models` verifies
+extension loading, not live service access.
 
-To inspect the package contents without publishing:
+Inspect package contents before publishing:
 
 ```sh
 npm pack --dry-run
 ```
 
-## CI and releases
+## CI and pull requests
 
-`ci.yml` checks pull requests and pushes to `main`. `release.yml` runs on pushes
-to `main` (to run `release-please`), version-tag pushes, or manual runs on an
-existing tag, so ordinary commits do not trigger the `publish` job. CI tests the
-pinned `devDependencies` baseline on Node.js 22.19.0 and 24, plus a `pi-compat`
-matrix across `@earendil-works/pi-*` `1.5.0` and latest `1.5`; releases use
-Node.js 24. `.npmrc` sets `package-lock=false` so dependency installation stays
-lockfile-free via `npm install`.
+- `ci.yml` runs on pull requests and pushes to `main`. It validates the pinned
+  `devDependencies` baseline (`1.5.2`) on Node.js 22.19.0 and 24, plus a
+  `pi-compat` matrix across `@earendil-works/pi-*` `1.5.0` and latest `1.5` on
+  Node.js 24.
+- Host `peerDependencies` stay `*` per Pi package conventions. `.npmrc` sets
+  `package-lock=false` so installs remain lockfile-free via `npm install`.
+- All changes to `main` require a pull request, passing CI across the matrix,
+  and resolved review discussions, then squash merge (no second-person approval
+  is required).
 
-All changes to `main` require a pull request, passing CI on both Node versions,
-and resolved review discussions. Squash merge after CI passes; no second-person
-approval is required.
-
-Releases are automated with `release-please` (`release-please-config.json` and
-`.release-please-manifest.json`):
-- Merging Conventional Commits (`feat:`, `fix:`, etc.) to `main` opens or updates
-  a release PR that bumps `package.json` and updates `CHANGELOG.md` and
-  `.release-please-manifest.json`.
-- Squash-merging that release PR (preserving its `chore(main): release X.Y.Z`
-  title) creates the `vX.Y.Z` tag and GitHub Release, then triggers the
-  `publish` job in `release.yml` to check, test, pack, and publish to npm.
-- Enable **Allow GitHub Actions to create and approve pull requests** in
-  repository Settings → Actions → General. Without a `RELEASE_PLEASE_TOKEN` PAT
-  (with `contents: write` and `pull-requests: write`) in repository secrets,
-  `GITHUB_TOKEN` is used; in that case, close and reopen the release PR after
-  its final update to trigger `ci.yml` when branch protection requires it.
-- To recover a failed `publish` job, choose **Re-run failed jobs** on that
-  workflow run (re-running all jobs on a `main` run skips `publish` once the tag
-  exists) or run `gh workflow run release.yml --ref vX.Y.Z`. Manual tag pushes
-  (`vX.Y.Z`) also trigger `publish` but bypass `release-please`, leaving
-  `CHANGELOG.md` and `.release-please-manifest.json` out of sync.
-- The workflow accepts stable versions only, publishes one version at a time,
-  and never moves a published tag. Only a registry 404 means the version is
-  absent; network, authentication, and server errors stop the job.
-
-Configure npm [Trusted Publishing](https://docs.npmjs.com/trusted-publishers/)
-for owner `fdkevin0`, repository `pi-agy-acp`, and workflow filename `release.yml`.
-The workflow grants OIDC permission to the publish job and uses npm >= 11.5.1.
-An optional `NPM_TOKEN` repository secret supports token authentication through
-`NODE_AUTH_TOKEN`; use a granular write token with the required 2FA bypass.
-
-If npm publication succeeds but GitHub Release creation fails, rerun that tagged
-workflow, or use `gh workflow run release.yml --ref vX.Y.Z`. Branch-based manual
-runs are rejected. Existing npm versions are not republished, and GitHub Releases
-are created only for existing tags with `gh release create --verify-tag`.
+For automated releases, npm Trusted Publishing, and recovery procedures, see
+[releasing](releasing.md).
 
 ## Documentation conventions
 
-Keep all project documentation in English. Use progressive disclosure:
+Keep all project documentation in English and organize by progressive
+disclosure:
 
-- Keep the README focused on the first successful run and essential limitations.
-- Put operational details in the reference and implementation details in this guide.
-- Link to the relevant section instead of duplicating detailed explanations.
-- Include linked documentation in the package's `files` list.
+- `README.md`: first successful run, commands overview, and essential limits.
+- `docs/reference.md`: user- and operator-facing behavior, configuration, and
+  compatibility limits.
+- `docs/development.md`: contributor setup, source layout, verification, and CI.
+- `docs/architecture.md`: subsystem invariants, protocol contracts, and
+  security boundaries.
+- `docs/releasing.md`: maintainer release automation and publishing recovery.
+
+Link to the owning document instead of duplicating details, and keep all linked
+documentation covered by `package.json`'s `files` list (`docs/` is included as
+a directory).
