@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.3](https://github.com/fdkevin0/pi-agy-acp/compare/v0.2.2...v0.2.3) (2026-11-23)
+
+
+### Bug Fixes
+
+* **runtime:** skip warm-cache startup spawn, reap idle ACP fronts, and add /agy-acp refresh ([#44](https://github.com/fdkevin0/pi-agy-acp/issues/44)) ([b5b0952](https://github.com/fdkevin0/pi-agy-acp/commit/b5b09520a989bb3c79bafcbb243330304dfc1da1))
+
 ## [0.2.2](https://github.com/fdkevin0/pi-agy-acp/compare/v0.2.1...v0.2.2) (2026-11-22)
 
 
