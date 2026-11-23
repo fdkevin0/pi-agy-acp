@@ -285,8 +285,33 @@ export default function (
       }
     }
   }
+  type RefreshOutcome =
+    | { status: 'ok'; count: number }
+    | { status: 'cancelled' }
+    | { status: 'error'; error: string }
+  const refreshModelsSafe = async (
+    signal?: AbortSignal,
+  ): Promise<RefreshOutcome> => {
+    const current = activeRuntime
+    if (!current) {
+      return {
+        status: 'error',
+        error: 'Antigravity ACP runtime is disposed.',
+      }
+    }
+    try {
+      await current.warmup({ force: true, signal })
+      return { status: 'ok', count: current.catalog.list().length }
+    } catch (err) {
+      if (signal?.aborted) return { status: 'cancelled' }
+      return {
+        status: 'error',
+        error: err instanceof Error ? err.message : String(err),
+      }
+    }
+  }
   pi.registerCommand('agy-acp', {
-    description: 'Antigravity ACP status, quota, or reset',
+    description: 'Antigravity ACP status, quota, refresh, or reset',
     getArgumentCompletions: (prefix) => {
       const normalized = prefix.trimStart()
       const items = [
@@ -294,6 +319,7 @@ export default function (
         'quota',
         'quota used',
         'quota remaining',
+        'refresh',
         'reset',
       ]
         .filter((command) => command.startsWith(normalized))
@@ -308,6 +334,40 @@ export default function (
         command === 'quota' && tokens.length === 2
           ? asQuotaDisplay(tokens[1])
           : undefined
+      if (command === 'refresh' && tokens.length === 1) {
+        const outcome =
+          ctx.mode === 'tui' && typeof ctx.ui.custom === 'function'
+            ? await ctx.ui.custom<RefreshOutcome>((tui, theme, _kb, done) => {
+                const loader = new BorderedLoader(
+                  tui,
+                  theme,
+                  'Refreshing Antigravity models...',
+                )
+                loader.onAbort = () => done({ status: 'cancelled' })
+                void refreshModelsSafe(loader.signal).then((result) => {
+                  if (!loader.signal.aborted) done(result)
+                })
+                return loader
+              })
+            : await refreshModelsSafe()
+        if (shutDown) return
+        if (outcome.status === 'cancelled') {
+          ctx.ui.notify('Model refresh cancelled', 'info')
+          return
+        }
+        if (outcome.status === 'error') {
+          ctx.ui.notify(
+            `Antigravity model refresh failed: ${outcome.error}`,
+            'error',
+          )
+          return
+        }
+        ctx.ui.notify(
+          `Refreshed Antigravity catalog (${outcome.count} model${outcome.count === 1 ? '' : 's'})`,
+          'info',
+        )
+        return
+      }
       if (command === 'reset' && tokens.length === 1) {
         clearStatus(ctx)
         await reset()
@@ -321,7 +381,7 @@ export default function (
         (tokens.length === 1 || requestedDisplay !== undefined)
       if (!isStatus && !isQuota) {
         ctx.ui.notify(
-          'Usage: /agy-acp [status|quota [used|remaining]|reset]',
+          'Usage: /agy-acp [status|quota [used|remaining]|refresh|reset]',
           'warning',
         )
         return

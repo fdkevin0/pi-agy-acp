@@ -207,6 +207,10 @@ export class AntigravityRuntime {
   private sweeper: ReturnType<typeof setInterval> | undefined
   private readonly monotonicNow: () => number
   private lastSweepAt: number
+  /** In-flight `stream()` calls acquiring or using the front process; guards idle teardown. */
+  private activeStreams = 0
+  /** Monotonic milliseconds the front process has been completely idle. */
+  private processIdleMs = 0
   private emailCache:
     | { fingerprint: string; email: string | undefined; at: number }
     | undefined
@@ -273,20 +277,25 @@ export class AntigravityRuntime {
     }
     if (
       this.process?.alive &&
-      this.starting === undefined &&
       this.processFingerprint !== undefined &&
-      this.processFingerprint !== fp &&
-      [...this.conversations.values()].every((c) => this.isIdle(c))
+      this.processFingerprint !== fp
     ) {
+      const canRestart =
+        this.starting === undefined &&
+        this.activeStreams === 0 &&
+        [...this.conversations.values()].every((c) => this.isIdle(c))
+      if (!canRestart) {
+        // Defer catalog fingerprint sync while the old binary's process is still active,
+        // so live observations from the stale process cannot stamp the new fingerprint.
+        return
+      }
       // Restart an idle ACP process after an on-disk `agy` upgrade so discovery probes the new binary.
       const stale = this.process
       const staleSessions = [...this.conversations.values()]
         .filter((conv) => conv.process === stale)
         .map((conv) => ({ conv, sessionId: conv.sessionId }))
-      this.process = undefined
-      this.processFingerprint = undefined
-      this.state = 'idle'
-      stale.stop()
+      this.detachProcess(stale)
+      void this.bridge.close()
       for (const { conv, sessionId } of staleSessions) {
         if (sessionId !== undefined) {
           removeSessionArtifacts(this.home, sessionId)
@@ -469,12 +478,12 @@ export class AntigravityRuntime {
   async readQuota(force = false): Promise<QuotaSnapshot> {
     this.assertActive()
     const quota = this.quota.read(force)
-    if (!this.catalog.tier()) {
+    if (!this.catalog.tier() && !this.catalog.observed) {
       this.tierDiscovery ??= (async () => {
         const state = this.state
         const error = this.lastError
         try {
-          await this.warmup()
+          await this.warmup({ force: true })
         } catch {
           // Optional account discovery must not leave an otherwise idle runtime in error.
           if (
@@ -499,6 +508,7 @@ export class AntigravityRuntime {
    */
   async ensureReady(): Promise<AcpProcess> {
     this.assertActive()
+    this.processIdleMs = 0
     if (this.sweeper === undefined) {
       this.lastSweepAt = this.monotonicNow()
       this.sweeper = setInterval(() => this.sweep(), SWEEP_INTERVAL_MS)
@@ -515,7 +525,10 @@ export class AntigravityRuntime {
   }
 
   /**
-   * Warm the process and refresh the catalog through a tool-less discovery session.
+   * Refresh the catalog through a tool-less discovery session when uncached,
+   * stale for the current `agy` binary, or forced. When this call starts the
+   * front process on an otherwise idle runtime, the temporary process and MCP
+   * bridge are stopped once discovery finishes unless a stream adopted them.
    * @returns resolves when discovery finished.
    */
   async warmup(
@@ -526,30 +539,39 @@ export class AntigravityRuntime {
     if (this.warmupPromise !== undefined)
       return abortable(this.warmupPromise, options.signal)
     this.reconcileBinaryFingerprint()
-    if (!options.force && this.catalog.observed) return
+    if (!options.force && this.catalog.isCurrent()) return
+    const hadProcess =
+      this.process?.alive === true || this.starting !== undefined
     this.warmupPromise = (async () => {
-      const proc = await this.ensureReady()
-      this.assertOwner(proc)
-      const result = await proc.newSession(
-        {
-          cwd: this.preflight?.workspace ?? this.home,
-          mcpServers: [],
-        },
-        { onUpdate: () => undefined },
-        120_000,
-      )
+      let proc: AcpProcess | undefined
       try {
+        proc = await this.ensureReady()
         this.assertOwner(proc)
-        if (
-          this.catalog.observe(
-            result.configOptions,
-            result.models?.availableModels,
-            result._meta?.antigravity?.tier,
-          )
+        const result = await proc.newSession(
+          {
+            cwd: this.preflight?.workspace ?? this.home,
+            mcpServers: [],
+          },
+          { onUpdate: () => undefined },
+          120_000,
         )
-          this.host.onModelsChanged()
+        try {
+          this.assertOwner(proc)
+          if (
+            this.catalog.observe(
+              result.configOptions,
+              result.models?.availableModels,
+              result._meta?.antigravity?.tier,
+            )
+          )
+            this.host.onModelsChanged()
+        } finally {
+          await this.closeAndCleanSession(proc, result.sessionId)
+        }
       } finally {
-        await this.closeAndCleanSession(proc, result.sessionId)
+        if (!hadProcess && proc !== undefined) {
+          await this.stopIdleProcess(proc, { ignoreWarmup: true })
+        }
       }
     })().finally(() => {
       this.warmupPromise = undefined
@@ -560,6 +582,7 @@ export class AntigravityRuntime {
   /** Close conversation sessions while retaining the process and discovery/quota caches. */
   async resetConversations(): Promise<void> {
     this.assertActive()
+    this.processIdleMs = 0
     const conversations = [...this.conversations.values()]
     for (const conv of conversations)
       this.dropTurn(conv, 'The Pi session changed.')
@@ -642,124 +665,131 @@ export class AntigravityRuntime {
       }
       return
     }
-    const proc = await this.ensureReady()
-    const key = options.sessionId ?? `anon-${randomBytes(6).toString('hex')}`
-    const release = await this.mutex.acquire(key, this.shutdown.signal)
-    let conv: Conversation | undefined
+    this.activeStreams++
+    this.processIdleMs = 0
     try {
-      this.assertActive()
-      conv = await this.acquireConversation(key)
-      this.assertOwner(proc, conv)
-      conv.lastUsed = this.monotonicNow()
-      conv.idleMs = 0
-      const split = splitSystem(options)
-      const tools = toBridgeTools(options.tools)
-      conv.toolNames = new Set(tools.map((t) => t.name))
-      const requestedEffort =
-        asEffort(options.reasoningEffort) ?? this.host.config.defaultEffort
-      let effort = this.effectiveEffort(options.model, requestedEffort)
-
-      if (options.signal?.aborted) {
-        this.dropTurn(conv, 'The harness cancelled this request.')
-        yield {
-          type: 'finish',
-          reason: {
-            kind: 'aborted',
-            failure: { message: 'Request aborted', code: 'ABORTED' },
-          },
-        }
-        return
-      }
-      if (conv.turn !== undefined && conv.turn.pendingCalls.size > 0) {
-        // Resuming a parked turn is only valid while the request still starts
-        // with the exact history and model/effort selection this ACP session
-        // already owns. A compaction checkpoint, pruned/rewritten prefix, or
-        // model/effort change means the live session is stale, so abandon the
-        // turn and let plan() rebuild from Pi's authoritative history.
-        const resumedEffort = clampEffortToOptions(conv.configOptions, effort)
-        if (
-          !this.historyPrefixIntact(conv, split.system, split.messages) ||
-          conv.model !== options.model ||
-          conv.effort !== resumedEffort
-        ) {
-          this.dropTurn(
-            conv,
-            'The conversation history or model selection changed; rebuilding the session from the harness history.',
-          )
-        } else {
-          // Tool waiters can abort in their result microtask; hand off the exact turn synchronously.
-          const resumed = this.deliverResults(
-            conv,
-            split.messages,
-            proc,
-            tools,
-          )
-          this.assertActive()
-          if (resumed !== undefined) {
-            conv.knownIds = messageIds(split.messages)
-            yield* this.pump(conv, resumed, proc, options, resumedEffort)
-            return
-          }
-          this.dropTurn(
-            conv,
-            'The conversation history changed; the harness restarted this turn.',
-          )
-        }
-      } else if (conv.turn !== undefined) {
-        this.dropTurn(conv, 'Superseded by a newer request.')
-      }
-
-      const plan = this.plan(conv, split.system, split.messages)
-      if (plan.rebuild) await this.resetSession(conv)
-      this.assertOwner(proc, conv)
-      let supplementalTools: readonly BridgeTool[] = []
-      if (conv.sessionId === undefined) {
-        conv.systemHash = digest(split.system)
-        supplementalTools = await this.openSession(conv, tools, proc)
-        effort = this.effectiveEffort(options.model, requestedEffort)
-      }
-      this.assertOwner(proc, conv, conv.sessionId)
-      effort = await this.select(conv, proc, options.model, effort)
-      this.assertOwner(proc, conv, conv.sessionId)
-      let blocks: AcpPromptBlock[]
-      if (plan.rebuild) {
-        blocks = replayPrompt(plan.history, plan.input, {
-          system: split.system,
-          supplementalTools,
-        })
-      } else {
-        blocks = inputPrompt(plan.input)
-        const toolDelta = consumeToolDelta(conv, tools)
-        if (toolDelta.length > 0)
-          blocks.unshift({ type: 'text', text: `${toolDelta}\n\n` })
-      }
-      if (options.signal?.aborted) {
-        this.dropTurn(conv, 'The harness cancelled this request.')
-        yield {
-          type: 'finish',
-          reason: {
-            kind: 'aborted',
-            failure: { message: 'Request aborted', code: 'ABORTED' },
-          },
-        }
-        return
-      }
-      conv.knownIds = messageIds(split.messages)
-      // A new turn starts with an empty reported-identity space: ids from past
-      // turns must never back a fresh permission request.
-      conv.reportedToolCalls.clear()
-      const turn = conv.turn = new AcpTurn(randomBytes(6).toString('hex'))
-      this.startPrompt(conv, turn, proc, blocks)
-      yield* this.pump(conv, turn, proc, options, effort)
-    } finally {
+      const proc = await this.ensureReady()
+      const key = options.sessionId ?? `anon-${randomBytes(6).toString('hex')}`
+      const release = await this.mutex.acquire(key, this.shutdown.signal)
+      let conv: Conversation | undefined
       try {
-        if (conv !== undefined) {
-          conv.opening = false
-          await this.afterStep(conv)
+        this.assertActive()
+        conv = await this.acquireConversation(key)
+        this.assertOwner(proc, conv)
+        conv.lastUsed = this.monotonicNow()
+        conv.idleMs = 0
+        const split = splitSystem(options)
+        const tools = toBridgeTools(options.tools)
+        conv.toolNames = new Set(tools.map((t) => t.name))
+        const requestedEffort =
+          asEffort(options.reasoningEffort) ?? this.host.config.defaultEffort
+        let effort = this.effectiveEffort(options.model, requestedEffort)
+
+        if (options.signal?.aborted) {
+          this.dropTurn(conv, 'The harness cancelled this request.')
+          yield {
+            type: 'finish',
+            reason: {
+              kind: 'aborted',
+              failure: { message: 'Request aborted', code: 'ABORTED' },
+            },
+          }
+          return
         }
+        if (conv.turn !== undefined && conv.turn.pendingCalls.size > 0) {
+          // Resuming a parked turn is only valid while the request still starts
+          // with the exact history and model/effort selection this ACP session
+          // already owns. A compaction checkpoint, pruned/rewritten prefix, or
+          // model/effort change means the live session is stale, so abandon the
+          // turn and let plan() rebuild from Pi's authoritative history.
+          const resumedEffort = clampEffortToOptions(conv.configOptions, effort)
+          if (
+            !this.historyPrefixIntact(conv, split.system, split.messages) ||
+            conv.model !== options.model ||
+            conv.effort !== resumedEffort
+          ) {
+            this.dropTurn(
+              conv,
+              'The conversation history or model selection changed; rebuilding the session from the harness history.',
+            )
+          } else {
+            // Tool waiters can abort in their result microtask; hand off the exact turn synchronously.
+            const resumed = this.deliverResults(
+              conv,
+              split.messages,
+              proc,
+              tools,
+            )
+            this.assertActive()
+            if (resumed !== undefined) {
+              conv.knownIds = messageIds(split.messages)
+              yield* this.pump(conv, resumed, proc, options, resumedEffort)
+              return
+            }
+            this.dropTurn(
+              conv,
+              'The conversation history changed; the harness restarted this turn.',
+            )
+          }
+        } else if (conv.turn !== undefined) {
+          this.dropTurn(conv, 'Superseded by a newer request.')
+        }
+
+        const plan = this.plan(conv, split.system, split.messages)
+        if (plan.rebuild) await this.resetSession(conv)
+        this.assertOwner(proc, conv)
+        let supplementalTools: readonly BridgeTool[] = []
+        if (conv.sessionId === undefined) {
+          conv.systemHash = digest(split.system)
+          supplementalTools = await this.openSession(conv, tools, proc)
+          effort = this.effectiveEffort(options.model, requestedEffort)
+        }
+        this.assertOwner(proc, conv, conv.sessionId)
+        effort = await this.select(conv, proc, options.model, effort)
+        this.assertOwner(proc, conv, conv.sessionId)
+        let blocks: AcpPromptBlock[]
+        if (plan.rebuild) {
+          blocks = replayPrompt(plan.history, plan.input, {
+            system: split.system,
+            supplementalTools,
+          })
+        } else {
+          blocks = inputPrompt(plan.input)
+          const toolDelta = consumeToolDelta(conv, tools)
+          if (toolDelta.length > 0)
+            blocks.unshift({ type: 'text', text: `${toolDelta}\n\n` })
+        }
+        if (options.signal?.aborted) {
+          this.dropTurn(conv, 'The harness cancelled this request.')
+          yield {
+            type: 'finish',
+            reason: {
+              kind: 'aborted',
+              failure: { message: 'Request aborted', code: 'ABORTED' },
+            },
+          }
+          return
+        }
+        conv.knownIds = messageIds(split.messages)
+        // A new turn starts with an empty reported-identity space: ids from past
+        // turns must never back a fresh permission request.
+        conv.reportedToolCalls.clear()
+        const turn = conv.turn = new AcpTurn(randomBytes(6).toString('hex'))
+        this.startPrompt(conv, turn, proc, blocks)
+        yield* this.pump(conv, turn, proc, options, effort)
       } finally {
-        release()
+        try {
+          if (conv !== undefined) {
+            conv.opening = false
+            await this.afterStep(conv)
+          }
+        } finally {
+          release()
+        }
       }
+    } finally {
+      this.activeStreams--
+      this.processIdleMs = 0
     }
   }
 
@@ -948,8 +978,14 @@ export class AntigravityRuntime {
   private onProcessExit(proc: AcpProcess, error: Error): void {
     const current = this.process === proc
     if (current) {
+      if (this.sweeper !== undefined) {
+        clearInterval(this.sweeper)
+        this.sweeper = undefined
+      }
       this.process = undefined
       this.processFingerprint = undefined
+      this.processIdleMs = 0
+      if (this.starting === undefined) void this.bridge.close()
     }
     if (current && this.lifecycle === 'active') {
       this.state = 'error'
@@ -1689,6 +1725,7 @@ export class AntigravityRuntime {
   private async afterStep(conv: Conversation): Promise<void> {
     conv.lastUsed = this.monotonicNow()
     conv.idleMs = 0
+    this.processIdleMs = 0
     const idle = this.isIdle(conv)
     if (idle && conv.key.startsWith('anon-')) {
       await this.resetSession(conv)
@@ -1779,22 +1816,86 @@ export class AntigravityRuntime {
     )
   }
 
+  private hasLiveConversations(): boolean {
+    for (const conv of this.conversations.values()) {
+      if (conv.sessionId !== undefined || !this.isIdle(conv)) return true
+    }
+    return false
+  }
+
+  private canStopIdleProcess(
+    options: { ignoreWarmup?: boolean } = {},
+  ): boolean {
+    if (this.lifecycle !== 'active') return false
+    if (this.starting !== undefined) return false
+    if (this.activeStreams > 0) return false
+    if (!options.ignoreWarmup && this.warmupPromise !== undefined) return false
+    return !this.hasLiveConversations()
+  }
+
+  private detachProcess(proc: AcpProcess): void {
+    if (this.process !== proc) return
+    if (this.sweeper !== undefined) {
+      clearInterval(this.sweeper)
+      this.sweeper = undefined
+    }
+    this.process = undefined
+    this.processFingerprint = undefined
+    this.processIdleMs = 0
+    if (this.lifecycle === 'active') this.state = 'idle'
+    proc.stop()
+  }
+
+  private async stopIdleProcess(
+    proc: AcpProcess,
+    options: { ignoreWarmup?: boolean } = {},
+  ): Promise<void> {
+    if (this.process !== proc || !this.canStopIdleProcess(options)) return
+    this.detachProcess(proc)
+    await this.bridge.close()
+  }
+
   private sweep(): void {
     const ttl = this.host.config.idleSessionTtlMs
     const now = this.monotonicNow()
     const delta = Math.max(0, now - this.lastSweepAt)
     this.lastSweepAt = now
     const slice = Math.min(delta, SWEEP_INTERVAL_MS * 2)
+    let allIdle =
+      this.activeStreams === 0 &&
+      this.warmupPromise === undefined &&
+      this.starting === undefined
+    const evictions: Promise<void>[] = []
     for (const conv of [...this.conversations.values()]) {
-      if (!this.isIdle(conv)) continue
+      if (!this.isIdle(conv)) {
+        allIdle = false
+        continue
+      }
       conv.idleMs += slice
       if (conv.idleMs > ttl) {
-        void this.resetSession(conv).catch((error: unknown) => {
-          this.host.log.warn(
-            `session sweep cleanup failed: ${error instanceof Error ? error.message : String(error)}`,
-          )
-        })
+        evictions.push(
+          this.resetSession(conv).catch((error: unknown) => {
+            this.host.log.warn(
+              `session sweep cleanup failed: ${error instanceof Error ? error.message : String(error)}`,
+            )
+          }),
+        )
         this.conversations.delete(conv.key)
+      }
+    }
+    if (!allIdle || this.process?.alive !== true) {
+      this.processIdleMs = 0
+      return
+    }
+    this.processIdleMs += slice
+    if (this.processIdleMs > ttl && !this.hasLiveConversations()) {
+      const proc = this.process
+      if (evictions.length === 0) {
+        void this.stopIdleProcess(proc)
+      } else {
+        void Promise.allSettled(evictions).then(() =>
+          this.stopIdleProcess(proc),
+        )
       }
     }
   }

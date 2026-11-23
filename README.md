@@ -39,14 +39,16 @@ installation. See [development setup](docs/development.md) for local testing.
 
 ## Usage
 
-Start `pi`, then use `/model` to refresh and select a model under `antigravity-acp`.
-The available models and reasoning levels are discovered dynamically from your
-Antigravity account and cached locally in `catalog.json`.
+Start `pi`, then use `/model` to select a model under `antigravity-acp` (or run
+`/agy-acp refresh` to force a live catalog refresh). The available models and
+reasoning levels are discovered dynamically from your Antigravity account and
+cached locally in `catalog.json`.
 
 | Command | Purpose |
 | --- | --- |
 | `/agy-acp` or `/agy-acp status` | Show runtime state, account details, models, sessions, and the last turn. |
 | `/agy-acp quota [used\|remaining]` | Show account details, grouped quota bars, and reset countdowns (remembers the last selected mode). |
+| `/agy-acp refresh` | Force a live model catalog refresh from `agy` without starting a conversation. |
 | `/agy-acp reset` | Close ACP sessions; the next request rebuilds the connection. |
 
 After an Antigravity turn settles, the status bar shows quota usage (for example,

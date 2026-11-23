@@ -8,10 +8,11 @@ For installation and your first request, start with the [installation guide](../
 | --- | --- |
 | `/agy-acp` or `/agy-acp status` | Show a status panel with runtime state, paths, sessions, model reasoning levels, and the last turn. |
 | `/agy-acp quota [used\|remaining]` | Show account details, grouped quota bars, and reset countdowns, optionally switching and remembering the display mode. |
+| `/agy-acp refresh` | Force a live model catalog refresh from `agy` and update `catalog.json`. |
 | `/agy-acp reset` | Close ACP sessions; the next request rebuilds a session from Pi's history. |
 
 Subcommands support completion with Tab. Unknown arguments display
-`Usage: /agy-acp [status|quota [used|remaining]|reset]` as a warning.
+`Usage: /agy-acp [status|quota [used|remaining]|refresh|reset]` as a warning.
 
 ### Status panel
 
@@ -69,8 +70,9 @@ successful response displays `No quota data available.`.
 
 Both panels show the email and subscription plan when known, omitting unavailable
 fields. If no plan is cached, the first `/agy-acp quota` query also tries to discover
-it. This may start ACP but sends no model prompt; failure does not prevent quota
-from appearing. Use `/agy-acp reset` to retry discovery. Viewing status never starts it.
+it. This may start a temporary ACP process (stopped again afterward if idle) but
+sends no model prompt; failure does not prevent quota from appearing. Use
+`/agy-acp reset` to retry discovery. Viewing status never starts it.
 
 The email comes from login logs. With the default home only, the extension also
 checks `ANTIGRAVITY_CLI_HOME`, `AGY_HOME`, and `~/.gemini/antigravity-cli`
@@ -142,11 +144,16 @@ directory. Authentication and token refresh remain agy's responsibility.
 ## Models and context
 
 Loading the extension restores the cached catalog from `catalog.json` (or starts
-empty on a fresh install) without starting agy. Model refresh (such as opening
-`/model`) or the first request discovers available models, reasoning levels
-(including grouped select options and `-effort` suffix variants), and image input
-capability (`promptCapabilities.image`) dynamically from ACP. A forced refresh
-queries again; refreshes can be cancelled. The selector exposes only the
+empty on a fresh install) without starting agy. Non-forced model refreshes (such
+as Pi startup or opening `/model`) reuse `catalog.json` without spawning agy
+whenever the cache already contains models for the current `agy` binary. When no
+matching cache exists, after an `agy` binary upgrade, on `/agy-acp refresh`, or
+on the first live request, the extension discovers available models, reasoning
+levels (including grouped select options and `-effort` suffix variants), and
+image input capability (`promptCapabilities.image`) dynamically from ACP.
+Standalone discovery stops its temporary ACP process once the cache is updated;
+idle ACP processes shut down automatically after all sessions expire. Refreshes
+can be cancelled. The selector exposes only the
 reasoning levels offered for each model (`low`, `medium`, `high`, `xhigh`, `max`).
 Direct requests map `minimal` to `low` and forward `xhigh` and `max` (clamping to
 the nearest effort offered by that model); `off` uses the runtime default.

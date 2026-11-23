@@ -114,11 +114,11 @@ export class ModelCatalog {
   private supportsImageInput: boolean | undefined
   /** Latest `availableModels` snapshot, kept for later option updates. */
   private available: readonly AvailableModel[] | undefined
-  /** Subprocess-free fingerprint of the `agy` binary that produced the cached catalog. */
-  private binaryFingerprint: string | undefined
-  /** Set when `binaryFingerprint` differs from the value last persisted on disk. */
-  private fingerprintDirty = false
-  /** Whether a live ACP session has reported the catalog. */
+  /** Current on-disk `agy` binary fingerprint, if resolved. */
+  private currentFingerprint: string | undefined
+  /** Fingerprint of the `agy` binary that produced the cached catalog. */
+  private observedFingerprint: string | undefined
+  /** Whether a live ACP session has reported the catalog in this process. */
   observed = false
   private readonly cachePath: string
 
@@ -128,10 +128,22 @@ export class ModelCatalog {
    */
   constructor(cachePath: string, binaryFingerprint?: string) {
     this.cachePath = cachePath
+    this.currentFingerprint = binaryFingerprint
     this.models = this.load(binaryFingerprint) ?? []
-    if (binaryFingerprint && this.binaryFingerprint === undefined) {
-      this.binaryFingerprint = binaryFingerprint
-    }
+  }
+
+  /** Whether disk-cached models match the current `agy` binary fingerprint. */
+  hasFreshCache(): boolean {
+    return (
+      this.models.length > 0 &&
+      (this.currentFingerprint === undefined ||
+        this.observedFingerprint === this.currentFingerprint)
+    )
+  }
+
+  /** Whether the catalog is current without probing ACP. */
+  isCurrent(): boolean {
+    return this.observed || this.hasFreshCache()
   }
 
   /** Input modalities advertised to Pi, derived from `initialize` `promptCapabilities.image`. */
@@ -161,16 +173,20 @@ export class ModelCatalog {
    */
   syncBinaryFingerprint(fingerprint: string | undefined): boolean {
     if (!fingerprint) return false
-    if (this.binaryFingerprint === fingerprint) return false
+    if (this.currentFingerprint === fingerprint) return false
+    const matchesObserved = this.observedFingerprint === fingerprint
     const hadContextWindows = this.contextWindows.size > 0
     const hadState =
-      this.binaryFingerprint !== undefined || hadContextWindows || this.observed
-    this.binaryFingerprint = fingerprint
-    if (hadState) {
+      this.currentFingerprint !== undefined ||
+      this.observedFingerprint !== undefined ||
+      hadContextWindows ||
+      this.observed
+    this.currentFingerprint = fingerprint
+    if (hadState && !matchesObserved) {
       this.contextWindows.clear()
       this.observed = false
-      this.fingerprintDirty = true
-      this.save()
+      // Persist cleared contextWindows while keeping observedFingerprint intact until live ACP re-observes.
+      if (hadContextWindows) this.save()
       return hadContextWindows
     }
     return false
@@ -304,6 +320,11 @@ export class ModelCatalog {
     this.observed = true
     const changed = JSON.stringify(next) !== JSON.stringify(this.models)
     if (changed) this.models = next
+    const fingerprintChanged =
+      modelEntries.length > 0 &&
+      this.currentFingerprint !== undefined &&
+      this.observedFingerprint !== this.currentFingerprint
+    if (fingerprintChanged) this.observedFingerprint = this.currentFingerprint
     let prunedChanged = false
     if (modelEntries.length > 0) {
       const activeIds = new Set(this.models.map((m) => m.id))
@@ -329,7 +350,7 @@ export class ModelCatalog {
       prunedChanged ||
       derivedChanged ||
       beforeEfforts !== JSON.stringify(this.efforts)
-    if (changed || effortsChanged || tierChanged || this.fingerprintDirty)
+    if (changed || effortsChanged || tierChanged || fingerprintChanged)
       this.save()
     return changed || effortsChanged
   }
@@ -395,8 +416,8 @@ export class ModelCatalog {
             ...(this.supportsImageInput !== undefined
               ? { supportsImage: this.supportsImageInput }
               : {}),
-            ...(this.binaryFingerprint !== undefined
-              ? { binaryFingerprint: this.binaryFingerprint }
+            ...(this.observedFingerprint !== undefined
+              ? { binaryFingerprint: this.observedFingerprint }
               : {}),
           },
           null,
@@ -404,7 +425,6 @@ export class ModelCatalog {
         )}\n`,
       )
       renameSync(tempPath, this.cachePath)
-      this.fingerprintDirty = false
     } catch (_cacheWrite) {
       try {
         unlinkSync(tempPath)
@@ -436,10 +456,7 @@ export class ModelCatalog {
       const fingerprintMatches =
         expectedFingerprint === undefined ||
         storedFingerprint === expectedFingerprint
-      this.binaryFingerprint = fingerprintMatches
-        ? (storedFingerprint ?? expectedFingerprint)
-        : expectedFingerprint
-      this.fingerprintDirty = !fingerprintMatches
+      this.observedFingerprint = storedFingerprint
       this.tierInfo = normalizeTier(parsed.tier)
       if (typeof parsed.supportsImage === 'boolean') {
         this.supportsImageInput = parsed.supportsImage

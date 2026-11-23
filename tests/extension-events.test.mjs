@@ -1325,3 +1325,219 @@ test('extension thinkingLevelMap exposes xhigh and max only when offered and inv
     undefined,
   )
 })
+
+test('non-forced refreshModels skips spawning agy when catalog.json matches the current binary, while /agy-acp refresh forces discovery', async (t) => {
+  const home = isolateHome(t)
+  writeFileSync(
+    join(home, 'catalog.json'),
+    JSON.stringify({
+      models: [{ id: 'gemini-4-argon', name: 'Gemini 4 Argon' }],
+      efforts: ['low', 'high'],
+      byModel: { 'gemini-4-argon': ['low', 'high'] },
+      tier: { name: 'Google AI Pro' },
+      binaryFingerprint: binaryFingerprint(process.execPath),
+    }),
+  )
+  let spawns = 0
+  let commands = 0
+  const spawnAcp = () => {
+    spawns++
+    const stdout = new PassThrough()
+    const exited = Promise.withResolvers()
+    const replies = {
+      initialize: {
+        protocolVersion: 1,
+        agentInfo: { name: 'Antigravity ACP Server', version: '1.5.14' },
+        agentCapabilities: { promptCapabilities: { image: true } },
+      },
+      'session/new': {
+        sessionId: 's-refresh-1',
+        configOptions: [
+          {
+            id: 'model',
+            options: [
+              { value: 'gemini-4-argon', name: 'Gemini 4 Argon' },
+              { value: 'gemini-4-neon', name: 'Gemini 4 Neon' },
+            ],
+          },
+          {
+            id: 'thought_level',
+            options: [{ value: 'low' }, { value: 'high' }],
+          },
+        ],
+        models: {
+          availableModels: [
+            { modelId: 'gemini-4-argon-high' },
+            { modelId: 'gemini-4-neon-high' },
+          ],
+        },
+      },
+      'session/close': {},
+    }
+    return {
+      stdout,
+      exited: exited.promise,
+      stderrTail: () => '',
+      terminate: () => exited.resolve({ code: 0, signal: null }),
+      stdin: new Writable({
+        write(data, _encoding, done) {
+          const req = JSON.parse(data)
+          stdout.write(
+            `${JSON.stringify({ jsonrpc: '2.0', id: req.id, result: replies[req.method] })}\n`,
+          )
+          done()
+        },
+      }),
+    }
+  }
+  const h = mountExtension(t, {
+    runCommand: async () => {
+      commands++
+      return { code: 0, stdout: '1.5.14', stderr: '' }
+    },
+    spawnAcp,
+  })
+
+  // Startup / non-forced refresh returns cached models without spawning agy.
+  const cached = await h.registrations[0].refreshModels({ allowNetwork: true })
+  assert.deepEqual(
+    cached.map((m) => m.id),
+    ['gemini-4-argon'],
+  )
+  assert.equal(spawns, 0)
+  assert.equal(commands, 0)
+
+  // Explicit /agy-acp refresh forces discovery, re-registers models, and leaves runtime idle.
+  await h.command.handler('refresh', h.ctx)
+  assert.equal(spawns, 1)
+  assert.equal(commands, 1)
+  assert.equal(h.registrations.length, 2)
+  assert.deepEqual(
+    h.registrations.at(-1).models.map((m) => m.id),
+    ['gemini-4-argon', 'gemini-4-neon'],
+  )
+  assert.deepEqual(h.notices.at(-1), {
+    text: 'Refreshed Antigravity catalog (2 models)',
+    level: 'info',
+  })
+  await h.command.handler('status', h.ctx)
+  assert.match(h.notices.at(-1).text, /Antigravity ACP · ○ idle/)
+})
+
+test('/agy-acp refresh supports TUI loader cancellation and surfaces errors cleanly', async (t) => {
+  initTheme('dark', false)
+  const pending = Promise.withResolvers()
+  const entered = Promise.withResolvers()
+  const closed = Promise.withResolvers()
+  const makeChild = (sessionNewReply) => {
+    const stdout = new PassThrough()
+    const exited = Promise.withResolvers()
+    const handlers = {
+      initialize: async (id) => {
+        stdout.write(
+          `${JSON.stringify({
+            jsonrpc: '2.0',
+            id,
+            result: {
+              protocolVersion: 1,
+              agentInfo: { name: 'Antigravity ACP Server', version: '1.5.14' },
+              agentCapabilities: { promptCapabilities: { image: true } },
+            },
+          })}\n`,
+        )
+      },
+      'session/new': (id) => sessionNewReply(id, stdout),
+      'session/close': async (id) => {
+        stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id, result: {} })}\n`)
+        closed.resolve()
+      },
+    }
+    return {
+      stdout,
+      exited: exited.promise,
+      stderrTail: () => '',
+      terminate: () => exited.resolve({ code: 0, signal: null }),
+      stdin: new Writable({
+        write(data, _encoding, done) {
+          const req = JSON.parse(data)
+          void handlers[req.method](req.id)
+          done()
+        },
+      }),
+    }
+  }
+  const spawnFactories = [
+    () =>
+      makeChild(async (id, stdout) => {
+        entered.resolve()
+        await pending.promise
+        stdout.write(
+          `${JSON.stringify({
+            jsonrpc: '2.0',
+            id,
+            result: {
+              sessionId: 's-tui-1',
+              configOptions: [
+                {
+                  id: 'model',
+                  options: [{ value: 'gemini-4-argon', name: 'Gemini 4 Argon' }],
+                },
+              ],
+            },
+          })}\n`,
+        )
+      }),
+    () =>
+      makeChild(async (id, stdout) => {
+        stdout.write(
+          `${JSON.stringify({
+            jsonrpc: '2.0',
+            id,
+            error: { code: -32000, message: 'agy offline' },
+          })}\n`,
+        )
+      }),
+  ]
+  const h = harness(t, {
+    runCommand: async () => ({ code: 0, stdout: '1.5.14', stderr: '' }),
+    spawnAcp: () => spawnFactories.shift()(),
+  })
+  let loader = { dispose() {} }
+  t.after(() => loader.dispose())
+  const tuiCtx = {
+    ...h.ctx,
+    mode: 'tui',
+    ui: {
+      ...h.ctx.ui,
+      custom(factory) {
+        return new Promise((resolve) => {
+          loader = factory(
+            { requestRender() {} },
+            { fg: (_color, text) => text },
+            undefined,
+            (value) => {
+              loader.dispose()
+              resolve(value)
+            },
+          )
+        })
+      },
+    },
+  }
+
+  const cancelled = h.command.handler('refresh', tuiCtx)
+  await entered.promise
+  loader.handleInput('\x1b')
+  await cancelled
+  assert.deepEqual(h.notices.at(-1), {
+    text: 'Model refresh cancelled',
+    level: 'info',
+  })
+  pending.resolve()
+  await closed.promise
+  await tick()
+
+  await h.command.handler('refresh', tuiCtx)
+  assert.equal(h.notices.at(-1).level, 'error')
+  assert.match(h.notices.at(-1).text, /Antigravity model refresh failed:.*agy offline/)
+})

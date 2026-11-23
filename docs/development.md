@@ -41,14 +41,22 @@ pi -e ./index.ts
   sockets, or timers; before the first ACP discovery (`catalog.json` absent),
   the catalog starts empty with no hardcoded model list. `catalog.json` is
   written atomically and persists models, per-model efforts, `promptCapabilities.image`,
-  tier, `contextWindows`, and a subprocess-free `agy` binary fingerprint
-  (`realpath`, `dev`, `ino`, `size`, `mtimeNs`); a changed binary invalidates
-  cached `contextWindows` and `observed` so the next refresh or session re-probes.
-  The ACP `initialize` handshake also validates `agentInfo.version` against
-  `MIN_AGY_VERSION`. Concurrent refreshes share a discovery session; after a live
-  catalog is observed, later refreshes reuse it unless forced. Refresh suppresses
+  tier, `contextWindows`, and the subprocess-free `agy` binary fingerprint
+  (`realpath`, `dev`, `ino`, `size`, `mtimeNs`) that observed those models.
+  Non-forced refreshes (`refreshModels` at Pi startup or `/model`) reuse a
+  cached catalog without spawning `agy` whenever `catalog.json` contains models
+  whose persisted fingerprint matches the current `agy` binary. A changed binary
+  clears cached `contextWindows` and `observed` without advancing the persisted
+  fingerprint until live ACP re-observes models, so the next refresh or session
+  re-probes cleanly. The ACP `initialize` handshake also validates
+  `agentInfo.version` against `MIN_AGY_VERSION`. Concurrent refreshes share a
+  discovery session; `/agy-acp refresh` (or `force: true`) bypasses the cache.
+  When standalone discovery starts the front process on an otherwise idle
+  runtime, it stops the temporary process, bridge, and sweeper once discovery
+  completes unless a concurrent `stream()` adopted them. Refresh suppresses
   provider re-registration so it cannot cancel itself. Cancellation ends the
-  caller's wait; shared discovery still closes its session and cleans its files.
+  caller's wait; shared discovery still closes its session, cleans its files,
+  and tears down an ephemeral process.
 - **Session lifecycle:** The bridge binds to `127.0.0.1`, uses per-session bearer
   credentials, and validates structured tool identity before granting permissions.
   On Unix, `agy acp` and helper commands run in detached process groups so
@@ -71,7 +79,12 @@ pi -e ./index.ts
   Tree navigation and compaction close conversation sessions and their files,
   retaining the process, bridge, and caches. `session_start` (`new`, `resume`, or
   `fork`) uses the same light reset if the runtime survives; `session_shutdown`
-  and `/agy-acp reset` dispose the runtime.
+  and `/agy-acp reset` dispose the runtime. A monotonic sleep-resilient sweeper
+  evicts idle sessions after `idleSessionTtlMs` (default 30 minutes) and stops
+  the idle ACP front, MCP bridge, and sweeper once no live sessions or in-flight
+  streams remain and the front itself has been idle past `idleSessionTtlMs`
+  (waiting for any evicted sessions to finish closing first). Upgrading the
+  on-disk `agy` binary while idle uses the same teardown path before restarting.
   Disposal is idempotent, drains in-flight startup and bridge binding, cancels
   waiters, and rolls back late session replies from obsolete processes or
   conversations. A turn owns cancellation through streaming and parked tool
@@ -84,8 +97,10 @@ pi -e ./index.ts
   abort early if stderr matches `Authentication required`. Model selection reads
   memory only. UI generation checks discard stale background results; warning
   keys include group, bucket, reset time, and threshold. An explicit quota query
-  can discover uncached account tiers through one tool-less ACP session per
-  runtime, persisting the tier in `catalog.json`. Email lookup scans `cli.log`
+  can force one tool-less ACP discovery session per runtime when no tier is
+  cached and no live session has been observed yet, persisting the tier in
+  `catalog.json` and stopping the temporary process afterward if the runtime was
+  idle. Email lookup scans `cli.log`
   and the newest 10 contained `log/cli-*.log` and `log/acp-server-*.log` files
   (newest first, deduplicated), checking the tail 64 KiB first and falling back
   to the head 64 KiB when larger. Runtime warnings stay off stderr by default to
