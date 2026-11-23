@@ -1,24 +1,35 @@
 # Reference
 
-For installation and your first request, start with the [installation guide](../README.md#install).
+For installation and your first request, start with the
+[installation guide](../README.md#install). For internal protocol and runtime
+details, see [architecture](architecture.md).
 
 ## Commands
 
 | Command | Behavior |
 | --- | --- |
-| `/agy-acp` or `/agy-acp status` | Show a status panel with runtime state, paths, sessions, model reasoning levels, and the last turn. |
-| `/agy-acp quota [used\|remaining]` | Show account details, grouped quota bars, and reset countdowns, optionally switching and remembering the display mode. |
+| `/agy-acp` or `/agy-acp status` | Show a status panel with runtime state, paths, account details, sessions, model reasoning levels, and the last turn. |
+| `/agy-acp quota [used\|remaining]` | Show account details, grouped quota bars, and reset countdowns, optionally switching and saving the display mode. |
 | `/agy-acp refresh` | Force a live model catalog refresh from `agy` and update `catalog.json`. |
-| `/agy-acp reset` | Close ACP sessions; the next request rebuilds a session from Pi's history. |
+| `/agy-acp reset` | Dispose the ACP runtime (stopping `agy`), clear sessions, status indicator, quota cache, and warning history; the next request rebuilds from Pi's history. |
 
-Subcommands support completion with Tab. Unknown arguments display
+Subcommands support Tab completion (`status`, `quota`, `quota used`,
+`quota remaining`, `refresh`, `reset`). Unknown arguments show
 `Usage: /agy-acp [status|quota [used|remaining]|refresh|reset]` as a warning.
+
+In interactive TUI mode, `/agy-acp quota` (`Fetching Antigravity quota...`) and
+`/agy-acp refresh` (`Refreshing Antigravity models...`) display a cancellable
+loader. Pressing Escape returns to the editor: `/agy-acp refresh` cancels the
+caller's wait, while `/agy-acp quota` hides the pending panel even if the
+underlying `/usage` query finishes updating the cache. Non-TUI modes run
+directly without a loader.
 
 ### Status panel
 
-The panel marks the runtime as idle, starting, ready, or in error. Before the first
-turn, it shows the isolated home and notes that agy has not been probed yet;
-viewing status does not start it. Models list their supported reasoning levels,
+The panel reports the runtime as `idle`, `starting`, `ready`, or `error`.
+Viewing status never starts `agy`; before `agy` has been probed (by a turn,
+`/agy-acp refresh`, or plan discovery), it shows the isolated home and notes
+that `agy` starts lazily. Models list their supported reasoning levels,
 including a fixed level where applicable.
 
 Once a turn finishes, its summary shows the model, effort, outcome (`completed`,
@@ -30,18 +41,9 @@ healthy runtime uses a warning.
 
 ### Quota panel
 
-In interactive TUI mode, a bordered loader displays `Fetching Antigravity quota...`
-while the request is pending. Press Escape to cancel waiting and return to the
-editor. The underlying quota query may finish and update the cache, but its result
-will not appear after cancellation. Non-TUI modes query directly without a loader.
-
-Quota is read through `agy -p /usage --output-format json`. Each model group has
-one row per quota window, with a 12-cell bar, a rounded percentage, and a relative
-reset time (omitted for untouched rolling windows at `0%` used / `100%` remaining
-whose reset time is still a full window away). By default (`used` mode), bars and
-percentages count up from `0%`; pass `remaining` (`/agy-acp quota remaining`) to
-count down from `100%`. The last selected mode is saved in `settings.json` inside
-`PI_AGY_HOME`. For example:
+Quota is read through `agy -p /usage --output-format json`. Disabled quota
+buckets are excluded. Each model group renders one row per usable quota window
+with a 12-cell bar, a rounded percentage, and a relative reset countdown:
 
 ```text
 Antigravity Quota
@@ -53,69 +55,84 @@ Antigravity Quota
     weekly  [█░░░░░░░░░░░]   9% · resets in 6d 7h
 ```
 
-Missing values display `n/a`; an elapsed reset time displays `resetting soon`.
-Severity uses the actual remaining fraction rather than the rounded percentage:
+- **Display mode:** Default is `used` (bars and percentages count up from `0%`).
+  Pass `remaining` (`/agy-acp quota remaining`) to count down from `100%`. When
+  a mode is passed, it is saved to `<PI_AGY_HOME>/settings.json` immediately,
+  even if the quota query is cancelled or fails.
+- **Reset labels:** Untouched rolling windows at `0%` used (`100%` remaining)
+  whose reset time is still a full window away omit the countdown. Otherwise,
+  missing values show `n/a`, elapsed resets show `resetting soon`, unparseable
+  timestamps show `reset time unavailable`, and sub-minute windows show
+  `resets in <1m`.
+- **Empty and stale responses:** A group with no usable windows shows
+  `No quota windows available.`, and an empty successful response shows
+  `No quota data available.`. Failed queries include the reason; if cached
+  groups exist, the title marks them `(stale)` and still renders their bars.
+
+Notification severity uses the actual remaining fraction rather than the rounded
+percentage:
 
 | Condition | Notification |
 | --- | --- |
 | All known windows above 20% remaining (<80% used) | Info |
-| Any window at or below 20% remaining (≥80% used), with none at or below 5% remaining | Warning |
+| Any window at or below 20% remaining (≥80% used), none at or below 5% remaining | Warning |
 | Any window at or below 5% remaining (≥95% used), or a failed quota query | Error |
-
-Errors include the reason. If cached groups are available after a failed query,
-the title marks them as `(stale)` and still displays their bars. An empty
-successful response displays `No quota data available.`.
 
 ### Account details
 
-Both panels show the email and subscription plan when known, omitting unavailable
-fields. If no plan is cached, the first `/agy-acp quota` query also tries to discover
-it. This may start a temporary ACP process (stopped again afterward if idle) but
-sends no model prompt; failure does not prevent quota from appearing. Use
-`/agy-acp reset` to retry discovery. Viewing status never starts it.
+Both panels display the email and subscription plan when known and omit
+unavailable fields:
 
-The email comes from login logs. With the default home only, the extension also
-checks `ANTIGRAVITY_CLI_HOME`, `AGY_HOME`, and `~/.gemini/antigravity-cli`
-(`cli.log` plus the newest 10 `log/cli-*.log` and `log/acp-server-*.log` files,
-scanning each log's tail 64 KiB and falling back to its head 64 KiB when larger);
-a custom `PI_AGY_HOME` stays isolated. Cached plans and login logs can be stale
-after an account change.
+- **Plan:** If no plan is cached, the first `/agy-acp quota` query attempts
+  discovery using a temporary tool-less ACP session (stopped afterward if the
+  runtime was idle) without sending a model prompt. Failure does not block quota
+  display; use `/agy-acp reset` to retry discovery. Viewing status never probes
+  `agy`.
+- **Email:** Read from `agy` login logs. With the default `PI_AGY_HOME`, the
+  extension also checks `ANTIGRAVITY_CLI_HOME`, `AGY_HOME`, and
+  `~/.gemini/antigravity-cli`; a custom `PI_AGY_HOME` stays isolated. Cached
+  plans and login logs can be stale after an account change.
 
 ### Quota status and warnings
 
-When a run using `antigravity-acp` fully settles, the extension checks `/usage`
-in the background and shows a compact status indicator such as `AGY 20%` (or
-`AGY 80%` in `remaining` mode). It uses the lowest known remaining window across
-the selected model's matching quota group(s) (or an unambiguous generic family
-group), and omits the status indicator and low-quota warning when group ownership is
-unknown or ambiguous. Failed background checks stay silent. Successful results
-and failures both respect the two-minute quota TTL, and concurrent background
-checks share the in-flight query.
+After an `antigravity-acp` run settles, the extension refreshes `/usage` in the
+background (sharing any in-flight request and respecting the 2-minute TTL) and
+displays a compact status bar indicator such as `AGY 20%` (or `AGY 80%` in
+`remaining` mode):
 
-At or below 20% and 5% remaining (≥80% and ≥95% used), a warning appears once
-per group, quota window, reset time, and threshold. `/agy-acp quota` explicitly
-refreshes quota and updates the status indicator; `/agy-acp status` uses fresh
-cached quota only. Neither session start nor model selection launches a quota
-command. Selecting another provider hides the status indicator; returning to
-Antigravity uses only a fresh in-memory snapshot. `/agy-acp reset` clears the
-status indicator and warning history; shutdown clears the status indicator.
+- The percentage reflects the lowest known remaining window across the active
+  model's matching quota group(s). When group ownership is unknown or ambiguous
+  (including effort-capped pools without a known effort), the indicator and
+  low-quota warning are omitted.
+- Background query failures stay silent and also respect the 2-minute TTL.
+- Low-quota warnings fire once per group, window, reset time, and threshold at
+  or below 20% remaining (≥80% used) and 5% remaining (≥95% used).
+- `/agy-acp quota` refreshes quota and updates the indicator; `/agy-acp status`
+  uses fresh cached quota only. Neither session start nor model selection starts
+  a quota command (switching between `antigravity-acp` models while a post-turn
+  check is already in flight retargets that check to the newly selected model).
+- Selecting another provider hides the indicator; returning to Antigravity uses
+  only a fresh in-memory snapshot. `/agy-acp reset` clears the indicator and
+  warning history; shutdown clears the indicator.
 
-When the active model belongs to `antigravity-acp`, this extension vetoes Pi's
-automatic prompt-cache warming to avoid background warming requests consuming
-quota. Other providers' warming decisions are left unchanged.
+Two automatic Pi safeguards also apply when `antigravity-acp` is the active
+provider (other providers are untouched):
+
+- **Prompt-cache warming veto:** Cancels Pi's automatic prompt-cache warming so
+  background warming requests do not consume Antigravity quota.
+- **Auto-compaction threshold guard:** Cancels threshold-triggered compaction
+  while a model's context window is still unknown (`0`).
 
 ## Configuration
 
-Set these environment variables before starting Pi:
+Set environment variables before starting Pi:
 
 | Variable | Purpose | Default |
 | --- | --- | --- |
 | `PI_AGY_COMMAND` | Absolute path to the `agy` executable. | Automatic discovery. |
-| `PI_AGY_HOME` | Dedicated directory for this extension's agy state. | `~/.pi/agent/cache/antigravity-acp` |
+| `PI_AGY_HOME` | Dedicated directory for this extension's state. | `~/.pi/agent/cache/antigravity-acp` |
 | `PI_AGY_QUOTA_DISPLAY` | Startup quota display mode (`used` or `remaining`), overriding `settings.json` for startup. Invalid values are ignored; `/agy-acp quota <mode>` overrides it for the active session. | `settings.json`, then `used` |
-| `PI_AGY_DEBUG` | Set to `1` to emit runtime warnings on `stderr` (silent by default to protect the TUI). | Unset (silent) |
-
-For example:
+| `PI_AGY_DEBUG` | Set to `1` to print runtime warnings on `stderr` (silent by default to protect the TUI). | Unset (silent) |
 
 ```sh
 PI_AGY_COMMAND=/absolute/path/to/agy pi -e ./index.ts
@@ -123,91 +140,83 @@ PI_AGY_COMMAND=/absolute/path/to/agy pi -e ./index.ts
 
 ### Stored data and authentication
 
-The dedicated directory isolates the bridge agent from your normal agy tools and
-plugins. It contains agy-managed session data, logs, and the extension's model cache.
+`PI_AGY_HOME` isolates the bridge agent from your normal `agy` tools and
+plugins. It stores the extension's `catalog.json`, `settings.json` (quota
+display preference), ACP logs, and `agy/` (isolated `agy` state, settings, and
+session databases).
 
-Temporary session data and old logs are removed automatically. The current log,
-model cache, `settings.json` (quota display preference), and authentication files
-are retained; sessions rebuild from Pi's history. Cleanup is best-effort if files are locked. Use a different `PI_AGY_HOME`
-for each concurrently running Pi instance, since startup cleanup assumes exclusive
-use of the directory.
-
-With file-backed authentication and the default `PI_AGY_HOME`, the extension
-atomically syncs the existing OAuth token from your normal agy directory
-(`ANTIGRAVITY_CLI_HOME`, `AGY_HOME`, or `~/.gemini/antigravity-cli`) with `0600`
-permissions while refusing symlinked paths. A custom `PI_AGY_HOME` stays
-isolated and does not copy tokens from default agy directories. Note that quota
-queries (`agy -p /usage`) always query the global `agy` CLI account because
-`agy` does not accept `--gemini-dir` on `/usage`. Do not commit or share this
-directory. Authentication and token refresh remain agy's responsibility.
+- **Cleanup:** Temporary session artifacts and old logs are removed
+  automatically (best-effort if locked). Current logs, `catalog.json`,
+  `settings.json`, and authentication files are retained; sessions rebuild from
+  Pi's history. Use a separate `PI_AGY_HOME` for each concurrently running Pi
+  instance because startup cleanup assumes exclusive directory ownership.
+- **OAuth sync:** With the default `PI_AGY_HOME` and file-backed auth, the
+  extension atomically syncs `antigravity-oauth-token` from your normal `agy`
+  directory (`ANTIGRAVITY_CLI_HOME`, `AGY_HOME`, or `~/.gemini/antigravity-cli`)
+  with `0600` permissions when the isolated copy is missing, empty, or older,
+  refusing symlinked paths. Sync failures warn rather than aborting startup. A
+  custom `PI_AGY_HOME` stays isolated and never copies tokens from default `agy`
+  directories.
+- **Global quota scope:** `agy -p /usage` does not accept `--gemini-dir`, so
+  quota queries always reflect the global `agy` CLI account. Do not commit or
+  share `PI_AGY_HOME`; authentication and token refresh remain `agy`'s
+  responsibility.
 
 ## Models and context
 
-Loading the extension restores the cached catalog from `catalog.json` (or starts
-empty on a fresh install) without starting agy. Non-forced model refreshes (such
-as Pi startup or opening `/model`) reuse `catalog.json` without spawning agy
-whenever the cache already contains models for the current `agy` binary. When no
-matching cache exists, after an `agy` binary upgrade, on `/agy-acp refresh`, or
-on the first live request, the extension discovers available models, reasoning
-levels (including grouped select options and `-effort` suffix variants), and
-image input capability (`promptCapabilities.image`) dynamically from ACP.
-Standalone discovery stops its temporary ACP process once the cache is updated;
-idle ACP processes shut down automatically after all sessions expire. Refreshes
-can be cancelled. The selector exposes only the
-reasoning levels offered for each model (`low`, `medium`, `high`, `xhigh`, `max`).
-Direct requests map `minimal` to `low` and forward `xhigh` and `max` (clamping to
-the nearest effort offered by that model); `off` uses the runtime default.
-
-Model context windows start at `0` until learned dynamically from the
-server-issued `max_context_tokens` metadata in the session database and cached
-per model in `catalog.json` alongside the `agy` binary fingerprint; updating the
-`agy` binary invalidates cached context windows and triggers re-discovery on the
-next refresh or session. The history replay budget is 160,000 bytes; older
-history can be omitted to fit, and historical images become text placeholders.
+- **Discovery and caching:** Loading the extension restores `catalog.json` (or
+  starts empty on a fresh install) without starting `agy`. Non-forced refreshes
+  (Pi startup or opening `/model`) reuse `catalog.json` without spawning `agy`
+  whenever cached models match the current `agy` binary fingerprint. Live ACP
+  discovery runs when no matching cache exists, on `/agy-acp refresh`, on the
+  first live request, or after an `agy` binary upgrade once refreshed or
+  restarted. Standalone discovery stops its temporary ACP process afterward,
+  and idle ACP processes shut down automatically after sessions expire.
+- **Reasoning levels:** The `/model` selector exposes only the levels offered
+  for each model (`low`, `medium`, `high`, `xhigh`, `max`). Direct requests map
+  `minimal` to `low`, clamp requested levels to the nearest offered effort, and
+  treat `off` as the runtime default (`high`).
+- **Context windows and replay:** Context windows start at `0` until learned
+  dynamically from session metadata and cached per model in `catalog.json`
+  against the `agy` binary fingerprint; upgrading `agy` invalidates cached
+  context windows. History replay uses a 160,000-byte budget—older turns can be
+  omitted to fit, and historical images become `[image]` placeholders.
 
 ## Usage and costs
 
-Usage comes from the ACP session rather than per-step API headers. Parked `toolUse`
-steps emit zero usage; statistics arrive on the final step when the full ACP turn
-finishes (accumulated across any automatic `max_tokens` continuations). `max_context_tokens`
-recorded in the session SQLite metadata supplies the model's context window, while
-`usage_update` (and same-turn `estimated_tokens_used` metadata when `usage_update`
-is absent) supplies live token occupancy.
+Usage comes from the ACP session rather than per-step HTTP headers. Parked
+`toolUse` steps emit zero usage; statistics arrive on the final step when the
+ACP turn completes (accumulated across any automatic `max_tokens` continuations)
+whenever `session/prompt` reports usage.
 
-The extension separates cumulative token consumption from final-call context
+The extension separates cumulative turn consumption from final-call context
 occupancy:
 
-- `input`, `output`, `cacheRead`, and `cacheWrite` preserve unscaled cumulative
-  turn totals from `session/prompt`, so Pi's session totals and flat pricing
+- `input`, `output`, `cacheRead`, `cacheWrite`, and `reasoning` preserve
+  unscaled cumulative turn totals, so Pi session totals and flat pricing
   overrides reflect full multi-step consumption.
-- `totalTokens` (which feeds Pi's context meter and auto-compaction threshold via
-  `calculateContextTokens`) uses the final model call's live `usage_update.used`
-  count when `agy` provides it. When `usage_update` is absent, it prefers the
-  same turn's `estimated_tokens_used` from `gen_metadata`, and otherwise falls
-  back to averaging the final `session/prompt` segment's prompt tokens across
-  that segment's model calls plus final-segment output tokens; this fallback is
-  an estimate rather than an exact per-step measurement.
+- `totalTokens` (feeding Pi's context meter and auto-compaction threshold) uses
+  the final call's live token occupancy when reported by `agy`, falling back to
+  the same turn's session metadata estimate and then a final-segment average
+  estimate.
 
-Default model prices are zero because pricing is unavailable. If you configure
-Pi model pricing overrides, flat per-million rates price the cumulative turn
-buckets accurately; tiered `inputTokensAbove` rules evaluate against cumulative
-turn prompt tokens rather than per-call prompt sizes. These estimates are not
-an invoice amount or a promise of free access.
+Default model prices are zero because upstream pricing is unavailable. With Pi
+pricing overrides, flat per-million rates price cumulative turn buckets
+accurately; tiered `inputTokensAbove` rules evaluate against cumulative turn
+prompt tokens rather than per-call prompt sizes. These numbers are estimates,
+not an invoice or a promise of free access.
 
-The extension reads only session-scoped `max_context_tokens` metadata inside `PI_AGY_HOME`;
-it never inspects your global `agy` databases or invokes or distributes binary patch
-scripts.
+Read-only SQLite inspection is restricted strictly to session-scoped databases
+inside `PI_AGY_HOME` (for context windows, occupancy estimates, and hidden
+terminal API error detection); the extension never reads global `agy` databases
+or invokes/distributes binary patches.
 
 ## Compatibility limits
 
-This version requires `agy` CLI >= 1.5.10 and targets the `@earendil-works/*`
-Pi packages at version 1.5.x.
-Host `peerDependencies` use `*` as required by Pi package conventions;
-`devDependencies` pin a reproducible CI baseline (`1.5.2`), and CI validates
-both that baseline (on Node.js 22.19.0 and 24) and the `1.5.x` host range
-(`1.5.0` and latest `1.5`), which requires Node.js >= 22.19.0. Compatibility
-with older `@mariozechner/*` interfaces is not claimed.
+- Requires Node.js >= 22.19.0, Pi (`@earendil-works/*`) 1.5.x, and `agy` >=
+  1.5.10. Older `@mariozechner/*` Pi interfaces are not supported.
+- Sampling parameters, output limits, forced `toolChoice`, and provider-scoped
+  environment overrides are not mapped to ACP.
 
-Sampling parameters, output limits, forced `toolChoice`, and provider-scoped
-environment overrides are not mapped to ACP. See
-[development checks](development.md#verification) for the scope of automated validation.
+See [verification](development.md#verification) for the automated test and
+compatibility scope.
