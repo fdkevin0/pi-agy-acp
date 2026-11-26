@@ -423,10 +423,19 @@ export function syncOAuthToken(
   }
 }
 
+/** Optional controls for isolated home preparation. */
+export interface PrepareHomeOptions {
+  /** Remove stale ACP conversation/brain/annotation artifacts and rotated logs. Defaults to `true`. */
+  cleanArtifacts?: boolean
+}
+
 /**
  * Write the isolated Antigravity home: bridge agent and ACP settings.
  * @param home - absolute home directory used as `--gemini-dir`.
  * @param userHome - optional user home override for testing.
+ * @param env - optional environment override for testing.
+ * @param onWarn - optional warning callback for non-fatal OAuth sync issues.
+ * @param options - optional preparation controls.
  * @returns the empty workspace directory used as every session's cwd.
  */
 export function prepareHome(
@@ -434,6 +443,7 @@ export function prepareHome(
   userHome: string = homedir(),
   env: NodeJS.ProcessEnv = process.env,
   onWarn?: (message: string) => void,
+  options: PrepareHomeOptions = {},
 ): string {
   const pluginDir = ensureRealDirectory(home, [
     'config',
@@ -460,25 +470,27 @@ export function prepareHome(
     ].join('\n'),
   )
   const appData = ensureRealDirectory(home, ['agy'])
-  // Pi owns conversation history; no ACP session is restored across processes.
-  // shortcut: cleanup requires an exclusive home; add locking before supporting shared homes.
-  removeArtifacts(appData, [
-    'conversations',
-    'brain',
-    'annotations',
-    'conversation_summaries.db',
-    'conversation_summaries.db-wal',
-    'conversation_summaries.db-shm',
-    'conversation_summaries.db-journal',
-    'jetbox_summaries_proto.pb',
-  ])
-  try {
-    removeArtifacts(
-      home,
-      readdirSync(home).filter((name) => /^acp\.log\.\d+$/.test(name)),
-    )
-  } catch {
-    // Log cleanup is best-effort when the home cannot be listed.
+  if (options.cleanArtifacts !== false) {
+    // Pi owns conversation history; cold startup cleans stale ACP artifacts from prior processes.
+    // shortcut: cleanup requires an exclusive home; add locking before supporting shared homes.
+    removeArtifacts(appData, [
+      'conversations',
+      'brain',
+      'annotations',
+      'conversation_summaries.db',
+      'conversation_summaries.db-wal',
+      'conversation_summaries.db-shm',
+      'conversation_summaries.db-journal',
+      'jetbox_summaries_proto.pb',
+    ])
+    try {
+      removeArtifacts(
+        home,
+        readdirSync(home).filter((name) => /^acp\.log\.\d+$/.test(name)),
+      )
+    } catch {
+      // Log cleanup is best-effort when the home cannot be listed.
+    }
   }
   try {
     syncOAuthToken(home, userHome, env)

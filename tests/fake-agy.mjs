@@ -25,7 +25,7 @@
 //   CALL_ALWAYSONLY <tool> <json>  reported call whose options only offer allow_always
 // Setting FAKE_AGY_NO_HANDSHAKE skips the MCP initialize handshake at session/new.
 // Every received prompt is appended to $FAKE_AGY_LOG as one JSON line.
-import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { createInterface } from 'node:readline'
 import { DatabaseSync } from 'node:sqlite'
@@ -770,6 +770,9 @@ async function handleLine(line) {
               image: process.env.FAKE_AGY_IMAGE !== '0',
               audio: false,
             },
+            sessionCapabilities: {
+              resume: {},
+            },
           },
           agentInfo: {
             name: 'fake-agy',
@@ -780,7 +783,7 @@ async function handleLine(line) {
     }
     if (method === 'session/new') {
       const s = {
-        id: `s${nextSession++}`,
+        id: `s${process.pid}-${nextSession++}`,
         model: 'gemini-4-argon',
         level: 'medium',
         mcp: params.mcpServers?.[0],
@@ -827,6 +830,96 @@ async function handleLine(line) {
         appendFileSync(
           mcpLog,
           `${JSON.stringify({ session: s.id, url: s.mcp?.url, authorization: s.mcp?.headers?.find((h) => h.name.toLowerCase() === 'authorization')?.value })}\n`,
+        )
+      }
+      return send({
+        jsonrpc: '2.0',
+        id,
+        result: {
+          sessionId: s.id,
+          _meta: {
+            antigravity: {
+              tier: { id: 'test-ultra', name: 'Google AI Ultra' },
+            },
+          },
+          configOptions: configOptions(s),
+          models: {
+            availableModels: availableModels(),
+            currentModelId: `${s.model}-${s.level}`,
+          },
+        },
+      })
+    }
+    if (method === 'session/resume') {
+      const targetId = params?.sessionId
+      if (process.env.FAKE_AGY_RESUME_ERROR) {
+        return send({
+          jsonrpc: '2.0',
+          id,
+          error: {
+            code: Number(process.env.FAKE_AGY_RESUME_ERROR),
+            message: `Failed to read session ${targetId}; retry, or load it with session/load`,
+          },
+        })
+      }
+      const dbPath =
+        home && typeof targetId === 'string'
+          ? join(home, 'agy', 'conversations', `${targetId}.db`)
+          : undefined
+      if (!dbPath || !existsSync(dbPath)) {
+        return send({
+          jsonrpc: '2.0',
+          id,
+          error: {
+            code: -32603,
+            message: `Failed to read session ${targetId}; retry, or load it with session/load`,
+          },
+        })
+      }
+      const db = new DatabaseSync(dbPath)
+      const nextMetaRow = db
+        .prepare('SELECT COALESCE(MAX(idx) + 1, 0) AS nextIdx FROM gen_metadata')
+        .get()
+      const nextStepRow = db
+        .prepare('SELECT COALESCE(MAX(idx) + 1, 0) AS nextIdx FROM steps')
+        .get()
+      // Match live `agy`: configOptions reset to defaults on session/resume.
+      const s = {
+        id: targetId,
+        model: 'gemini-4-argon',
+        level: 'medium',
+        mcp: params.mcpServers?.[0],
+        system: params._meta?.antigravity?.systemPrompt?.append ?? '',
+        tools: [],
+        metaSeq: Number(nextMetaRow?.nextIdx ?? 0),
+        stepSeq: Number(nextStepRow?.nextIdx ?? 0),
+        db,
+      }
+      sessions.set(s.id, s)
+      if (s.mcp && !process.env.FAKE_AGY_NO_HANDSHAKE) {
+        await mcp(s.mcp, {
+          jsonrpc: '2.0',
+          id: ++rpcId,
+          method: 'initialize',
+          params: {
+            protocolVersion: '2025-06-18',
+            capabilities: {},
+            clientInfo: { name: 'fake', version: '0' },
+          },
+        })
+        s.tools = (
+          await mcp(s.mcp, {
+            jsonrpc: '2.0',
+            id: ++rpcId,
+            method: 'tools/list',
+            params: {},
+          })
+        ).result.tools.map((t) => t.name)
+      }
+      if (mcpLog) {
+        appendFileSync(
+          mcpLog,
+          `${JSON.stringify({ session: s.id, resumed: true, url: s.mcp?.url, authorization: s.mcp?.headers?.find((h) => h.name.toLowerCase() === 'authorization')?.value })}\n`,
         )
       }
       return send({

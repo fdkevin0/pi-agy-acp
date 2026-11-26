@@ -21,6 +21,8 @@ const FORCED_AGY_ENV_KEYS_LOWER = new Set([
   'agy_cli_disable_auto_update',
   'pythonunbuffered',
 ])
+const AUTO_COMPACT_OVERRIDE_KEY = 'AGY_CLI_AUTO_COMPACT_OVERRIDE'
+const AUTO_COMPACT_OVERRIDE_KEY_LOWER = AUTO_COMPACT_OVERRIDE_KEY.toLowerCase()
 
 /** Build a sanitized environment for spawning `agy` subprocesses. */
 export function buildAgyEnv(
@@ -29,6 +31,7 @@ export function buildAgyEnv(
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {}
   const caseInsensitive = platform === 'win32'
+  let hasAutoCompactOverride = false
   for (const [key, value] of Object.entries(baseEnv)) {
     if (value === undefined) continue
     if (caseInsensitive) {
@@ -38,13 +41,24 @@ export function buildAgyEnv(
         FORCED_AGY_ENV_KEYS_LOWER.has(lower)
       )
         continue
-    } else if (STRIPPED_AGY_ENV_KEYS.has(key)) {
-      continue
+      if (lower === AUTO_COMPACT_OVERRIDE_KEY_LOWER) {
+        hasAutoCompactOverride = true
+      }
+    } else {
+      if (STRIPPED_AGY_ENV_KEYS.has(key)) continue
+      if (key === AUTO_COMPACT_OVERRIDE_KEY) {
+        hasAutoCompactOverride = true
+      }
     }
     env[key] = value
   }
   env.AGY_CLI_DISABLE_AUTO_UPDATE = '1'
   env.PYTHONUNBUFFERED = '1'
+  // Keep agy's internal auto-compaction at the highest valid threshold so Pi
+  // owns compaction unless the user explicitly sets AGY_CLI_AUTO_COMPACT_OVERRIDE.
+  if (!hasAutoCompactOverride) {
+    env[AUTO_COMPACT_OVERRIDE_KEY] = '100%'
+  }
   return env
 }
 

@@ -133,6 +133,7 @@ Set environment variables before starting Pi:
 | `PI_AGY_HOME` | Dedicated directory for this extension's state. | `~/.pi/agent/cache/antigravity-acp` |
 | `PI_AGY_QUOTA_DISPLAY` | Startup quota display mode (`used` or `remaining`), overriding `settings.json` for startup. Invalid values are ignored; `/agy-acp quota <mode>` overrides it for the active session. | `settings.json`, then `used` |
 | `PI_AGY_DEBUG` | Set to `1` to print runtime warnings on `stderr` (silent by default to protect the TUI). | Unset (silent) |
+| `AGY_CLI_AUTO_COMPACT_OVERRIDE` | Forwarded to `agy` to control its internal auto-compaction threshold (e.g. `80%`, or `0` to revert to `agy`'s server default). | `100%` (when unset) |
 
 ```sh
 PI_AGY_COMMAND=/absolute/path/to/agy pi -e ./index.ts
@@ -145,11 +146,14 @@ plugins. It stores the extension's `catalog.json`, `settings.json` (quota
 display preference), ACP logs, and `agy/` (isolated `agy` state, settings, and
 session databases).
 
-- **Cleanup:** Temporary session artifacts and old logs are removed
-  automatically (best-effort if locked). Current logs, `catalog.json`,
-  `settings.json`, and authentication files are retained; sessions rebuild from
-  Pi's history. Use a separate `PI_AGY_HOME` for each concurrently running Pi
-  instance because startup cleanup assumes exclusive directory ownership.
+- **Cleanup:** Temporary session artifacts and old logs are removed on cold
+  startup and explicit resets (best-effort if locked). Clean idle-expired
+  sessions retain their database across idle front restarts so the next turn can
+  resume via `session/resume` without history replay, falling back automatically
+  to a fresh session rebuild if resume fails or history diverged. Current logs,
+  `catalog.json`, `settings.json`, and authentication files are retained. Use a
+  separate `PI_AGY_HOME` for each concurrently running Pi instance because
+  startup cleanup assumes exclusive directory ownership.
 - **Sign-in:** Sign in with `agy` before starting Pi, or run `agy acp --login`
   in headless, SSH, or terminal-only environments. Authentication and token
   refresh remain `agy`'s responsibility.

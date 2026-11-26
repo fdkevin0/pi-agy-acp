@@ -21,6 +21,7 @@ Working directory is `<PI_AGY_HOME>/workspace`. ACP JSON-RPC timeouts:
 | --- | --- |
 | `initialize` | 120 s |
 | `session/new` | 120 s |
+| `session/resume` | 120 s |
 | `session/set_config_option` | 60 s |
 | `session/close` | 15 s |
 | `session/prompt` | None (bounded by turn/abort lifecycle) |
@@ -117,12 +118,23 @@ Working directory is `<PI_AGY_HOME>/workspace`. ACP JSON-RPC timeouts:
   first and failing fast with `CAPACITY_EXCEEDED` (`RATE_LIMIT`) to avoid
   parent/subagent deadlocks. Requests without a `sessionId` use ephemeral
   `anon-*` keys torn down immediately after each idle step.
-- **Idle sweeper:** Runs every 60 s (`.unref()`) with a monotonic delta capped
-  at 120 s per tick for sleep resilience. Idle conversations expire after
-  `idleSessionTtlMs` (30 min); once no live sessions or in-flight streams remain
-  and the front has been idle past `idleSessionTtlMs`, the sweeper stops the
-  ACP process, MCP bridge, and itself (waiting for evicted sessions to close
-  first).
+- **Idle sweeper and `session/resume`:** Runs every 60 s (`.unref()`) with a
+  monotonic delta capped at 120 s per tick for sleep resilience. Idle
+  conversations expire after `idleSessionTtlMs` (30 min): clean, named
+  conversations close via `session/close` while retaining their SQLite DB in a
+  bounded `resumableSessions` map (`maxLiveSessions * 2`, LRU-evicted with
+  artifact cleanup), whereas dirty or ephemeral `anon-*` sessions delete their
+  artifacts immediately. Once no live sessions or in-flight streams remain and
+  the front has been idle past `idleSessionTtlMs`, the sweeper stops the ACP
+  process, MCP bridge, and itself (waiting for evicted sessions to close first).
+  On an idle front restart (`prepareHome(..., { cleanArtifacts: false })`),
+  retained DBs survive; when the next turn arrives with an intact system prompt
+  and history prefix, the runtime calls `session/resume` with a fresh MCP
+  tenant, re-applies model/effort via `select()`, and sends only the delta
+  input. Any `JsonRpcRemoteError` from `session/resume` (including `-32603` and
+  `-32002`) or history divergence cleans the dormant DB and falls back to
+  `session/new` + `replayPrompt()`. Explicit teardown (`resetConversations()`,
+  `dispose()`, binary upgrade, LRU eviction) deletes dormant DBs immediately.
 - **Pi lifecycle resets:** Compaction, tree navigation, and `session_start`
   (`new`, `resume`, `fork`) perform a light reset (closing conversation sessions
   and artifacts while keeping the ACP process, bridge, and caches).
@@ -141,8 +153,10 @@ Working directory is `<PI_AGY_HOME>/workspace`. ACP JSON-RPC timeouts:
     trees via `taskkill /T /F /PID`. Helper commands wait up to 250 ms
     (`EXIT_DRAIN_MS`) after exit to avoid hangs from inherited stdio handles.
   - Subprocess environments strip `GEMINI_API_KEY`, `GOOGLE_API_KEY`,
-    `GEMINI_HOME`, `ELECTRON_RUN_AS_NODE`, and `CHROME_CRASHPAD_PIPE_NAME`, and
-    force `AGY_CLI_DISABLE_AUTO_UPDATE=1` and `PYTHONUNBUFFERED=1`.
+    `GEMINI_HOME`, `ELECTRON_RUN_AS_NODE`, and `CHROME_CRASHPAD_PIPE_NAME`,
+    force `AGY_CLI_DISABLE_AUTO_UPDATE=1` and `PYTHONUNBUFFERED=1`, and default
+    `AGY_CLI_AUTO_COMPACT_OVERRIDE=100%` when unset (case-insensitively on
+    Windows) so Pi owns compaction while preserving explicit user overrides.
   - Binary auto-discovery checks `~/.local/bin/agy` and `PATH` on Unix, and
     `%LOCALAPPDATA%\agy\bin\agy.exe`, `~/.local/bin/agy.exe`, then `PATH`
     (`.exe` prioritized ahead of `PATHEXT` wrappers) on Windows.
