@@ -571,12 +571,14 @@ setInterval(() => {}, 60000)
   writeFileSync(
     orphanParent,
     `import { spawn } from 'node:child_process'
-import { writeFileSync } from 'node:fs'
+import { renameSync, writeFileSync } from 'node:fs'
 const gc = spawn(process.execPath, ['-e', 'setInterval(() => {}, 60000)'], {
   detached: true,
   stdio: ['ignore', 'inherit', 'inherit'],
 })
-writeFileSync(${JSON.stringify(gcPidFile)}, String(gc.pid))
+const pidFile = ${JSON.stringify(gcPidFile)}
+writeFileSync(pidFile + '.tmp', String(gc.pid))
+renameSync(pidFile + '.tmp', pidFile)
 gc.unref()
 process.stdout.write('parent-done')
 process.exit(0)
@@ -601,12 +603,14 @@ process.exit(0)
   writeFileSync(
     abortParent,
     `import { spawn } from 'node:child_process'
-import { writeFileSync } from 'node:fs'
+import { renameSync, writeFileSync } from 'node:fs'
 const gc = spawn(process.execPath, ['-e', 'setInterval(() => {}, 60000)'], {
   detached: true,
   stdio: ['ignore', 'inherit', 'inherit'],
 })
-writeFileSync(${JSON.stringify(abortGcPidFile)}, String(gc.pid))
+const pidFile = ${JSON.stringify(abortGcPidFile)}
+writeFileSync(pidFile + '.tmp', String(gc.pid))
+renameSync(pidFile + '.tmp', pidFile)
 gc.unref()
 process.stderr.write('ABORT_NOW\\n')
 setInterval(() => {}, 60000)

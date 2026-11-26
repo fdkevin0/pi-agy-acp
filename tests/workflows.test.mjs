@@ -84,19 +84,28 @@ function fixture(t, version = '1.2.3') {
 
 test('release preflight rejects branch dispatch and tag mismatches before contacting npm', (t) => {
   const run = fixture(t)
-  for (const env of [
-    { GITHUB_REF_TYPE: 'branch', GITHUB_REF_NAME: 'main' },
-    { GITHUB_REF_NAME: 'v9.9.9' },
-  ]) {
-    const result = run('Validate release tag and check npm registry', env)
-    assert.notEqual(result.status, 0)
-    assert.match(
-      result.stdout,
-      /Run this workflow on the existing v1\.2\.3 tag/,
-    )
-    assert.equal(result.output, '')
-    assert.equal(result.calls, '')
-  }
+  const branchResult = run('Validate release tag and check npm registry', {
+    GITHUB_REF_TYPE: 'branch',
+    GITHUB_REF_NAME: 'main',
+  })
+  assert.notEqual(branchResult.status, 0)
+  assert.match(
+    branchResult.stdout,
+    /Run this workflow on the existing v1\.2\.3 tag/,
+  )
+  assert.equal(branchResult.output, '')
+  assert.equal(branchResult.calls, '')
+
+  const mismatchResult = run('Validate release tag and check npm registry', {
+    GITHUB_REF_NAME: 'v9.9.9',
+  })
+  assert.notEqual(mismatchResult.status, 0)
+  assert.match(
+    mismatchResult.stdout,
+    /Run this workflow on the existing v1\.2\.3 tag/,
+  )
+  assert.equal(mismatchResult.output, '')
+  assert.equal(mismatchResult.calls, '')
 })
 
 test('prerelease tags cannot accidentally publish to the stable channel', (t) => {
@@ -112,27 +121,27 @@ test('prerelease tags cannot accidentally publish to the stable channel', (t) =>
 
 test('only a registry 404 allows publication; outages and auth failures stop the release', (t) => {
   const run = fixture(t)
-  for (const [status, expected] of [
-    ['200', 'true'],
-    ['404', 'false'],
-  ]) {
+  const assertPublished = (status, expected) => {
     const result = run('Validate release tag and check npm registry', {
       HTTP_STATUS: status,
     })
     assert.equal(result.status, 0, result.stderr)
     assert.equal(result.output, `published=${expected}\n`)
   }
-  for (const env of [
-    { HTTP_STATUS: '401' },
-    { HTTP_STATUS: '403' },
-    { HTTP_STATUS: '429' },
-    { HTTP_STATUS: '500' },
-    { CURL_EXIT: '28', HTTP_STATUS: '000' },
-  ]) {
+  const assertBlocked = (env) => {
     const result = run('Validate release tag and check npm registry', env)
     assert.notEqual(result.status, 0)
     assert.equal(result.output, '')
   }
+
+  assertPublished('200', 'true')
+  assertPublished('404', 'false')
+
+  assertBlocked({ HTTP_STATUS: '401' })
+  assertBlocked({ HTTP_STATUS: '403' })
+  assertBlocked({ HTTP_STATUS: '429' })
+  assertBlocked({ HTTP_STATUS: '500' })
+  assertBlocked({ CURL_EXIT: '28', HTTP_STATUS: '000' })
 })
 
 test('release recovery reuses the existing tag and never creates a tag at the current commit', (t) => {

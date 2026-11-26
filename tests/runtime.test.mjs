@@ -53,7 +53,6 @@ import {
 
 const here = dirname(fileURLToPath(import.meta.url))
 const fake = join(here, 'fake-agy.mjs')
-chmodSync(fake, 0o755)
 
 function readJsonl(path) {
   return existsSync(path)
@@ -875,7 +874,7 @@ test('cancellation aborts the step and the next turn rebuilds', async (t) => {
     adapter.stream({
       ...base,
       signal: controller.signal,
-      messages: [sys, user('u1', 'SLEEP 2000')],
+      messages: [sys, user('u1', 'WAIT_CANCEL')],
     }),
   )
   await entered.promise
@@ -888,7 +887,7 @@ test('cancellation aborts the step and the next turn rebuilds', async (t) => {
       ...base,
       messages: [
         sys,
-        user('u1', 'SLEEP 2000'),
+        user('u1', 'WAIT_CANCEL'),
         assistant('a1', [{ type: 'text', text: 'partial' }]),
         user('u2', 'again'),
       ],
@@ -1955,7 +1954,7 @@ test('the MCP bridge enforces per-tenant bearer secrets and drops the conversati
       headers: {
         'content-type': 'application/json',
         accept: 'application/json, text/event-stream',
-        ...(authorization !== undefined ? { authorization } : {}),
+        authorization,
       },
       body: JSON.stringify(body),
     })
