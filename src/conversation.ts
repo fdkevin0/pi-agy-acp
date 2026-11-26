@@ -1057,7 +1057,7 @@ async function* stepChunks(
  * @param call - the still-running call.
  * @returns MCP result instructing the agent to keep waiting.
  */
-export function relayNotice(call: ParkedCall): BridgeToolResult {
+function relayNotice(call: ParkedCall): BridgeToolResult {
   return {
     content: [
       {

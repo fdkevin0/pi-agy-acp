@@ -362,13 +362,32 @@ export class AcpProcess {
 
   private onNotification(method: string, params: unknown): void {
     if (method !== 'session/update') return
-    const record = params as { sessionId?: string; update?: AcpSessionUpdate }
-    if (record.sessionId === undefined || record.update === undefined) return
-    this.listeners.get(record.sessionId)?.onUpdate(record.update)
+    if (params === null || typeof params !== 'object' || Array.isArray(params))
+      return
+    const record = params as { sessionId?: unknown; update?: unknown }
+    if (
+      typeof record.sessionId !== 'string' ||
+      record.update === null ||
+      typeof record.update !== 'object' ||
+      Array.isArray(record.update)
+    )
+      return
+    this.listeners
+      .get(record.sessionId)
+      ?.onUpdate(record.update as AcpSessionUpdate)
   }
 
   private onRequest(method: string, params: unknown): unknown {
     if (method === 'session/request_permission') {
+      if (
+        params === null ||
+        typeof params !== 'object' ||
+        Array.isArray(params)
+      )
+        return { outcome: { outcome: 'cancelled' } }
+      const record = params as { sessionId?: unknown }
+      if (typeof record.sessionId !== 'string')
+        return { outcome: { outcome: 'cancelled' } }
       const request = params as AcpPermissionRequest
       const outcome = this.listeners
         .get(request.sessionId)

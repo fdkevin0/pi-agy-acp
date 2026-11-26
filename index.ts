@@ -209,7 +209,7 @@ export default function (
   })
   pi.on('agent_settled', (_event, ctx) => {
     // Pi 1.5.2 AgentSession._emitAgentSettled runs after tools and the run finish.
-    runtime.settleSession(ctx.sessionManager.getSessionId())
+    activeRuntime?.settleSession(ctx.sessionManager.getSessionId())
     const current = activeRuntime
     if (!current || !ctx.hasUI || ctx.model?.provider !== config.provider) return
     if (pendingSettle?.runtime === current) {
@@ -414,15 +414,21 @@ export default function (
           return
         }
       }
-      const notice = snapshot
-        ? formatQuota(snapshot, undefined, quotaDisplay)
-        : formatStatus(
-            runtime.status(
-              ctx.model?.provider === config.provider
-                ? ctx.model.id
-                : undefined,
-            ),
-          )
+      let notice: { text: string; level: 'info' | 'warning' | 'error' }
+      if (snapshot) {
+        notice = formatQuota(snapshot, undefined, quotaDisplay)
+      } else {
+        const current = activeRuntime
+        if (!current) {
+          ctx.ui.notify('Antigravity ACP runtime is disposed.', 'error')
+          return
+        }
+        notice = formatStatus(
+          current.status(
+            ctx.model?.provider === config.provider ? ctx.model.id : undefined,
+          ),
+        )
+      }
       if (epoch === uiEpoch)
         updateStatus(ctx, snapshot ?? activeRuntime?.quota.peek())
       ctx.ui.notify(notice.text, notice.level)

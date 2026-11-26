@@ -5537,3 +5537,31 @@ test('sweep reaps an idle front after evicting its last session and after resetC
   assert.equal(runtime.bridge.server, undefined)
   assert.equal(runtime.status().state, 'idle')
 })
+
+test('resetConversations returns cleanly when racing with dispose and answerPermission guards non-array options', async (t) => {
+  const { runtime } = makeRuntime(t)
+  await collect(
+    runtime.stream({
+      model: 'gemini-4-argon',
+      sessionId: 'RACE-1',
+      messages: [sys, user('u1', 'hello')],
+    }),
+  )
+  const conv = runtime.conversations.get('RACE-1')
+  assert.ok(conv)
+  assert.deepEqual(
+    runtime.answerPermission(conv, {
+      sessionId: conv.sessionId,
+      options: null,
+    }),
+    { outcome: 'cancelled' },
+  )
+
+  const release = await runtime.mutex.acquire('RACE-1')
+  const resetting = runtime.resetConversations()
+  const disposing = runtime.dispose()
+  release()
+  await Promise.all([resetting, disposing])
+  await runtime.resetConversations()
+  assert.equal(runtime.conversations.size, 0)
+})

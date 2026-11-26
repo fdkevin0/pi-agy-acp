@@ -2178,3 +2178,55 @@ test('QuotaReader auth-required error mentions agy acp --login', async () => {
   assert.equal(snap.status, 'error')
   assert.match(snap.error ?? '', /agy acp --login/)
 })
+
+test('parseUsage rejects non-object JSON roots and filters malformed group entries', () => {
+  assert.throws(() => parseUsage('null'), /no quota groups/)
+  assert.throws(() => parseUsage('"string"'), /no quota groups/)
+  assert.throws(() => parseUsage('[]'), /no quota groups/)
+  assert.throws(() => parseUsage('{"command":null}'), /no quota groups/)
+  assert.throws(() => parseUsage('{"command":{"data":null}}'), /no quota groups/)
+
+  const groups = parseUsage(
+    JSON.stringify({
+      command: {
+        data: {
+          groups: [
+            null,
+            'bad',
+            [],
+            42,
+            {
+              name: 'Gemini',
+              description: 'Primary models',
+              buckets: [
+                null,
+                {
+                  id: 'b1',
+                  name: '5h',
+                  window: '5h',
+                  remaining_fraction: 0.75,
+                  reset_time: '2026-01-01T00:00:00Z',
+                },
+              ],
+            },
+          ],
+        },
+      },
+    }),
+  )
+  assert.deepEqual(groups, [
+    {
+      name: 'Gemini',
+      description: 'Primary models',
+      buckets: [
+        {
+          id: 'b1',
+          name: '5h',
+          window: '5h',
+          remainingFraction: 0.75,
+          resetTime: '2026-01-01T00:00:00Z',
+        },
+      ],
+    },
+  ])
+})

@@ -221,26 +221,33 @@ function parseBucket(raw: unknown): QuotaBucket | undefined {
  * @returns the quota groups.
  */
 export function parseUsage(stdout: string): QuotaGroup[] {
-  const parsed = JSON.parse(stdout) as {
-    command?: { data?: { groups?: unknown[] } }
-  }
-  const groups = parsed.command?.data?.groups
+  const parsed: unknown = JSON.parse(stdout)
+  const command =
+    parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as { command?: unknown }).command
+      : undefined
+  const data =
+    command !== null && typeof command === 'object' && !Array.isArray(command)
+      ? (command as { data?: unknown }).data
+      : undefined
+  const groups =
+    data !== null && typeof data === 'object' && !Array.isArray(data)
+      ? (data as { groups?: unknown }).groups
+      : undefined
   if (!Array.isArray(groups))
     throw new Error('agy /usage returned no quota groups')
-  return groups.map((raw) => {
-    const group = raw as {
-      name?: string
-      description?: string
-      buckets?: unknown[]
-    }
-    return {
+  return groups
+    .filter(
+      (raw): raw is Record<string, unknown> =>
+        raw !== null && typeof raw === 'object' && !Array.isArray(raw),
+    )
+    .map((group) => ({
       name: String(group.name ?? ''),
       description: String(group.description ?? ''),
       buckets: (Array.isArray(group.buckets) ? group.buckets : [])
         .map(parseBucket)
         .filter((bucket): bucket is QuotaBucket => bucket !== undefined),
-    }
-  })
+    }))
 }
 
 /** Cached quota reader with request coalescing. */
@@ -278,10 +285,6 @@ export class QuotaReader {
       this.now() - this.cachedAt < this.ttlMs
       ? this.cached
       : undefined
-  }
-
-  get pending(): boolean {
-    return this.inflight !== undefined
   }
 
   /**

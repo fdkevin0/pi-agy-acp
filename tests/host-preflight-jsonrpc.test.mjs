@@ -806,3 +806,102 @@ process.exit(0)
   assert.equal(debugRes.code, 0)
   assert.match(debugRes.stderr, /\[pi-agy-acp\] acp: dropped frame: unparsable frame: not-valid-json/)
 })
+
+test('JsonRpcPeer.write ignores late async onRequest settlement after close', async () => {
+  const input = new PassThrough()
+  const output = new PassThrough()
+  output.setEncoding('utf8')
+  const written = []
+  output.on('data', (chunk) => written.push(chunk))
+  const gate = Promise.withResolvers()
+  const entered = Promise.withResolvers()
+  const peer = new JsonRpcPeer(input, output, {
+    onRequest: async () => {
+      entered.resolve()
+      return gate.promise
+    },
+    onNotification() {},
+  })
+
+  input.write('{"jsonrpc":"2.0","id":7,"method":"ping","params":{}}\n')
+  await entered.promise
+  peer.close(new Error('shutdown'))
+  gate.resolve({ ok: true })
+  await Promise.resolve()
+  await Promise.resolve()
+  assert.deepEqual(written, [])
+})
+
+test('AcpProcess guards malformed session/update and session/request_permission params', async () => {
+  const stdin = new PassThrough()
+  const stdout = new PassThrough()
+  stdin.setEncoding('utf8')
+  const replies = []
+  const threeReplies = Promise.withResolvers()
+  let buf = ''
+  const onLine = (line) => {
+    const msg = JSON.parse(line)
+    replies.push(msg)
+  }
+  const updates = []
+  const permissions = []
+  const logs = []
+  const proc = new AcpProcess({
+    argv: ['fake-agy', 'acp'],
+    cwd: tmpdir(),
+    clientName: 'pi-agy-acp',
+    clientVersion: '0.2.3',
+    log: (msg) => logs.push(msg),
+    spawn: () => ({
+      stdin,
+      stdout,
+      exited: new Promise(() => {}),
+      terminate() {},
+      stderrTail: () => '',
+    }),
+  })
+  stdin.on('data', (chunk) => {
+    buf += chunk
+    const lines = buf.split('\n')
+    buf = lines.pop()
+    lines.filter(Boolean).forEach(onLine)
+    const permissionReplies = replies.filter((m) => m.id === 10 || m.id === 11 || m.id === 12)
+    permissionReplies.length === 3 && threeReplies.resolve()
+  })
+
+  const startPromise = proc.start(5_000)
+  stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id: 1, result: { protocolVersion: 1 } })}\n`)
+  await startPromise
+
+  const sessionPromise = proc.newSession(
+    {},
+    {
+      onUpdate: (u) => updates.push(u),
+      onPermission: (r) => {
+        permissions.push(r)
+        return { outcome: 'cancelled' }
+      },
+    },
+    5_000,
+  )
+  stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id: 2, result: { sessionId: 's1' } })}\n`)
+  await sessionPromise
+
+  stdout.write('{"jsonrpc":"2.0","method":"session/update","params":null}\n')
+  stdout.write('{"jsonrpc":"2.0","method":"session/update","params":[]}\n')
+  stdout.write('{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":42,"update":{}}}\n')
+  stdout.write('{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":null}}\n')
+  stdout.write('{"jsonrpc":"2.0","id":10,"method":"session/request_permission","params":null}\n')
+  stdout.write('{"jsonrpc":"2.0","id":11,"method":"session/request_permission","params":[]}\n')
+  stdout.write('{"jsonrpc":"2.0","id":12,"method":"session/request_permission","params":{"sessionId":123}}\n')
+
+  await threeReplies.promise
+  const byId = new Map(replies.map((m) => [m.id, m]))
+  assert.deepEqual(byId.get(10)?.result, { outcome: { outcome: 'cancelled' } })
+  assert.deepEqual(byId.get(11)?.result, { outcome: { outcome: 'cancelled' } })
+  assert.deepEqual(byId.get(12)?.result, { outcome: { outcome: 'cancelled' } })
+  assert.equal(updates.length, 0)
+  assert.equal(permissions.length, 0)
+  assert.deepEqual(logs, [])
+  proc.stop()
+})

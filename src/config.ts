@@ -1,11 +1,6 @@
-import {
-  mkdirSync,
-  readFileSync,
-  renameSync,
-  unlinkSync,
-  writeFileSync,
-} from 'node:fs'
+import { mkdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { atomicWriteFile } from './util.ts'
 
 /** Reasoning effort ids accepted by the Antigravity ACP `thought_level` option. */
 export const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
@@ -13,7 +8,7 @@ export const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
 export type Effort = (typeof EFFORTS)[number]
 
 /** Supported quota percentage display conventions. */
-export const QUOTA_DISPLAY_MODES = ['used', 'remaining'] as const
+const QUOTA_DISPLAY_MODES = ['used', 'remaining'] as const
 /** Quota percentage display convention (`used` counts up from 0%, `remaining` counts down from 100%). */
 export type QuotaDisplay = (typeof QUOTA_DISPLAY_MODES)[number]
 /** Default quota percentage display convention when no env var or saved preference is set. */
@@ -105,21 +100,12 @@ export function writeQuotaDisplayPreference(
   quotaDisplay: QuotaDisplay,
 ): void {
   const path = join(home, SETTINGS_FILE)
-  const tempPath = join(
-    home,
-    `.${SETTINGS_FILE}.${process.pid}.${Date.now()}.tmp`,
-  )
   try {
     mkdirSync(home, { recursive: true })
     const existing = readJson(path)
     const content = `${JSON.stringify({ ...existing, quotaDisplay }, null, 2)}\n`
-    writeFileSync(tempPath, content)
-    renameSync(tempPath, path)
+    atomicWriteFile(path, content)
   } catch {
-    try {
-      unlinkSync(tempPath)
-    } catch {
-      // Best-effort cleanup.
-    }
+    // Best-effort preference persistence.
   }
 }

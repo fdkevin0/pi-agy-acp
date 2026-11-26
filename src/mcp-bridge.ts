@@ -104,6 +104,7 @@ export class McpBridge {
   private server: Server | undefined
   private port = 0
   private readonly openResponses = new Set<ServerResponse>()
+  private readonly pendingCloses = new Set<Promise<void>>()
   /** Tenant keys whose agent completed the MCP `initialize` handshake. */
   private readonly handshakes = new Set<string>()
   private readonly router: BridgeRouter
@@ -178,12 +179,19 @@ export class McpBridge {
     for (const res of this.openResponses) res.destroy()
     this.openResponses.clear()
     this.handshakes.clear()
-    if (server !== undefined)
-      await new Promise<void>((resolve) => {
+    if (server !== undefined) {
+      const closing = new Promise<void>((resolve) => {
         server.close(() => resolve())
         // Node's closeAllConnections includes parsers with incomplete headers/bodies.
         server.closeAllConnections()
+      }).finally(() => {
+        this.pendingCloses.delete(closing)
       })
+      this.pendingCloses.add(closing)
+    }
+    if (this.pendingCloses.size > 0) {
+      await Promise.all([...this.pendingCloses])
+    }
   }
 
   /**
@@ -415,36 +423,39 @@ export class McpBridge {
       return finalResult
     }
 
-    let result: BridgeToolResult
     try {
-      result = await this.router.callTool({
-        tenantKey,
-        conversationId,
-        name,
-        arguments: args,
-        signal: controller.signal,
-        commit,
-      })
-    } catch (error) {
-      result = {
-        content: [
-          {
-            type: 'text',
-            text: error instanceof Error ? error.message : String(error),
-          },
-        ],
-        isError: true,
+      let result: BridgeToolResult
+      try {
+        result = await this.router.callTool({
+          tenantKey,
+          conversationId,
+          name,
+          arguments: args,
+          signal: controller.signal,
+          commit,
+        })
+      } catch (error) {
+        result = {
+          content: [
+            {
+              type: 'text',
+              text: error instanceof Error ? error.message : String(error),
+            },
+          ],
+          isError: true,
+        }
+      } finally {
+        settled = true
+        clearInterval(keepAlive)
+      }
+      if (!wroteResponse && !res.writableEnded && !res.destroyed) {
+        writeEvent(res, { jsonrpc: '2.0', id: request.id, result })
+        res.end()
       }
     } finally {
-      settled = true
-      clearInterval(keepAlive)
+      this.openResponses.delete(res)
+      res.off('close', onClose)
     }
-    if (!wroteResponse && !res.writableEnded && !res.destroyed) {
-      writeEvent(res, { jsonrpc: '2.0', id: request.id, result })
-      res.end()
-    }
-    this.openResponses.delete(res)
-    res.off('close', onClose)
     if (controller.signal.aborted)
       this.log(
         `mcp: call ${name} finished after the agent disconnected`,

@@ -4,7 +4,19 @@
  * @module pi-agy-acp/util
  */
 
-import { createHash } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
+import {
+  chmodSync,
+  closeSync,
+  constants as fsConstants,
+  lstatSync,
+  openSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+  type Stats,
+} from 'node:fs'
+import { basename, dirname, join } from 'node:path'
 
 /** A promise with externally exposed settlement. */
 export interface Deferred<T> {
@@ -155,12 +167,70 @@ export function digest(value: unknown): string {
 }
 
 /**
- * Sleep for a duration.
- * @param ms - delay.
- * @returns a promise resolved after the delay.
+ * Atomically write a regular file in the target directory while rejecting
+ * symlinked or non-regular destination paths.
  */
-export function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms))
+export function atomicWriteFile(
+  path: string,
+  content: string | Uint8Array,
+  options?: { mode?: number },
+): void {
+  let existing: Stats | undefined
+  try {
+    existing = lstatSync(path)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw error
+  }
+  if (
+    existing !== undefined &&
+    (existing.isSymbolicLink() || !existing.isFile())
+  ) {
+    throw new Error(
+      `Refusing to write to symlink or non-regular file: ${path}`,
+    )
+  }
+  const tmpPath = join(
+    dirname(path),
+    `.${basename(path)}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`,
+  )
+  const mode = options?.mode
+  let fd: number | undefined
+  let created = false
+  try {
+    fd = openSync(
+      tmpPath,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL,
+      mode ?? 0o666,
+    )
+    created = true
+    writeFileSync(fd, content)
+    closeSync(fd)
+    fd = undefined
+    if (mode !== undefined) {
+      try {
+        chmodSync(tmpPath, mode)
+      } catch {
+        // Mode bits are advisory on Windows.
+      }
+    }
+    renameSync(tmpPath, path)
+  } catch (error) {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd)
+      } catch {
+        // Ignore close errors during cleanup.
+      }
+    }
+    if (created) {
+      try {
+        unlinkSync(tmpPath)
+      } catch {
+        // Best-effort temp file cleanup.
+      }
+    }
+    throw error
+  }
 }
 
 /** Cancel one caller's wait without cancelling work shared with other callers. */
