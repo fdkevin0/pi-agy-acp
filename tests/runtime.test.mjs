@@ -4637,6 +4637,29 @@ test('runtime surfaces hidden SQLite QUOTA_EXHAUSTED on end_turn and refusal whi
   )
   assert.equal(finishOf(refusalChunks).reason.kind, 'error')
   assert.equal(finishOf(refusalChunks).reason.failure.code, 'REFUSAL')
+
+  // agy 1.5.18 swallows corrupt PNG INVALID_ARGUMENT (code 400) into step_type=17 with end_turn (no usage).
+  await assert.rejects(
+    collect(
+      adapter.stream({
+        provider: 'antigravity',
+        model: 'gemini-4-neon',
+        sessionId: 'S-INVALID-IMAGE',
+        messages: [
+          sys,
+          user(
+            'u1',
+            'STEP 17 Agent execution terminated due to error. INVALID_ARGUMENT (code 400): Unable to process input image. HTTP 400 Bad Request\nSTOP end_turn',
+          ),
+        ],
+      }),
+    ),
+    (err) => {
+      assert.equal(err.code, 'INVALID_REQUEST')
+      assert.match(err.message, /400 INVALID_ARGUMENT.*Unable to process input image/)
+      return true
+    },
+  )
 })
 
 test('runtime marks session dirty and rebuilds after hidden INVALID_THINKING_SIGNATURE, while retried step 17 followed by step 15 succeeds', async (t) => {

@@ -1984,8 +1984,18 @@ export function mapError(error: unknown): Error {
     return new LlmError(message, 'CONTEXT_WINDOW_EXCEEDED', { cause: error })
   if (/rate.?limit|429|too many requests|overloaded|capacity/i.test(message))
     return new LlmError(message, 'RATE_LIMIT', { cause: error })
-  if (/quota|resource.?exhausted|limit reached|exceeded your/i.test(message))
+  if (
+    /quota|resource.?exhausted|limit reached|exceeded your|prepaid\s+balance|spend\s+cap|insufficient\s+(?:funds|credits?|balance)|billing\s+(?:limit|exhausted|disabled|required)/i.test(
+      message,
+    )
+  )
     return new LlmError(message, 'QUOTA', { cause: error })
+  if (
+    /\binvalid_argument\b|unable to process input image|http\s+400|\(code\s+400\)|invalid\s+(?:image|request|argument)/i.test(
+      message,
+    )
+  )
+    return new LlmError(message, 'INVALID_REQUEST', { cause: error })
   if (error instanceof JsonRpcRemoteError)
     return new LlmError(`Antigravity: ${message}`, 'SERVER', { cause: error })
   return new LlmError(message, 'TRANSPORT', { cause: error })

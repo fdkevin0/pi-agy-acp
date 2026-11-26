@@ -43,10 +43,17 @@ export type HiddenTurnErrorKind =
   | 'rate_limit'
   | 'transient_not_found'
   | 'model_not_found'
+  | 'invalid_request'
 
 export interface HiddenTurnError {
   kind: HiddenTurnErrorKind
-  code: 'QUOTA' | 'PROVIDER_ERROR' | 'RATE_LIMIT' | 'SERVER' | 'UNKNOWN_MODEL'
+  code:
+    | 'QUOTA'
+    | 'PROVIDER_ERROR'
+    | 'RATE_LIMIT'
+    | 'SERVER'
+    | 'UNKNOWN_MODEL'
+    | 'INVALID_REQUEST'
   message: string
   dirtySession?: boolean
   resetTimestamp?: string
@@ -396,6 +403,8 @@ const RATE_LIMIT_RE =
   /(?:HTTP\s+429|\(code\s+429\)|"code"\s*:\s*429|\bRESOURCE_EXHAUSTED\b)/
 const NOT_FOUND_RE =
   /(?:HTTP\s+404|\(code\s+404\)|"code"\s*:\s*404|\bNOT_FOUND\b)/
+const INVALID_ARGUMENT_RE =
+  /(?:HTTP\s+400|\(code\s+400\)|"code"\s*:\s*400|\bINVALID_ARGUMENT\b|Unable to process input image)/i
 
 /**
  * Classify a terminal `steps` error payload (`step_type = 17`) into a structured
@@ -472,6 +481,17 @@ export function classifyStepErrorPayload(
       kind: 'model_not_found',
       code: 'UNKNOWN_MODEL',
       message: 'Antigravity model is unavailable (404 NOT_FOUND)',
+    }
+  }
+
+  if (INVALID_ARGUMENT_RE.test(payload)) {
+    const detail = /Unable to process input image/i.test(payload)
+      ? ': Unable to process input image'
+      : ''
+    return {
+      kind: 'invalid_request',
+      code: 'INVALID_REQUEST',
+      message: `Antigravity rejected the request (400 INVALID_ARGUMENT)${detail}`,
     }
   }
 
