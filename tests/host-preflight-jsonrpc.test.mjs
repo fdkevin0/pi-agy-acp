@@ -251,6 +251,26 @@ test('prepareHome rejects symlinked settings.json, writes atomically, and warns 
   assert.equal(existsSync(join(externalConfig, 'plugins')), false)
 })
 
+test('prepareHome preserves session artifacts when cleanArtifacts is false and cleans them by default', (t) => {
+  const root = makeTempRoot(t, 'pi-prepare-home-preserve-')
+  const home = join(root, 'home')
+  const userHome = join(root, 'no-user-auth')
+  const dbPath = join(home, 'agy', 'conversations', 's1.db')
+  const brainNote = join(home, 'agy', 'brain', 's1', 'note.md')
+  mkdirSync(join(home, 'agy', 'conversations'), { recursive: true })
+  mkdirSync(join(home, 'agy', 'brain', 's1'), { recursive: true })
+  writeFileSync(dbPath, 'sqlite-db')
+  writeFileSync(brainNote, 'brain-note')
+
+  prepareHome(home, userHome, {}, undefined, { cleanArtifacts: false })
+  assert.equal(existsSync(dbPath), true)
+  assert.equal(existsSync(brainNote), true)
+
+  prepareHome(home, userHome, {})
+  assert.equal(existsSync(dbPath), false)
+  assert.equal(existsSync(brainNote), false)
+})
+
 test('runtime warns instead of failing openSession when OAuth token sync fails', async (t) => {
   const root = makeTempRoot(t, 'pi-runtime-oauth-warn-')
   const defaultPiHome = join(root, '.pi', 'agent', 'cache', 'antigravity-acp')
@@ -425,6 +445,25 @@ test('buildAgyEnv strips sensitive/conflicting variables and injects required ag
   assert.equal(unixEnv.CHROME_CRASHPAD_PIPE_NAME, undefined)
   assert.equal(unixEnv.AGY_CLI_DISABLE_AUTO_UPDATE, '1')
   assert.equal(unixEnv.PYTHONUNBUFFERED, '1')
+  assert.equal(unixEnv.AGY_CLI_AUTO_COMPACT_OVERRIDE, '100%')
+
+  const unixOverride = buildAgyEnv(
+    {
+      PATH: '/usr/bin',
+      AGY_CLI_AUTO_COMPACT_OVERRIDE: '80%',
+    },
+    'linux',
+  )
+  assert.equal(unixOverride.AGY_CLI_AUTO_COMPACT_OVERRIDE, '80%')
+
+  const unixZeroOverride = buildAgyEnv(
+    {
+      PATH: '/usr/bin',
+      AGY_CLI_AUTO_COMPACT_OVERRIDE: '0',
+    },
+    'linux',
+  )
+  assert.equal(unixZeroOverride.AGY_CLI_AUTO_COMPACT_OVERRIDE, '0')
 
   const winEnv = buildAgyEnv(
     {
@@ -449,6 +488,17 @@ test('buildAgyEnv strips sensitive/conflicting variables and injects required ag
   assert.equal(winEnv.pythonunbuffered, undefined)
   assert.equal(winEnv.AGY_CLI_DISABLE_AUTO_UPDATE, '1')
   assert.equal(winEnv.PYTHONUNBUFFERED, '1')
+  assert.equal(winEnv.AGY_CLI_AUTO_COMPACT_OVERRIDE, '100%')
+
+  const winOverride = buildAgyEnv(
+    {
+      Path: 'C:\\Windows',
+      agy_cli_auto_compact_override: '80%',
+    },
+    'win32',
+  )
+  assert.equal(winOverride.agy_cli_auto_compact_override, '80%')
+  assert.equal(winOverride.AGY_CLI_AUTO_COMPACT_OVERRIDE, undefined)
 })
 
 test('redactStderr scrubs Bearer tokens, Google API keys, OAuth tokens, secret params, and accounts.google.com queries', () => {

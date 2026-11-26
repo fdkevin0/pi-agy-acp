@@ -23,6 +23,7 @@ import {
   type AcpPermissionOutcome,
   type AcpPermissionRequest,
   type AcpPromptResult,
+  type AcpSessionUpdate,
   type AcpSpawner,
 } from './acp-process.ts'
 import {
@@ -50,6 +51,7 @@ import {
   bridgeSystemPrompt,
   inputPrompt,
   MCP_SERVER_NAME,
+  renderSessionInstructions,
   renderTranscript,
   replayPrompt,
   splitSystem,
@@ -179,6 +181,13 @@ interface Conversation {
   effort: Effort | undefined
 }
 
+interface ResumableSession {
+  readonly sessionId: string
+  readonly systemHash: string
+  readonly knownIds: readonly string[]
+  readonly issuedIds: ReadonlySet<string>
+}
+
 interface PromptPlan {
   rebuild: boolean
   history: readonly RequestMessage[]
@@ -202,6 +211,8 @@ export class AntigravityRuntime {
   private tierDiscovery: Promise<void> | undefined
   private warmupPromise: Promise<void> | undefined
   private readonly conversations = new Map<string, Conversation>()
+  /** Dormant idle-swept sessions eligible for `session/resume` on next request. */
+  private readonly resumableSessions = new Map<string, ResumableSession>()
   private readonly tenants = new Map<string, Conversation>()
   private readonly mutex = new KeyedMutex()
   /** Serializes capacity checks and session creation so concurrent requests cannot overshoot maxLiveSessions. */
@@ -276,6 +287,7 @@ export class AntigravityRuntime {
     ) {
       this.preflight = undefined
       this.preflightFingerprint = undefined
+      this.clearResumableSessions()
     }
     if (
       this.process?.alive &&
@@ -299,6 +311,7 @@ export class AntigravityRuntime {
         .map((conv) => ({ conv, sessionId: conv.sessionId }))
       this.detachProcess(stale)
       void this.bridge.close()
+      this.clearResumableSessions()
       for (const { conv, sessionId } of staleSessions) {
         if (sessionId !== undefined) {
           removeSessionArtifacts(this.home, sessionId)
@@ -590,6 +603,7 @@ export class AntigravityRuntime {
   async resetConversations(): Promise<void> {
     if (this.lifecycle !== 'active' || this.shutdown.signal.aborted) return
     this.processIdleMs = 0
+    this.clearResumableSessions()
     const conversations = [...this.conversations.values()]
     for (const conv of conversations)
       this.dropTurn(conv, 'The Pi session changed.')
@@ -627,6 +641,7 @@ export class AntigravityRuntime {
       new LlmError('Antigravity provider was disposed', 'TRANSPORT'),
     )
     this.stopSweeper()
+    this.clearResumableSessions()
     for (const conv of this.conversations.values()) {
       conv.turn?.abandon('The harness provider was unloaded.')
       this.clearSession(conv)
@@ -753,14 +768,45 @@ export class AntigravityRuntime {
           this.dropTurn(conv, 'Superseded by a newer request.')
         }
 
-        const plan = this.plan(conv, split.system, split.messages)
-        if (plan.rebuild) await this.resetSession(conv)
-        this.assertOwner(proc, conv)
+        let plan = this.plan(conv, split.system, split.messages)
         let supplementalTools: readonly BridgeTool[] = []
+        let resumed = false
         if (conv.sessionId === undefined) {
-          conv.systemHash = digest(split.system)
-          supplementalTools = await this.openSession(conv, tools, proc)
-          effort = this.effectiveEffort(options.model, requestedEffort)
+          const resumable = this.resumableSessions.get(conv.key)
+          if (resumable !== undefined) {
+            this.resumableSessions.delete(conv.key)
+            const resumeInput = this.deltaInput(
+              resumable,
+              split.system,
+              split.messages,
+            )
+            if (resumeInput === undefined) {
+              // History or system prompt diverged while dormant: discard persisted session DB.
+              removeSessionArtifacts(this.home, resumable.sessionId)
+            } else {
+              const resumedTools = await this.resumeSession(
+                conv,
+                resumable,
+                tools,
+                proc,
+              )
+              if (resumedTools !== undefined) {
+                supplementalTools = resumedTools
+                plan = { rebuild: false, history: [], input: resumeInput }
+                resumed = true
+                effort = this.effectiveEffort(options.model, requestedEffort)
+              }
+            }
+          }
+        }
+        if (!resumed) {
+          if (plan.rebuild) await this.resetSession(conv)
+          this.assertOwner(proc, conv)
+          if (conv.sessionId === undefined) {
+            conv.systemHash = digest(split.system)
+            supplementalTools = await this.openSession(conv, tools, proc)
+            effort = this.effectiveEffort(options.model, requestedEffort)
+          }
         }
         this.assertOwner(proc, conv, conv.sessionId)
         effort = await this.select(conv, proc, options.model, effort)
@@ -773,6 +819,14 @@ export class AntigravityRuntime {
           })
         } else {
           blocks = inputPrompt(plan.input)
+          if (supplementalTools.length > 0) {
+            const toolInstructions = renderSessionInstructions(
+              '',
+              supplementalTools,
+            )
+            if (toolInstructions.length > 0)
+              blocks.unshift({ type: 'text', text: toolInstructions })
+          }
           const toolDelta = consumeToolDelta(conv, tools)
           if (toolDelta.length > 0)
             blocks.unshift({ type: 'text', text: `${toolDelta}\n\n` })
@@ -965,7 +1019,10 @@ export class AntigravityRuntime {
     this.reconcileBinaryFingerprint()
     const warn = (message: string) => this.host.log.warn(message)
     if (this.preflight !== undefined) {
-      prepareHome(this.home, undefined, undefined, warn)
+      // Preserve retained session DBs across idle front restarts when dormant sessions exist.
+      prepareHome(this.home, undefined, undefined, warn, {
+        cleanArtifacts: this.resumableSessions.size === 0,
+      })
       return Promise.resolve(this.preflight)
     }
     this.preflightPromise ??= (async () => {
@@ -975,7 +1032,9 @@ export class AntigravityRuntime {
       const version = await readVersion(binary, this.host.runCommand)
       this.assertActive()
       assertSupportedAgyVersion(version, binary)
-      const workspace = prepareHome(this.home, undefined, undefined, warn)
+      const workspace = prepareHome(this.home, undefined, undefined, warn, {
+        cleanArtifacts: true,
+      })
       const result: PreflightResult = {
         binary,
         version,
@@ -1018,10 +1077,40 @@ export class AntigravityRuntime {
     }
   }
 
-  private async openSession(
+  private openSession(
     conv: Conversation,
     tools: readonly BridgeTool[],
     proc: AcpProcess,
+  ): Promise<readonly BridgeTool[]> {
+    return this.establishSession(conv, tools, proc)
+  }
+
+  private async resumeSession(
+    conv: Conversation,
+    resumable: ResumableSession,
+    tools: readonly BridgeTool[],
+    proc: AcpProcess,
+  ): Promise<readonly BridgeTool[] | undefined> {
+    try {
+      return await this.establishSession(conv, tools, proc, resumable)
+    } catch (error) {
+      if (error instanceof JsonRpcRemoteError && this.owns(proc, conv)) {
+        this.host.log.warn(
+          `antigravity-acp: session/resume failed for ${resumable.sessionId} (${error.message}); falling back to session/new`,
+        )
+        this.clearSession(conv)
+        removeSessionArtifacts(this.home, resumable.sessionId)
+        return undefined
+      }
+      throw mapError(error)
+    }
+  }
+
+  private async establishSession(
+    conv: Conversation,
+    tools: readonly BridgeTool[],
+    proc: AcpProcess,
+    resumable?: ResumableSession,
   ): Promise<readonly BridgeTool[]> {
     this.assertOwner(proc, conv)
     try {
@@ -1052,68 +1141,68 @@ export class AntigravityRuntime {
     conv.tenantKey = tenantKey
     conv.tenantSecret = tenantSecret
     this.tenants.set(tenantKey, conv)
-    try {
-      const result = await proc.newSession(
-        {
-          cwd: this.preflight?.workspace ?? this.home,
-          mcpServers,
-          _meta: {
-            antigravity: {
-              systemPrompt: {
-                append: bridgeSystemPrompt(),
+    const params: Record<string, unknown> = {
+      ...(resumable !== undefined ? { sessionId: resumable.sessionId } : {}),
+      cwd: this.preflight?.workspace ?? this.home,
+      mcpServers,
+      _meta: {
+        antigravity: {
+          systemPrompt: {
+            append: bridgeSystemPrompt(),
+          },
+        },
+      },
+    }
+    const listener = {
+      onUpdate: (update: AcpSessionUpdate) => {
+        if (!this.owns(proc, conv) || conv.tenantKey !== tenantKey) return
+        if (
+          update.sessionUpdate === 'config_option_update' &&
+          Array.isArray(update.configOptions)
+        ) {
+          conv.configOptions = update.configOptions
+          if (this.catalog.observe(update.configOptions))
+            this.host.onModelsChanged()
+        }
+        if (recordReportedToolCall(conv, update) === 'conflict') {
+          this.host.log.warn(
+            `antigravity-acp: agent reported conflicting identity for tool call ${String(update.toolCallId)}`,
+          )
+        }
+        conv.turn?.onUpdate(update)
+        if (update.sessionUpdate === 'usage_update') {
+          const hasCachedContextWindow =
+            conv.model !== undefined &&
+            this.catalog.contextWindowFor(conv.model) !== undefined
+          const hasPositiveUsed =
+            typeof update.used === 'number' &&
+            Number.isFinite(update.used) &&
+            update.used > 0
+          if (!(hasCachedContextWindow && hasPositiveUsed)) {
+            this.harvestSessionTurnData(
+              conv,
+              conv.sessionId,
+              conv.model,
+              conv.metaFloorIdx,
+              {
+                turn: conv.turn,
+                ifChangedSince: conv.lastDbStamp,
               },
-            },
-          },
-        },
-        {
-          onUpdate: (update) => {
-            if (
-              !this.owns(proc, conv) ||
-              conv.tenantKey !== tenantKey
-            ) return
-            if (
-              update.sessionUpdate === 'config_option_update' &&
-              Array.isArray(update.configOptions)
-            ) {
-              conv.configOptions = update.configOptions
-              if (this.catalog.observe(update.configOptions))
-                this.host.onModelsChanged()
-            }
-            if (recordReportedToolCall(conv, update) === 'conflict') {
-              this.host.log.warn(
-                `antigravity-acp: agent reported conflicting identity for tool call ${String(update.toolCallId)}`,
-              )
-            }
-            conv.turn?.onUpdate(update)
-            if (update.sessionUpdate === 'usage_update') {
-              const hasCachedContextWindow =
-                conv.model !== undefined &&
-                this.catalog.contextWindowFor(conv.model) !== undefined
-              const hasPositiveUsed =
-                typeof update.used === 'number' &&
-                Number.isFinite(update.used) &&
-                update.used > 0
-              if (!(hasCachedContextWindow && hasPositiveUsed)) {
-                this.harvestSessionTurnData(
-                  conv,
-                  conv.sessionId,
-                  conv.model,
-                  conv.metaFloorIdx,
-                  {
-                    turn: conv.turn,
-                    ifChangedSince: conv.lastDbStamp,
-                  },
-                )
-              }
-            }
-          },
-          onPermission: (request) => this.owns(proc, conv) && conv.tenantKey === tenantKey
-            ? this.answerPermission(conv, request)
-            : { outcome: 'cancelled' },
-        },
-        120_000,
-      )
-      // A buffered session/new reply can resolve after its process has exited.
+            )
+          }
+        }
+      },
+      onPermission: (request: AcpPermissionRequest) =>
+        this.owns(proc, conv) && conv.tenantKey === tenantKey
+          ? this.answerPermission(conv, request)
+          : ({ outcome: 'cancelled' } as const),
+    }
+    try {
+      const result =
+        resumable !== undefined
+          ? await proc.resumeSession(params, listener, 120_000)
+          : await proc.newSession(params, listener, 120_000)
+      // A buffered session reply can resolve after its process has exited.
       if (!this.owns(proc, conv)) {
         await this.closeAndCleanSession(proc, result.sessionId)
         this.assertActive()
@@ -1126,9 +1215,14 @@ export class AntigravityRuntime {
       conv.metaFloorIdx = 0
       conv.lastDbStamp = undefined
       conv.effort = undefined
-
       conv.dirty = false
-      conv.issuedIds.clear()
+      if (resumable !== undefined) {
+        conv.systemHash = resumable.systemHash
+        conv.knownIds = [...resumable.knownIds]
+        conv.issuedIds = new Set(resumable.issuedIds)
+      } else {
+        conv.issuedIds.clear()
+      }
       if (
         this.catalog.observe(
           result.configOptions,
@@ -1140,6 +1234,7 @@ export class AntigravityRuntime {
       return supplementalTools
     } catch (error) {
       this.clearSession(conv)
+      if (resumable !== undefined) throw error
       throw mapError(error)
     }
   }
@@ -1362,25 +1457,10 @@ export class AntigravityRuntime {
     system: string,
     messages: readonly RequestMessage[],
   ): PromptPlan {
-    const reusable =
-      conv.sessionId !== undefined &&
-      !conv.dirty &&
-      this.historyPrefixIntact(conv, system, messages)
-    if (reusable) {
-      const known = conv.knownIds as string[]
-      let rest = messages.slice(known.length)
-      let skip = 0
-      while (
-        skip < rest.length &&
-        this.isOwn(conv, rest[skip] as RequestMessage)
-      )
-        skip++
-      rest = rest.slice(skip)
-      if (
-        rest.length > 0 &&
-        rest.every((m) => m.role === 'user' || m.role === 'system')
-      ) {
-        return { rebuild: false, history: [], input: rest }
+    if (conv.sessionId !== undefined && !conv.dirty) {
+      const input = this.deltaInput(conv, system, messages)
+      if (input !== undefined) {
+        return { rebuild: false, history: [], input }
       }
     }
     let cut = messages.length
@@ -1397,40 +1477,103 @@ export class AntigravityRuntime {
   }
 
   /**
+   * Compute incremental user/system input after a session's known prefix and
+   * own assistant/tool messages, or `undefined` if the history diverged.
+   */
+  private deltaInput(
+    state: {
+      systemHash: string | undefined
+      knownIds: readonly string[] | undefined
+      issuedIds: ReadonlySet<string>
+    },
+    system: string,
+    messages: readonly RequestMessage[],
+  ): readonly RequestMessage[] | undefined {
+    if (!this.historyPrefixIntact(state, system, messages)) return undefined
+    const known = state.knownIds as readonly string[]
+    let rest = messages.slice(known.length)
+    let skip = 0
+    while (
+      skip < rest.length &&
+      this.isOwn(state.issuedIds, rest[skip] as RequestMessage)
+    )
+      skip++
+    rest = rest.slice(skip)
+    if (
+      rest.length > 0 &&
+      rest.every((m) => m.role === 'user' || m.role === 'system')
+    ) {
+      return rest
+    }
+    return undefined
+  }
+
+  /**
    * Whether the live ACP session's context is still an exact prefix of the
    * request: the same system prompt and the same message ids in the same order.
    * A compaction checkpoint, a pruned/rewritten prefix, or a replaced system
    * prompt all make the session stale and force a rebuild.
-   * @param conv - conversation owning the ACP session.
+   * @param state - conversation or dormant session owning the prefix metadata.
    * @param system - current Pi system prompt.
    * @param messages - full request history after leading system messages.
    * @returns true when only new messages were appended.
    */
   private historyPrefixIntact(
-    conv: Conversation,
+    state: {
+      systemHash: string | undefined
+      knownIds: readonly string[] | undefined
+    },
     system: string,
     messages: readonly RequestMessage[],
   ): boolean {
     // plan() has always required the same system digest for reuse; a changed
     // digest is a genuinely new prompt, while mid-conversation updates travel
     // as `system` messages inside `messages` (systemPromptUpdate: 'in-history').
-    if (conv.knownIds === undefined || conv.systemHash !== digest(system))
+    if (state.knownIds === undefined || state.systemHash !== digest(system))
       return false
-    const known = conv.knownIds
+    const known = state.knownIds
     return (
       known.length <= messages.length &&
       known.every((id, index) => messages[index]?.id === id)
     )
   }
 
-  private isOwn(conv: Conversation, message: RequestMessage): boolean {
+  private isOwn(
+    issuedIds: ReadonlySet<string>,
+    message: RequestMessage,
+  ): boolean {
     if (message.role === 'assistant')
       return (
         message.source.kind === 'model' &&
         message.source.provider === this.host.config.provider
       )
-    if (message.role === 'tool') return conv.issuedIds.has(message.toolCallId)
+    if (message.role === 'tool') return issuedIds.has(message.toolCallId)
     return false
+  }
+
+  private parkResumableSession(key: string, entry: ResumableSession): void {
+    this.dropResumableSession(key)
+    this.resumableSessions.set(key, entry)
+    const maxResumable = Math.max(1, this.host.config.maxLiveSessions) * 2
+    while (this.resumableSessions.size > maxResumable) {
+      const oldestKey = this.resumableSessions.keys().next().value
+      if (oldestKey === undefined) break
+      this.dropResumableSession(oldestKey)
+    }
+  }
+
+  private dropResumableSession(key: string): void {
+    const existing = this.resumableSessions.get(key)
+    if (existing === undefined) return
+    this.resumableSessions.delete(key)
+    removeSessionArtifacts(this.home, existing.sessionId)
+  }
+
+  private clearResumableSessions(): void {
+    for (const entry of this.resumableSessions.values()) {
+      removeSessionArtifacts(this.home, entry.sessionId)
+    }
+    this.resumableSessions.clear()
   }
 
   private async closeAndCleanSession(
@@ -1444,7 +1587,38 @@ export class AntigravityRuntime {
     }
   }
 
+  private async evictIdleSession(conv: Conversation): Promise<void> {
+    this.harvestSessionTurnData(conv, conv.sessionId, conv.model, conv.metaFloorIdx, {
+      ifChangedSince: conv.lastDbStamp,
+    })
+    const canPark =
+      conv.sessionId !== undefined &&
+      conv.systemHash !== undefined &&
+      !conv.dirty &&
+      conv.knownIds !== undefined &&
+      !conv.key.startsWith('anon-')
+    if (!canPark) {
+      await this.resetSession(conv)
+      return
+    }
+    const sessionId = conv.sessionId as string
+    const proc = conv.process
+    this.parkResumableSession(conv.key, {
+      sessionId,
+      systemHash: conv.systemHash as string,
+      knownIds: [...(conv.knownIds as string[])],
+      issuedIds: new Set(conv.issuedIds),
+    })
+    this.clearSession(conv)
+    conv.knownIds = undefined
+    conv.dirty = false
+    if (proc !== undefined) {
+      await proc.closeSession(sessionId)
+    }
+  }
+
   private async resetSession(conv: Conversation): Promise<void> {
+    this.dropResumableSession(conv.key)
     this.harvestSessionTurnData(conv, conv.sessionId, conv.model, conv.metaFloorIdx, {
       ifChangedSince: conv.lastDbStamp,
     })
@@ -1886,7 +2060,7 @@ export class AntigravityRuntime {
       conv.idleMs += slice
       if (conv.idleMs > ttl) {
         evictions.push(
-          this.resetSession(conv).catch((error: unknown) => {
+          this.evictIdleSession(conv).catch((error: unknown) => {
             this.host.log.warn(
               `session sweep cleanup failed: ${error instanceof Error ? error.message : String(error)}`,
             )

@@ -97,6 +97,9 @@ export interface AcpInitializeResult {
       audio?: boolean
       embeddedContext?: boolean
     }
+    sessionCapabilities?: {
+      resume?: Record<string, unknown>
+    }
   }
 }
 
@@ -268,6 +271,28 @@ export class AcpProcess {
   ): Promise<AcpNewSessionResult> {
     const result = await this.link().request<AcpNewSessionResult>(
       'session/new',
+      params,
+      { timeoutMs },
+    )
+    // JsonRpcPeer can resolve a buffered reply before stop; leave its rollback to the owner.
+    if (this.alive) this.listeners.set(result.sessionId, listener)
+    return result
+  }
+
+  /**
+   * Resume one persisted ACP session.
+   * @param params - `session/resume` parameters.
+   * @param listener - observer bound to the resumed session id.
+   * @param timeoutMs - setup deadline.
+   * @returns the session result.
+   */
+  async resumeSession(
+    params: Record<string, unknown>,
+    listener: AcpSessionListener,
+    timeoutMs: number,
+  ): Promise<AcpNewSessionResult> {
+    const result = await this.link().request<AcpNewSessionResult>(
+      'session/resume',
       params,
       { timeoutMs },
     )

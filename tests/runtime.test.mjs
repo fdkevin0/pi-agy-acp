@@ -1532,13 +1532,14 @@ test('permission requests naming another session are refused', async (t) => {
       messages: [sys, user('u1', 'hello')],
     }),
   )
+  const s26Id = adapter.conversations.get('S26').sessionId
   const step = await collect(
     adapter.stream({
       provider: 'antigravity',
       model: 'gemini-4-argon',
       sessionId: 'S27',
       tools: [bash],
-      messages: [sys, user('u1', 'CROSSCALL s1 bash {"command":"ls"}')],
+      messages: [sys, user('u1', `CROSSCALL ${s26Id} bash {"command":"ls"}`)],
     }),
   )
   assert.match(textOf(step), /RESULT\(bash\)=PERMISSION_REJECTED/)
@@ -5563,4 +5564,363 @@ test('resetConversations returns cleanly when racing with dispose and answerPerm
   await Promise.all([resetting, disposing])
   await runtime.resetConversations()
   assert.equal(runtime.conversations.size, 0)
+})
+
+test('idle sweep + front reap resumes session via session/resume with fresh MCP tenant, re-applied model/effort, and delta prompt', async (t) => {
+  let clock = 1_000
+  const { home, runtime, prompts, mcps } = makeRuntime(t, {
+    config: { idleSessionTtlMs: 150_000 },
+    host: { monotonicNow: () => clock },
+  })
+  const turn1 = await collect(
+    runtime.stream({
+      model: 'gemini-4-neon',
+      reasoningEffort: 'low',
+      sessionId: 'RESUME-1',
+      messages: [sys, user('u1', 'first turn')],
+    }),
+  )
+  const proc1 = runtime.process
+  const proc1Exited = new Promise((resolve) => proc1.onExit(resolve))
+  const sessionId1 = runtime.conversations.get('RESUME-1').sessionId
+  const dbPath = join(home, 'agy', 'conversations', `${sessionId1}.db`)
+  assert.equal(existsSync(dbPath), true)
+
+  clock += 60_000
+  runtime.sweep()
+  clock += 60_000
+  runtime.sweep()
+  clock += 60_000
+  runtime.sweep()
+  await proc1Exited
+
+  assert.equal(runtime.conversations.size, 0)
+  assert.equal(runtime.status().liveSessions, 0)
+  assert.equal(runtime.process, undefined)
+  assert.equal(existsSync(dbPath), true)
+
+  await collect(
+    runtime.stream({
+      model: 'gemini-4-neon',
+      reasoningEffort: 'low',
+      sessionId: 'RESUME-1',
+      messages: [
+        sys,
+        user('u1', 'first turn'),
+        assistantFrom('a1', turn1),
+        user('u2', 'second turn'),
+      ],
+    }),
+  )
+  assert.notEqual(runtime.process, proc1)
+  assert.equal(runtime.conversations.get('RESUME-1').sessionId, sessionId1)
+
+  const mcpEntries = mcps()
+  assert.equal(mcpEntries.length, 2)
+  assert.equal(mcpEntries[1].resumed, true)
+  assert.equal(mcpEntries[1].session, sessionId1)
+  assert.notEqual(mcpEntries[1].url, mcpEntries[0].url)
+  assert.notEqual(mcpEntries[1].authorization, mcpEntries[0].authorization)
+
+  const promptEntries = prompts()
+  assert.equal(promptEntries.length, 2)
+  assert.equal(promptEntries[1].model, 'gemini-4-neon')
+  assert.equal(promptEntries[1].level, 'low')
+  assert.equal(promptEntries[1].text, 'second turn')
+  assert.doesNotMatch(promptEntries[1].text, /<pi_history>/)
+  assert.doesNotMatch(promptEntries[1].text, /<system_instructions>/)
+})
+
+test('session/resume falls back to session/new + replayPrompt and cleans artifacts on -32603 and -32002', async (t) => {
+  // Case 1: -32603 (missing DB on disk, matching live agy 1.5.18 under --process-per-session).
+  let clock1 = 1_000
+  const warnings1 = []
+  const rt1 = makeRuntime(t, {
+    config: { idleSessionTtlMs: 150_000 },
+    host: {
+      monotonicNow: () => clock1,
+      log: { info: () => undefined, warn: (msg) => warnings1.push(msg) },
+    },
+  })
+  const turn1a = await collect(
+    rt1.runtime.stream({
+      model: 'gemini-4-argon',
+      sessionId: 'FALLBACK-32603',
+      messages: [sys, user('u1', 'before missing db')],
+    }),
+  )
+  const proc1 = rt1.runtime.process
+  const proc1Exited = new Promise((resolve) => proc1.onExit(resolve))
+  const sid1 = rt1.runtime.conversations.get('FALLBACK-32603').sessionId
+  clock1 += 60_000
+  rt1.runtime.sweep()
+  clock1 += 60_000
+  rt1.runtime.sweep()
+  clock1 += 60_000
+  rt1.runtime.sweep()
+  await proc1Exited
+
+  rmSync(join(rt1.home, 'agy', 'conversations', `${sid1}.db`), { force: true })
+  assert.equal(existsSync(join(rt1.home, 'agy', 'brain', sid1)), true)
+
+  await collect(
+    rt1.runtime.stream({
+      model: 'gemini-4-argon',
+      sessionId: 'FALLBACK-32603',
+      messages: [
+        sys,
+        user('u1', 'before missing db'),
+        assistantFrom('a1', turn1a),
+        user('u2', 'after missing db'),
+      ],
+    }),
+  )
+  assert.equal(
+    warnings1.some((w) => w.includes('session/resume failed')),
+    true,
+  )
+  assert.equal(existsSync(join(rt1.home, 'agy', 'brain', sid1)), false)
+  assert.match(rt1.prompts()[1].text, /<pi_history>/)
+  assert.match(rt1.prompts()[1].text, /<system_instructions>/)
+  assert.match(rt1.prompts()[1].text, /after missing db/)
+
+  // Case 2: -32002 (explicit JSON-RPC remote error).
+  let clock2 = 1_000
+  const warnings2 = []
+  const rt2 = makeRuntime(t, {
+    config: { idleSessionTtlMs: 150_000 },
+    env: { FAKE_AGY_RESUME_ERROR: '-32002' },
+    host: {
+      monotonicNow: () => clock2,
+      log: { info: () => undefined, warn: (msg) => warnings2.push(msg) },
+    },
+  })
+  const turn1b = await collect(
+    rt2.runtime.stream({
+      model: 'gemini-4-argon',
+      sessionId: 'FALLBACK-32002',
+      messages: [sys, user('u1', 'before 32002')],
+    }),
+  )
+  const proc2 = rt2.runtime.process
+  const proc2Exited = new Promise((resolve) => proc2.onExit(resolve))
+  const sid2 = rt2.runtime.conversations.get('FALLBACK-32002').sessionId
+  clock2 += 60_000
+  rt2.runtime.sweep()
+  clock2 += 60_000
+  rt2.runtime.sweep()
+  clock2 += 60_000
+  rt2.runtime.sweep()
+  await proc2Exited
+  assert.equal(
+    existsSync(join(rt2.home, 'agy', 'conversations', `${sid2}.db`)),
+    true,
+  )
+
+  await collect(
+    rt2.runtime.stream({
+      model: 'gemini-4-argon',
+      sessionId: 'FALLBACK-32002',
+      messages: [
+        sys,
+        user('u1', 'before 32002'),
+        assistantFrom('a1', turn1b),
+        user('u2', 'after 32002'),
+      ],
+    }),
+  )
+  assert.equal(
+    warnings2.some((w) => w.includes('session/resume failed')),
+    true,
+  )
+  assert.notEqual(rt2.runtime.conversations.get('FALLBACK-32002').sessionId, sid2)
+  assert.equal(
+    existsSync(join(rt2.home, 'agy', 'conversations', `${sid2}.db`)),
+    false,
+  )
+  assert.equal(existsSync(join(rt2.home, 'agy', 'brain', sid2)), false)
+  assert.match(rt2.prompts()[1].text, /<pi_history>/)
+  assert.match(rt2.prompts()[1].text, /after 32002/)
+})
+
+test('history or system prompt divergence while dormant skips session/resume and cleans dormant DB', async (t) => {
+  let clock = 1_000
+  const { home, runtime, prompts, mcps } = makeRuntime(t, {
+    config: { idleSessionTtlMs: 150_000 },
+    host: { monotonicNow: () => clock },
+  })
+  const turnSys = await collect(
+    runtime.stream({
+      model: 'gemini-4-argon',
+      sessionId: 'DIV-SYS',
+      messages: [sys, user('u1', 'sys original')],
+    }),
+  )
+  await collect(
+    runtime.stream({
+      model: 'gemini-4-argon',
+      sessionId: 'DIV-HIST',
+      messages: [sys, user('u1', 'hist original')],
+    }),
+  )
+  const proc1 = runtime.process
+  const proc1Exited = new Promise((resolve) => proc1.onExit(resolve))
+  const sidSys = runtime.conversations.get('DIV-SYS').sessionId
+  const sidHist = runtime.conversations.get('DIV-HIST').sessionId
+
+  clock += 60_000
+  runtime.sweep()
+  clock += 60_000
+  runtime.sweep()
+  clock += 60_000
+  runtime.sweep()
+  await proc1Exited
+
+  const dbSys = join(home, 'agy', 'conversations', `${sidSys}.db`)
+  const dbHist = join(home, 'agy', 'conversations', `${sidHist}.db`)
+  assert.equal(existsSync(dbSys), true)
+  assert.equal(existsSync(dbHist), true)
+
+  const changedSys = {
+    id: 'sys',
+    role: 'system',
+    content: [{ type: 'text', text: 'You are a different assistant.' }],
+    source: { kind: 'system-prompt' },
+  }
+  await collect(
+    runtime.stream({
+      model: 'gemini-4-argon',
+      sessionId: 'DIV-SYS',
+      messages: [
+        changedSys,
+        user('u1', 'sys original'),
+        assistantFrom('a1', turnSys),
+        user('u2', 'sys follow-up'),
+      ],
+    }),
+  )
+  assert.equal(existsSync(dbSys), false)
+  assert.match(prompts()[2].text, /<pi_history>/)
+
+  await collect(
+    runtime.stream({
+      model: 'gemini-4-argon',
+      sessionId: 'DIV-HIST',
+      messages: [sys, user('u-compacted', 'compacted summary')],
+    }),
+  )
+  assert.equal(existsSync(dbHist), false)
+  assert.match(prompts()[3].text, /<system_instructions>/)
+  assert.equal(
+    mcps().some((entry) => entry.resumed === true),
+    false,
+  )
+})
+
+test('explicit resetConversations, dispose, and binary upgrade delete dormant session DBs', async (t) => {
+  // 1. resetConversations deletes dormant DB.
+  let clock1 = 1_000
+  const rt1 = makeRuntime(t, {
+    config: { idleSessionTtlMs: 150_000 },
+    host: { monotonicNow: () => clock1 },
+  })
+  await collect(
+    rt1.runtime.stream({
+      model: 'gemini-4-argon',
+      sessionId: 'TEARDOWN-RESET',
+      messages: [sys, user('u1', 'hello')],
+    }),
+  )
+  const proc1 = rt1.runtime.process
+  const proc1Exited = new Promise((resolve) => proc1.onExit(resolve))
+  const sid1 = rt1.runtime.conversations.get('TEARDOWN-RESET').sessionId
+  const db1 = join(rt1.home, 'agy', 'conversations', `${sid1}.db`)
+  clock1 += 60_000
+  rt1.runtime.sweep()
+  clock1 += 60_000
+  rt1.runtime.sweep()
+  clock1 += 60_000
+  rt1.runtime.sweep()
+  await proc1Exited
+  assert.equal(existsSync(db1), true)
+  await rt1.runtime.resetConversations()
+  assert.equal(existsSync(db1), false)
+
+  // 2. dispose deletes dormant DB.
+  let clock2 = 1_000
+  const rt2 = makeRuntime(t, {
+    config: { idleSessionTtlMs: 150_000 },
+    host: { monotonicNow: () => clock2 },
+  })
+  await collect(
+    rt2.runtime.stream({
+      model: 'gemini-4-argon',
+      sessionId: 'TEARDOWN-DISPOSE',
+      messages: [sys, user('u1', 'hello')],
+    }),
+  )
+  const proc2 = rt2.runtime.process
+  const proc2Exited = new Promise((resolve) => proc2.onExit(resolve))
+  const sid2 = rt2.runtime.conversations.get('TEARDOWN-DISPOSE').sessionId
+  const db2 = join(rt2.home, 'agy', 'conversations', `${sid2}.db`)
+  clock2 += 60_000
+  rt2.runtime.sweep()
+  clock2 += 60_000
+  rt2.runtime.sweep()
+  clock2 += 60_000
+  rt2.runtime.sweep()
+  await proc2Exited
+  assert.equal(existsSync(db2), true)
+  await rt2.runtime.dispose()
+  assert.equal(existsSync(db2), false)
+
+  // 3. Binary upgrade while dormant deletes dormant DB and skips session/resume.
+  const binDir = mkdtempSync(join(tmpdir(), 'agy-bin-upgrade-'))
+  t.after(() => rmSync(binDir, { recursive: true, force: true }))
+  const upgradeBin = join(binDir, 'fake-agy.mjs')
+  copyFileSync(fake, upgradeBin)
+  chmodSync(upgradeBin, 0o755)
+  let clock3 = 1_000
+  const rt3 = makeRuntime(t, {
+    config: { command: upgradeBin, idleSessionTtlMs: 150_000 },
+    host: { monotonicNow: () => clock3 },
+  })
+  const turn3 = await collect(
+    rt3.runtime.stream({
+      model: 'gemini-4-argon',
+      sessionId: 'TEARDOWN-UPGRADE',
+      messages: [sys, user('u1', 'before upgrade')],
+    }),
+  )
+  const proc3 = rt3.runtime.process
+  const proc3Exited = new Promise((resolve) => proc3.onExit(resolve))
+  const sid3 = rt3.runtime.conversations.get('TEARDOWN-UPGRADE').sessionId
+  const db3 = join(rt3.home, 'agy', 'conversations', `${sid3}.db`)
+  clock3 += 60_000
+  rt3.runtime.sweep()
+  clock3 += 60_000
+  rt3.runtime.sweep()
+  clock3 += 60_000
+  rt3.runtime.sweep()
+  await proc3Exited
+  assert.equal(existsSync(db3), true)
+
+  writeFileSync(upgradeBin, `${readFileSync(upgradeBin, 'utf8')}\n// upgraded\n`)
+  await collect(
+    rt3.runtime.stream({
+      model: 'gemini-4-argon',
+      sessionId: 'TEARDOWN-UPGRADE',
+      messages: [
+        sys,
+        user('u1', 'before upgrade'),
+        assistantFrom('a1', turn3),
+        user('u2', 'after upgrade'),
+      ],
+    }),
+  )
+  assert.equal(
+    rt3.mcps().some((entry) => entry.resumed === true),
+    false,
+  )
+  assert.match(rt3.prompts()[1].text, /<pi_history>/)
 })
