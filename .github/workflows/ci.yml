@@ -23,10 +23,10 @@ jobs:
       matrix:
         node: ["22.19.0", "24"]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ${{ matrix.node }}
           package-manager-cache: false
@@ -48,17 +48,17 @@ jobs:
       matrix:
         pi: ["1.5.0", "1.5"]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24"
           package-manager-cache: false
       - name: Install baseline dependencies
         run: npm install
       - name: Install Pi host matrix version
-        run: npm install --no-save "@earendil-works/pi-ai@${{ matrix.pi }}" "@earendil-works/pi-coding-agent@${{ matrix.pi }}" "@earendil-works/pi-tui@${{ matrix.pi }}"
+        run: npm install --no-save "@earendil-works/pi-ai@${{ matrix.pi }}" "@earendil-works/pi-coding-agent@${{ matrix.pi }}"
       - name: Typecheck
         run: npm run check
       - name: Run tests
