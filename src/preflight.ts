@@ -42,8 +42,8 @@ import { removeArtifacts } from './session-db.ts'
 
 /** Agent id installed in the isolated home. */
 export const BRIDGE_AGENT = 'pi-bridge'
-/** Minimum official CLI version supported (`agy 1.5.10+`). */
-export const MIN_AGY_VERSION: readonly [number, number, number] = [1, 5, 10]
+/** Minimum official CLI version supported (`agy 1.5.18+`). */
+export const MIN_AGY_VERSION: readonly [number, number, number] = [1, 5, 18]
 
 /** Output of one finished helper command. */
 export interface CommandOutput {
@@ -183,7 +183,7 @@ export function resolveAgyBinary(
   )
   if (found === undefined) {
     throw new Error(
-      'antigravity-acp: the Antigravity CLI (agy) was not found; install it from https://antigravity.google/docs/install?tab=cli and sign in once with `agy`',
+      'antigravity-acp: the Antigravity CLI (agy) was not found; install it from https://antigravity.google/docs/install?tab=cli and sign in once with `agy` (or `agy acp --login` for headless/SSH setups)',
     )
   }
   return found

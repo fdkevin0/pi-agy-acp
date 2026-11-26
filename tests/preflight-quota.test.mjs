@@ -299,7 +299,7 @@ test('failed account discovery leaves quota usable, cleans startup, and attempts
   })
   runtime.preflight = {
     binary: 'fake',
-    version: '1.5.10',
+    version: '1.5.18',
     home,
     workspace: home,
     logFile: join(home, 'acp.log'),
@@ -368,10 +368,19 @@ test('binary discovery skips same-name directories and version error matches min
   )
   assert.throws(() => resolveAgyBinary(join(bad, 'agy')), /not found/)
   assert.throws(
-    () => assertSupportedAgyVersion('1.5.9', binary),
-    /requires >= 1\.5\.10/,
+    () =>
+      resolveAgyBinary('', {
+        platform: 'linux',
+        home: join(root, 'empty-home'),
+        env: { PATH: '' },
+      }),
+    /agy acp --login/,
   )
-  assert.doesNotThrow(() => assertSupportedAgyVersion('1.5.10', binary))
+  assert.throws(
+    () => assertSupportedAgyVersion('1.5.17', binary),
+    /requires >= 1\.5\.18/,
+  )
+  assert.doesNotThrow(() => assertSupportedAgyVersion('1.5.18', binary))
 })
 
 test('quota reads without ACP startup, coalesces requests and preserves command errors', async (t) => {
@@ -2073,4 +2082,99 @@ test('ModelCatalog uses exact modelId matching in deriveEfforts and preserves gl
   ])
   assert.equal(prunedChanged, true)
   assert.deepEqual(catalog.effortList(), ['low', 'high'])
+})
+
+test('ModelCatalog derives efforts for full agy 1.5.18 inventory including Neon, Hydrogen, Orchestrators, and gateway duplicate-name IDs', (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-catalog-1518-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const catalog = new ModelCatalog(join(root, 'catalog.json'))
+
+  catalog.observe(
+    [
+      {
+        id: 'model',
+        options: [
+          { value: 'gemini-4-neon', name: 'Gemini 4 Neon' },
+          { value: 'gemini-4-carbon', name: 'Gemini 4 Carbon' },
+          { value: 'gemini-4-argon', name: 'Gemini 4 Argon' },
+          { value: 'gemini-4-hydrogen', name: 'Gemini 4 Hydrogen' },
+          { value: 'gemini-pro-orchestrator-neon', name: 'Orchestrator (Neon)' },
+          { value: 'gemini-pro-orchestrator', name: 'Orchestrator (Carbon)' },
+          { value: 'gemini-pro-orchestrator-argon', name: 'Orchestrator (Argon)' },
+          { value: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash' },
+          { value: 'claude-opus-5-5', name: 'Claude Opus 5.5 (claude-opus-5-5)' },
+          { value: 'claude-sonnet-5-5', name: 'Claude Sonnet 5.5' },
+          { value: 'gpt-oss-120b-medium', name: 'GPT-OSS 120B (Medium)' },
+        ],
+      },
+      {
+        id: 'thought_level',
+        options: [
+          { value: 'low' },
+          { value: 'medium' },
+          { value: 'high' },
+          { value: 'xhigh' },
+        ],
+      },
+    ],
+    [
+      { modelId: 'gemini-4-neon-high' },
+      { modelId: 'gemini-4-neon-xhigh' },
+      { modelId: 'gemini-4-neon-medium' },
+      { modelId: 'gemini-4-neon-low' },
+      { modelId: 'gemini-4-carbon-medium' },
+      { modelId: 'gemini-4-carbon-high' },
+      { modelId: 'gemini-4-carbon-low' },
+      { modelId: 'gemini-4-argon-medium' },
+      { modelId: 'gemini-4-argon-high' },
+      { modelId: 'gemini-4-argon-low' },
+      { modelId: 'gemini-4-hydrogen-high' },
+      { modelId: 'gemini-4-hydrogen-xhigh' },
+      { modelId: 'gemini-4-hydrogen-medium' },
+      { modelId: 'gemini-4-hydrogen-low' },
+      { modelId: 'gemini-pro-orchestrator-neon' },
+      { modelId: 'gemini-pro-orchestrator' },
+      { modelId: 'gemini-pro-orchestrator-argon' },
+      { modelId: 'gemini-3.8-flash-high' },
+      { modelId: 'gemini-3.8-flash-medium' },
+      { modelId: 'gemini-3.8-flash-low' },
+      { modelId: 'claude-opus-5-5-low' },
+      { modelId: 'claude-opus-5-5-medium' },
+      { modelId: 'claude-opus-5-5-high' },
+      { modelId: 'claude-sonnet-5-5-low' },
+      { modelId: 'claude-sonnet-5-5-medium' },
+      { modelId: 'claude-sonnet-5-5-high' },
+      { modelId: 'gpt-oss-120b-medium' },
+    ],
+  )
+
+  assert.deepEqual(catalog.effortList(), ['low', 'medium', 'high', 'xhigh'])
+  assert.deepEqual(catalog.effortsFor('gemini-4-neon'), ['low', 'medium', 'high', 'xhigh'])
+  assert.deepEqual(catalog.effortsFor('gemini-4-hydrogen'), ['low', 'medium', 'high', 'xhigh'])
+  assert.deepEqual(catalog.effortsFor('gemini-4-carbon'), ['low', 'medium', 'high'])
+  assert.deepEqual(catalog.effortsFor('claude-opus-5-5'), ['low', 'medium', 'high'])
+  assert.deepEqual(catalog.effortsFor('gemini-pro-orchestrator-neon'), [])
+  assert.deepEqual(catalog.effortsFor('gemini-pro-orchestrator'), [])
+  assert.deepEqual(catalog.effortsFor('gemini-pro-orchestrator-argon'), [])
+  assert.equal(catalog.supportsEffortSelection('gemini-pro-orchestrator-neon'), false)
+  assert.equal(catalog.supportsEffortSelection('gemini-pro-orchestrator'), false)
+  assert.equal(catalog.supportsEffortSelection('gemini-pro-orchestrator-argon'), false)
+  assert.equal(catalog.supportsEffortSelection('gpt-oss-120b-medium'), false)
+  assert.equal(catalog.fixedEffort('gpt-oss-120b-medium'), 'medium')
+})
+
+test('QuotaReader auth-required error mentions agy acp --login', async () => {
+  const reader = new QuotaReader(
+    () => '/usr/bin/agy',
+    async () => ({
+      code: 1,
+      stdout: '',
+      stderr: 'Authentication required',
+      abortedBy: 'stderr',
+    }),
+    60_000,
+  )
+  const snap = await reader.read(true)
+  assert.equal(snap.status, 'error')
+  assert.match(snap.error ?? '', /agy acp --login/)
 })

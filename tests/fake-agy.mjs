@@ -41,15 +41,28 @@ let nextSession = 1
 const rl = createInterface({ input: process.stdin })
 const send = (m) => process.stdout.write(`${JSON.stringify(m)}\n`)
 const MODELS = [
+  { value: 'gemini-4-neon', name: 'Gemini 4 Neon' },
+  { value: 'gemini-4-carbon', name: 'Gemini 4 Carbon' },
   { value: 'gemini-4-argon', name: 'Gemini 4 Argon' },
+  { value: 'gemini-4-hydrogen', name: 'Gemini 4 Hydrogen' },
+  { value: 'gemini-pro-orchestrator-neon', name: 'Orchestrator (Neon)' },
+  { value: 'gemini-pro-orchestrator', name: 'Orchestrator (Carbon)' },
+  { value: 'gemini-pro-orchestrator-argon', name: 'Orchestrator (Argon)' },
   { value: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash' },
   { value: 'claude-opus-5-5', name: 'Claude Opus 5.5' },
   { value: 'claude-sonnet-5-5', name: 'Claude Sonnet 5.5' },
   { value: 'gpt-oss-120b-medium', name: 'GPT-OSS 120B (Medium)' },
 ]
-// One entry per effort variant, exactly like a live ACP session.
+// One entry per effort variant, matching live `agy 1.5.18` ACP session/new.
 const availableModels = () => [
+  ...['gemini-4-neon', 'gemini-4-hydrogen'].flatMap((id) =>
+    ['low', 'medium', 'high', 'xhigh'].map((level) => ({
+      modelId: `${id}-${level}`,
+      name: `${id} (${level})`,
+    })),
+  ),
   ...[
+    'gemini-4-carbon',
     'gemini-4-argon',
     'gemini-3.8-flash',
     'claude-opus-5-5',
@@ -60,6 +73,9 @@ const availableModels = () => [
       name: `${id} (${level})`,
     })),
   ),
+  { modelId: 'gemini-pro-orchestrator-neon', name: 'Orchestrator (Neon)' },
+  { modelId: 'gemini-pro-orchestrator', name: 'Orchestrator (Carbon)' },
+  { modelId: 'gemini-pro-orchestrator-argon', name: 'Orchestrator (Argon)' },
   { modelId: 'gpt-oss-120b-medium', name: 'GPT-OSS 120B (Medium)' },
 ]
 const configOptions = (s) => [
@@ -81,6 +97,7 @@ const configOptions = (s) => [
       { value: 'low', name: 'Low' },
       { value: 'medium', name: 'Medium' },
       { value: 'high', name: 'High' },
+      { value: 'xhigh', name: 'Extra High' },
     ],
   },
 ]
@@ -343,6 +360,7 @@ function contextWindowForFakeModel(modelId, text) {
   if (match !== null) return Number(match[1])
   if (modelId.startsWith('gpt-oss')) return 131_072
   if (
+    modelId === 'gemini-4-neon' ||
     modelId === 'gemini-4-argon' ||
     modelId === 'gemini-4-carbon' ||
     modelId === 'gemini-4-hydrogen' ||
@@ -644,7 +662,7 @@ async function runPrompt(s, text) {
       update(s.id, {
         sessionUpdate: 'usage_update',
         used: Number(line.slice(9).trim()),
-        size: 256_000,
+        size: 1_048_576,
       })
     } else if (line.startsWith('STEP ')) {
       const rest = line.slice('STEP '.length)
@@ -722,7 +740,7 @@ rl.on('line', async (line) => {
           },
           agentInfo: {
             name: 'fake-agy',
-            version: process.env.FAKE_AGY_VERSION ?? '1.5.14',
+            version: process.env.FAKE_AGY_VERSION ?? '1.5.18',
           },
         },
       })
@@ -800,8 +818,11 @@ rl.on('line', async (line) => {
     if (method === 'session/set_config_option') {
       if (params.configId === 'model') s.model = params.value
       if (params.configId === 'thought_level') {
-        // Fixed-variant families do not expose a thinking-level selector.
-        if (s.model.startsWith('gpt-oss')) {
+        // Fixed-variant families and orchestrators do not expose a thinking-level selector.
+        if (
+          s.model.startsWith('gpt-oss') ||
+          s.model.startsWith('gemini-pro-orchestrator')
+        ) {
           return send({
             jsonrpc: '2.0',
             id,

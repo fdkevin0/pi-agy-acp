@@ -2331,12 +2331,12 @@ test('Windows preflight locates agy.exe in LOCALAPPDATA and PATH while skipping 
   )
 
   assert.throws(
-    () => assertSupportedAgyVersion('1.5.9', defaultWinExe),
-    /1\.5\.9.*agy update/,
+    () => assertSupportedAgyVersion('1.5.17', defaultWinExe),
+    /1\.5\.17.*agy update/,
   )
-  assert.doesNotThrow(() => assertSupportedAgyVersion('1.5.10', defaultWinExe))
+  assert.doesNotThrow(() => assertSupportedAgyVersion('1.5.18', defaultWinExe))
   assert.doesNotThrow(() =>
-    assertSupportedAgyVersion('Antigravity CLI 1.5.14', defaultWinExe),
+    assertSupportedAgyVersion('Antigravity CLI 1.5.18', defaultWinExe),
   )
   assert.doesNotThrow(() =>
     assertSupportedAgyVersion('fake-agy 0.0.1', defaultWinExe),
@@ -4194,12 +4194,12 @@ test('switching models in a reused session isolates gen_metadata rows and thrown
 
 test('initialize handshake rejects unsupported agentInfo.version even when --version is non-semver', async (t) => {
   const { runtime } = makeRuntime(t, {
-    env: { FAKE_AGY_VERSION: '1.5.9' },
+    env: { FAKE_AGY_VERSION: '1.5.17' },
     host: {
       runCommand: async () => ({ code: 0, stdout: 'unknown', stderr: '' }),
     },
   })
-  await assert.rejects(runtime.ensureReady(), /requires >= 1\.5\.10/)
+  await assert.rejects(runtime.ensureReady(), /requires >= 1\.5\.18/)
   assert.equal(runtime.process, undefined)
   assert.equal(runtime.bridge.server, undefined)
   assert.equal(runtime.status().state, 'error')
@@ -4286,7 +4286,7 @@ test('select handles models and efforts advertised inside grouped configOptions'
           initialize: (request, wire) =>
             sendWireResult(request, wire, {
               protocolVersion: 1,
-              agentInfo: { name: 'grouped-fake', version: '1.5.14' },
+              agentInfo: { name: 'grouped-fake', version: '1.5.18' },
             }),
           'session/new': (request, wire) =>
             sendWireResult(request, wire, {
@@ -5000,7 +5000,7 @@ test('select clamps thought_level to live levelOption options, skips empty optio
           initialize: (request, wire) =>
             sendWireResult(request, wire, {
               protocolVersion: 1,
-              agentInfo: { name: 'clamp-fake', version: '1.5.14' },
+              agentInfo: { name: 'clamp-fake', version: '1.5.18' },
             }),
           'session/new': (request, wire) =>
             sendWireResult(request, wire, {
@@ -5266,7 +5266,7 @@ test('stream arriving during standalone warmup adopts the front instead of teari
         const handlers = {
           initialize: async () => ({
             protocolVersion: 1,
-            agentInfo: { name: 'Fake ACP', version: '1.5.14' },
+            agentInfo: { name: 'Fake ACP', version: '1.5.18' },
             agentCapabilities: { promptCapabilities: { image: true } },
           }),
           'session/new': () => sessionNewHandlers.shift()(),
@@ -5417,7 +5417,7 @@ test('unexpected ACP child exit during standalone warmup closes MCP bridge and c
                 id,
                 result: {
                   protocolVersion: 1,
-                  agentInfo: { name: 'Fake ACP', version: '1.5.14' },
+                  agentInfo: { name: 'Fake ACP', version: '1.5.18' },
                   agentCapabilities: { promptCapabilities: { image: true } },
                 },
               })}\n`,

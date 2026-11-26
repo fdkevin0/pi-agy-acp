@@ -150,6 +150,9 @@ session databases).
   `settings.json`, and authentication files are retained; sessions rebuild from
   Pi's history. Use a separate `PI_AGY_HOME` for each concurrently running Pi
   instance because startup cleanup assumes exclusive directory ownership.
+- **Sign-in:** Sign in with `agy` before starting Pi, or run `agy acp --login`
+  in headless, SSH, or terminal-only environments. Authentication and token
+  refresh remain `agy`'s responsibility.
 - **OAuth sync:** With the default `PI_AGY_HOME` and file-backed auth, the
   extension atomically syncs `antigravity-oauth-token` from your normal `agy`
   directory (`ANTIGRAVITY_CLI_HOME`, `AGY_HOME`, or `~/.gemini/antigravity-cli`)
@@ -159,8 +162,7 @@ session databases).
   directories.
 - **Global quota scope:** `agy -p /usage` does not accept `--gemini-dir`, so
   quota queries always reflect the global `agy` CLI account. Do not commit or
-  share `PI_AGY_HOME`; authentication and token refresh remain `agy`'s
-  responsibility.
+  share `PI_AGY_HOME`.
 
 ## Models and context
 
@@ -214,7 +216,8 @@ or invokes/distributes binary patches.
 ## Compatibility limits
 
 - Requires Node.js >= 22.19.0, Pi (`@earendil-works/*`) 1.5.x, and `agy` >=
-  1.5.10. Older `@mariozechner/*` Pi interfaces are not supported.
+  1.5.18 (which adds long-turn OAuth/503 recovery and fixes Windows cross-drive
+  plugin loading). Older `@mariozechner/*` Pi interfaces are not supported.
 - Sampling parameters, output limits, forced `toolChoice`, and provider-scoped
   environment overrides are not mapped to ACP.
 
