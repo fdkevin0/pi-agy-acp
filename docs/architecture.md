@@ -221,6 +221,8 @@ Working directory is `<PI_AGY_HOME>/workspace`. ACP JSON-RPC timeouts:
     or `Invalid \`signature\` in \`thinking\` block`) → `PROVIDER_ERROR` and
     marks the session dirty for rebuild
   - `429` / `RESOURCE_EXHAUSTED` → `RATE_LIMIT`
+  - `400` / `INVALID_ARGUMENT` (including malformed-image rejections) →
+    `INVALID_REQUEST`
   - `404` / `NOT_FOUND` → `SERVER` if the model was reached, else
     `UNKNOWN_MODEL`
 - Scoped artifact cleanup removes `conversations/<id>.db*`, `brain/<id>`, and

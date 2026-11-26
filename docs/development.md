@@ -62,10 +62,9 @@ npm test
 pi --no-extensions -e ./index.ts --list-models antigravity-acp
 ```
 
-Tests run directly with Node's native TypeScript support (`tsx` is not
-required) using a scripted local `agy` substitute so `npm test` runs offline
-without consuming account quota. Tests bind ephemeral loopback sockets on
-`127.0.0.1`.
+Tests run directly with Node's native TypeScript support using a scripted local
+`agy` substitute so `npm test` runs offline without consuming account quota.
+Tests bind ephemeral loopback sockets on `127.0.0.1`.
 
 Automated tests cover ACP transport and sessions, JSON-RPC framing, MCP bridge
 boundaries and permissions, model/account discovery, session SQLite inspection,
