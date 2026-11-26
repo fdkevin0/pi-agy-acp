@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { streamPi, requestMessages } from '../src/pi-stream.ts'
 import { AntigravityRuntime, mapError } from '../src/runtime.ts'
+import { JsonRpcRemoteError } from '../src/jsonrpc.ts'
 import { LlmError } from '../src/protocol.ts'
 import { splitSystem, renderTranscript } from '../src/history.ts'
 import {
@@ -264,9 +265,63 @@ test('timeout and cancellation cannot masquerade as overflow; quota and overflow
     'CONTEXT_WINDOW_EXCEEDED',
   )
   assert.equal(mapError(new Error('rate limit reached')).code, 'RATE_LIMIT')
+  assert.equal(
+    mapError(
+      new JsonRpcRemoteError('session/prompt', {
+        code: -32000,
+        message: 'Prepaid balance exhausted',
+      }),
+    ).code,
+    'QUOTA',
+  )
+  assert.equal(
+    mapError(
+      new JsonRpcRemoteError('session/prompt', {
+        code: -32000,
+        message: 'Organization spend cap reached',
+      }),
+    ).code,
+    'QUOTA',
+  )
+  assert.equal(
+    mapError(
+      new JsonRpcRemoteError('session/prompt', {
+        code: -32000,
+        message: 'Billing disabled for account',
+      }),
+    ).code,
+    'QUOTA',
+  )
+  assert.equal(
+    mapError(
+      new JsonRpcRemoteError('session/prompt', {
+        code: -32602,
+        message: 'INVALID_ARGUMENT (code 400): Unable to process input image',
+      }),
+    ).code,
+    'INVALID_REQUEST',
+  )
   const authErr = mapError(new Error('Authentication required'))
   assert.equal(authErr.code, 'AUTH')
   assert.match(authErr.message, /agy acp --login/)
+  const prepaid = await result(
+    {
+      async *stream() {
+        throw mapError(
+          new JsonRpcRemoteError('session/prompt', {
+            code: -32000,
+            message: 'Prepaid balance exhausted',
+          }),
+        )
+      },
+    },
+    context(user('hi')),
+  )
+  assert.equal(
+    prepaid.message.errorMessage,
+    'quota exceeded: session/prompt: Prepaid balance exhausted',
+  )
+  assert.equal(isRetryableAssistantError(prepaid.message), false)
   const overflow = await result(
     {
       async *stream() {

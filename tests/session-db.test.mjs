@@ -184,6 +184,41 @@ test('classifyStepErrorPayload classifies structured 429/RESOURCE_EXHAUSTED and 
   assert.equal(classifyStepErrorPayload('', false), undefined)
 })
 
+test('classifyStepErrorPayload classifies INVALID_ARGUMENT (code 400) image and request failures without matching bare 400', () => {
+  const corruptPngPayload =
+    'Agent execution terminated due to error. INVALID_ARGUMENT (code 400): Unable to process input image. HTTP 400 Bad Request'
+  assert.deepEqual(classifyStepErrorPayload(corruptPngPayload, false), {
+    kind: 'invalid_request',
+    code: 'INVALID_REQUEST',
+    message:
+      'Antigravity rejected the request (400 INVALID_ARGUMENT): Unable to process input image',
+  })
+
+  assert.deepEqual(
+    classifyStepErrorPayload('{"error":{"code":400,"status":"INVALID_ARGUMENT"}}', true),
+    {
+      kind: 'invalid_request',
+      code: 'INVALID_REQUEST',
+      message: 'Antigravity rejected the request (400 INVALID_ARGUMENT)',
+    },
+  )
+
+  // Invalid thinking signature (HTTP 400) must still take precedence over generic invalid_request.
+  assert.equal(
+    classifyStepErrorPayload(
+      'HTTP 400: messages.1.content.0.thinking.signature: Field required',
+      false,
+    )?.kind,
+    'invalid_thinking_signature',
+  )
+
+  // Bare 400 in identifiers must not false-positive.
+  assert.equal(
+    classifyStepErrorPayload('trace_id=req_400_ok transient EOF', false),
+    undefined,
+  )
+})
+
 test('readSessionCursors and readSessionTurnData handle missing DBs, idx=0 steps, BLOB/TEXT payloads, and stamp gating', (t) => {
   const home = makeTempHome(t)
   assert.deepEqual(readSessionCursors(home, 'missing'), {

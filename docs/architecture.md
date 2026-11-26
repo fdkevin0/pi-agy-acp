@@ -212,7 +212,10 @@ Working directory is `<PI_AGY_HOME>/workspace`. ACP JSON-RPC timeouts:
   switches so prior context windows cannot bleed across models.
 - On `end_turn` and `refusal`, inspects the newest terminal `steps` row
   (`step_type = 17`, cross-checked against `step_type = 15` model reachability)
-  to surface hidden API errors while preserving pure safety refusals:
+  to surface hidden API errors while preserving pure safety refusals. This
+  remains necessary in `agy` 1.5.18 because certain API errors (such as
+  `INVALID_ARGUMENT (code 400)` on malformed images) still complete
+  `session/prompt` with `stopReason: "end_turn"`:
   - `QUOTA_EXHAUSTED` → `QUOTA` (extracts reset timestamp/delay)
   - Thinking signature validation errors (`thinking.signature: Field required`
     or `Invalid \`signature\` in \`thinking\` block`) → `PROVIDER_ERROR` and
