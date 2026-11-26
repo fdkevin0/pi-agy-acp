@@ -212,7 +212,7 @@ function renderBlocks(content: readonly ContentBlock[]): string {
  * @param content - user content blocks.
  * @returns prompt blocks in content order.
  */
-export function promptBlocks(
+function promptBlocks(
   content: readonly ContentBlock[],
 ): AcpPromptBlock[] {
   const blocks: AcpPromptBlock[] = []
@@ -221,9 +221,6 @@ export function promptBlocks(
       if (block.text.length > 0) blocks.push({ type: 'text', text: block.text })
     } else if (block.type === 'image') {
       blocks.push({ type: 'image', data: block.data, mimeType: block.mimeType })
-    } else {
-      const text = renderBlocks([block])
-      if (text.length > 0) blocks.push({ type: 'text', text })
     }
   }
   return blocks

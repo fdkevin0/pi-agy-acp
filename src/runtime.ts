@@ -26,9 +26,11 @@ import {
   type AcpSpawner,
 } from './acp-process.ts'
 import {
+  findConfigOption,
   flattenConfigOptions,
   ModelCatalog,
   nearestEffort,
+  offeredEffortsFrom,
 } from './catalog.ts'
 import { asEffort, defaults, type Config, type Effort } from './config.ts'
 import {
@@ -586,16 +588,28 @@ export class AntigravityRuntime {
 
   /** Close conversation sessions while retaining the process and discovery/quota caches. */
   async resetConversations(): Promise<void> {
-    this.assertActive()
+    if (this.lifecycle !== 'active' || this.shutdown.signal.aborted) return
     this.processIdleMs = 0
     const conversations = [...this.conversations.values()]
     for (const conv of conversations)
       this.dropTurn(conv, 'The Pi session changed.')
     await Promise.all(
       conversations.map(async (conv) => {
-        const release = await this.mutex.acquire(conv.key, this.shutdown.signal)
+        let release: () => void
         try {
-          if (this.conversations.get(conv.key) !== conv) return
+          release = await this.mutex.acquire(conv.key, this.shutdown.signal)
+        } catch (error) {
+          if (this.lifecycle !== 'active' || this.shutdown.signal.aborted)
+            return
+          throw error
+        }
+        try {
+          if (
+            this.lifecycle !== 'active' ||
+            this.shutdown.signal.aborted ||
+            this.conversations.get(conv.key) !== conv
+          )
+            return
           await this.resetSession(conv)
           this.conversations.delete(conv.key)
         } finally {
@@ -1165,7 +1179,14 @@ export class AntigravityRuntime {
     request: AcpPermissionRequest,
   ): AcpPermissionOutcome {
     const pick = (kind: string): AcpPermissionOutcome | undefined => {
-      const option = request.options.find((o) => o.kind === kind)
+      if (!Array.isArray(request.options)) return undefined
+      const option = request.options.find(
+        (o) =>
+          o !== null &&
+          typeof o === 'object' &&
+          o.kind === kind &&
+          typeof o.optionId === 'string',
+      )
       return option === undefined
         ? undefined
         : { outcome: 'selected', optionId: option.optionId }
@@ -1249,9 +1270,7 @@ export class AntigravityRuntime {
   ): Promise<Effort> {
     const sessionId = conv.sessionId as string
     this.assertOwner(proc, conv, sessionId)
-    const modelOption = conv.configOptions.find(
-      (o) => o.id === 'model' || o.category === 'model',
-    )
+    const modelOption = findConfigOption(conv.configOptions, 'model')
     const modelValues =
       modelOption?.options !== undefined
         ? flattenConfigOptions(modelOption.options)
@@ -1290,15 +1309,8 @@ export class AntigravityRuntime {
       conv.lastDbStamp = undefined
     }
     conv.model = model
-    const levelOption = conv.configOptions.find(
-      (o) => o.id === 'thought_level' || o.category === 'thought_level',
-    )
-    const offeredEfforts =
-      levelOption?.options !== undefined
-        ? flattenConfigOptions(levelOption.options)
-            .map((o) => asEffort(o.value))
-            .filter((v): v is Effort => v !== undefined)
-        : undefined
+    const levelOption = findConfigOption(conv.configOptions, 'thought_level')
+    const offeredEfforts = offeredEffortsFrom(levelOption)
     const targetEffort =
       offeredEfforts !== undefined && offeredEfforts.length > 0
         ? offeredEfforts.includes(effort)
@@ -1691,9 +1703,6 @@ export class AntigravityRuntime {
           data: block.data,
           mimeType: block.mimeType,
         })
-      } else {
-        const rendered = renderTranscript([{ role: 'user', content: [block] }])
-        if (rendered.length > 0) items.push({ type: 'text', text: rendered })
       }
     }
     if (items.length === 0) items.push({ type: 'text', text: '(no output)' })
@@ -1908,14 +1917,11 @@ function clampEffortToOptions(
   configOptions: readonly AcpConfigOption[],
   effort: Effort,
 ): Effort {
-  const levelOption = configOptions.find(
-    (o) => o.id === 'thought_level' || o.category === 'thought_level',
+  const offered = offeredEffortsFrom(
+    findConfigOption(configOptions, 'thought_level'),
   )
-  if (levelOption?.options === undefined) return effort
-  const offered = flattenConfigOptions(levelOption.options)
-    .map((o) => asEffort(o.value))
-    .filter((v): v is Effort => v !== undefined)
-  if (offered.length === 0 || offered.includes(effort)) return effort
+  if (offered === undefined || offered.length === 0 || offered.includes(effort))
+    return effort
   return nearestEffort(effort, offered)
 }
 

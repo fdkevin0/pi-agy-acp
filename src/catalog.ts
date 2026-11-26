@@ -7,21 +7,15 @@
  * @module pi-agy-acp/catalog
  */
 
-import {
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  renameSync,
-  unlinkSync,
-  writeFileSync,
-} from 'node:fs'
-import { basename, dirname, join } from 'node:path'
+import { existsSync, mkdirSync, readFileSync } from 'node:fs'
+import { dirname } from 'node:path'
 import type {
   AcpConfigOption,
   AcpConfigOptionValue,
   AcpTierInfo,
 } from './acp-process.ts'
-import { EFFORTS, type Effort } from './config.ts'
+import { asEffort, EFFORTS, type Effort } from './config.ts'
+import { atomicWriteFile } from './util.ts'
 
 /** One advertised model family. */
 export interface CatalogModel {
@@ -48,6 +42,24 @@ export function flattenConfigOptions(
         : []
       : [entry]
   })
+}
+
+/** Find an ACP config option by id or category. */
+export function findConfigOption(
+  options: readonly AcpConfigOption[] | undefined,
+  id: string,
+): AcpConfigOption | undefined {
+  return options?.find((o) => o.id === id || o.category === id)
+}
+
+/** Extract valid `Effort` values from a `thought_level` config option. */
+export function offeredEffortsFrom(
+  option: AcpConfigOption | undefined,
+): Effort[] | undefined {
+  if (option?.options === undefined) return undefined
+  return flattenConfigOptions(option.options)
+    .map((o) => asEffort(o.value))
+    .filter((v): v is Effort => v !== undefined)
 }
 
 /** Effort suffixes ordered longest-first so `-<effort>-effort` beats `-<effort>`. */
@@ -285,21 +297,10 @@ export class ModelCatalog {
       if (tierChanged) this.save()
       return false
     }
-    const modelOption = options.find(
-      (o) => o.id === 'model' || o.category === 'model',
-    )
-    const levelOption = options.find(
-      (o) => o.id === 'thought_level' || o.category === 'thought_level',
-    )
+    const modelOption = findConfigOption(options, 'model')
+    const levelOption = findConfigOption(options, 'thought_level')
     const beforeEfforts = JSON.stringify(this.efforts)
-    const levelEfforts =
-      levelOption?.options !== undefined
-        ? flattenConfigOptions(levelOption.options)
-            .map((o) => o.value)
-            .filter((v): v is Effort =>
-              (EFFORTS as readonly string[]).includes(v),
-            )
-        : []
+    const levelEfforts = offeredEffortsFrom(levelOption) ?? []
     const modelEntries = flattenConfigOptions(modelOption?.options)
     const next =
       modelEntries.length > 0
@@ -388,15 +389,10 @@ export class ModelCatalog {
   }
 
   private save(): void {
-    const dir = dirname(this.cachePath)
-    const tempPath = join(
-      dir,
-      `.${basename(this.cachePath)}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2, 8)}.tmp`,
-    )
     try {
-      mkdirSync(dir, { recursive: true })
-      writeFileSync(
-        tempPath,
+      mkdirSync(dirname(this.cachePath), { recursive: true })
+      atomicWriteFile(
+        this.cachePath,
         `${JSON.stringify(
           {
             models: this.models,
@@ -415,13 +411,7 @@ export class ModelCatalog {
           2,
         )}\n`,
       )
-      renameSync(tempPath, this.cachePath)
     } catch (_cacheWrite) {
-      try {
-        unlinkSync(tempPath)
-      } catch {
-        // Best-effort cleanup.
-      }
       // The cache only speeds up the next cold start.
     }
   }

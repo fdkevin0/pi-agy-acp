@@ -183,12 +183,33 @@ export function streamPi(
             'INVALID_PAYLOAD',
           )
         }
+        if (
+          candidate.system !== undefined &&
+          typeof candidate.system !== 'string'
+        ) {
+          throw new LlmError(
+            'onPayload replacement system must be a string when provided',
+            'INVALID_PAYLOAD',
+          )
+        }
+        if (
+          candidate.reasoningEffort !== undefined &&
+          typeof candidate.reasoningEffort !== 'string'
+        ) {
+          throw new LlmError(
+            'onPayload replacement reasoningEffort must be a string when provided',
+            'INVALID_PAYLOAD',
+          )
+        }
         request = {
-          ...(candidate as unknown as GenerateOptions),
+          model: candidate.model,
+          messages: candidate.messages as GenerateOptions['messages'],
+          system: candidate.system,
           tools:
             candidate.tools === undefined
               ? request.tools
               : (candidate.tools as GenerateOptions['tools']),
+          reasoningEffort: candidate.reasoningEffort,
           sessionId: options.sessionId,
           signal: options.signal,
         }

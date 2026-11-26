@@ -188,6 +188,7 @@ export class JsonRpcPeer {
   }
 
   private write(message: unknown): void {
+    if (this.closed !== undefined) return
     try {
       this.output.write(`${JSON.stringify(message)}\n`)
     } catch (error) {

@@ -8,37 +8,28 @@
  * @module pi-agy-acp/preflight
  */
 
-import { randomBytes } from 'node:crypto'
 import {
   accessSync,
-  chmodSync,
   closeSync,
   constants as fsConstants,
   fstatSync,
   mkdirSync,
   openSync,
-  writeFileSync,
   readFileSync,
   realpathSync,
-  renameSync,
   statSync,
   lstatSync,
   readdirSync,
-  unlinkSync,
   type BigIntStats,
   type Stats,
 } from 'node:fs'
 import { homedir } from 'node:os'
-import {
-  basename,
-  delimiter,
-  dirname,
-  isAbsolute,
-  join,
-  resolve,
-} from 'node:path'
+import { delimiter, isAbsolute, join, resolve } from 'node:path'
 import { readJson } from './config.ts'
 import { removeArtifacts } from './session-db.ts'
+import { atomicWriteFile } from './util.ts'
+
+export { atomicWriteFile }
 
 /** Agent id installed in the isolated home. */
 export const BRIDGE_AGENT = 'pi-bridge'
@@ -322,73 +313,6 @@ function ensureRealDirectory(
     }
   }
   return current
-}
-
-/**
- * Atomically write a regular file in the target directory while rejecting
- * symlinked or non-regular destination paths.
- */
-export function atomicWriteFile(
-  path: string,
-  content: string | Uint8Array,
-  options?: { mode?: number },
-): void {
-  let existing: Stats | undefined
-  try {
-    existing = lstatSync(path)
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw error
-  }
-  if (
-    existing !== undefined &&
-    (existing.isSymbolicLink() || !existing.isFile())
-  ) {
-    throw new Error(
-      `Refusing to write to symlink or non-regular file: ${path}`,
-    )
-  }
-  const tmpPath = join(
-    dirname(path),
-    `.${basename(path)}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`,
-  )
-  const mode = options?.mode
-  let fd: number | undefined
-  let created = false
-  try {
-    fd = openSync(
-      tmpPath,
-      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL,
-      mode ?? 0o666,
-    )
-    created = true
-    writeFileSync(fd, content)
-    closeSync(fd)
-    fd = undefined
-    if (mode !== undefined) {
-      try {
-        chmodSync(tmpPath, mode)
-      } catch {
-        // Mode bits are advisory on Windows.
-      }
-    }
-    renameSync(tmpPath, path)
-  } catch (error) {
-    if (fd !== undefined) {
-      try {
-        closeSync(fd)
-      } catch {
-        // Ignore close errors during cleanup.
-      }
-    }
-    if (created) {
-      try {
-        unlinkSync(tmpPath)
-      } catch {
-        // Best-effort temp file cleanup.
-      }
-    }
-    throw error
-  }
 }
 
 /**
