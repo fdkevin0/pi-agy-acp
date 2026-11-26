@@ -15,9 +15,11 @@ const provider = 'antigravity-acp'
 const tick = () => new Promise((resolve) => setImmediate(resolve))
 
 const LIVE_CATALOG = [
+  { id: 'gemini-4-neon', name: 'Gemini 4 Neon' },
   { id: 'gemini-4-carbon', name: 'Gemini 4 Carbon' },
   { id: 'gemini-4-argon', name: 'Gemini 4 Argon' },
   { id: 'gemini-4-hydrogen', name: 'Gemini 4 Hydrogen' },
+  { id: 'gemini-pro-orchestrator-neon', name: 'Orchestrator (Neon)' },
   { id: 'gemini-pro-orchestrator', name: 'Orchestrator (Carbon)' },
   { id: 'gemini-pro-orchestrator-argon', name: 'Orchestrator (Argon)' },
   { id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash' },
@@ -26,12 +28,12 @@ const LIVE_CATALOG = [
   { id: 'gpt-oss-120b-medium', name: 'GPT-OSS 120B (Medium)' },
 ]
 
-// Matches real `agy 1.5.9 -p /usage --output-format json` schema and group descriptions.
+// Matches real `agy 1.5.18 -p /usage --output-format json` schema and group descriptions.
 const liveGroups = (claudeRemaining = 0.1, resetTime = '2030-01-01T00:00:00Z') => [
   {
     name: 'Gemini Models',
     description:
-      'Models within this group: Gemini 4 Carbon, Gemini 4 Argon, Gemini 4 Hydrogen, Orchestrator (Carbon), Orchestrator (Argon), Gemini 3.8 Flash',
+      'Models within this group: Gemini 4 Neon, Gemini 4 Carbon, Gemini 4 Argon, Gemini 4 Hydrogen, Orchestrator (Neon), Orchestrator (Carbon), Orchestrator (Argon), Gemini 3.8 Flash',
     buckets: [
       { id: 'gemini-5h', window: '5h', remainingFraction: 0.8, resetTime },
     ],
@@ -480,11 +482,13 @@ const groups = (...items) => ({
   groups: items,
 })
 
-test('quota selection covers live agy 1.5.9 catalog, multi-group minimums, qualifiers, and ambiguity rejection', () => {
+test('quota selection covers live agy 1.5.18 catalog, multi-group minimums, qualifiers, and ambiguity rejection', () => {
   const liveSnapshot = snapshot()
   assert.deepEqual(
     LIVE_CATALOG.map((model) => formatQuotaStatus(liveSnapshot, model)),
     [
+      'AGY 20%',
+      'AGY 20%',
       'AGY 20%',
       'AGY 20%',
       'AGY 20%',
@@ -1219,7 +1223,7 @@ test('extension thinkingLevelMap exposes xhigh and max only when offered and inv
     const replies = {
       initialize: {
         protocolVersion: 1,
-        agentInfo: { name: 'Antigravity ACP Server', version: '1.5.14' },
+        agentInfo: { name: 'Antigravity ACP Server', version: '1.5.18' },
         agentCapabilities: { promptCapabilities: { image: false, audio: false } },
       },
       'session/new': {
@@ -1281,7 +1285,7 @@ test('extension thinkingLevelMap exposes xhigh and max only when offered and inv
   }
   const h = mountExtension(t, {
     model: { provider, id: 'gemini-4-argon', name: 'Gemini 4 Argon' },
-    runCommand: async () => ({ code: 0, stdout: '1.5.14', stderr: '' }),
+    runCommand: async () => ({ code: 0, stdout: '1.5.18', stderr: '' }),
     spawnAcp,
   })
   assert.equal(
@@ -1347,7 +1351,7 @@ test('non-forced refreshModels skips spawning agy when catalog.json matches the 
     const replies = {
       initialize: {
         protocolVersion: 1,
-        agentInfo: { name: 'Antigravity ACP Server', version: '1.5.14' },
+        agentInfo: { name: 'Antigravity ACP Server', version: '1.5.18' },
         agentCapabilities: { promptCapabilities: { image: true } },
       },
       'session/new': {
@@ -1393,7 +1397,7 @@ test('non-forced refreshModels skips spawning agy when catalog.json matches the 
   const h = mountExtension(t, {
     runCommand: async () => {
       commands++
-      return { code: 0, stdout: '1.5.14', stderr: '' }
+      return { code: 0, stdout: '1.5.18', stderr: '' }
     },
     spawnAcp,
   })
@@ -1440,7 +1444,7 @@ test('/agy-acp refresh supports TUI loader cancellation and surfaces errors clea
             id,
             result: {
               protocolVersion: 1,
-              agentInfo: { name: 'Antigravity ACP Server', version: '1.5.14' },
+              agentInfo: { name: 'Antigravity ACP Server', version: '1.5.18' },
               agentCapabilities: { promptCapabilities: { image: true } },
             },
           })}\n`,
@@ -1499,7 +1503,7 @@ test('/agy-acp refresh supports TUI loader cancellation and surfaces errors clea
       }),
   ]
   const h = harness(t, {
-    runCommand: async () => ({ code: 0, stdout: '1.5.14', stderr: '' }),
+    runCommand: async () => ({ code: 0, stdout: '1.5.18', stderr: '' }),
     spawnAcp: () => spawnFactories.shift()(),
   })
   let loader = { dispose() {} }

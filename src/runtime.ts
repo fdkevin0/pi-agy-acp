@@ -1969,7 +1969,7 @@ export function mapError(error: unknown): Error {
     )
   ) {
     return new LlmError(
-      `Antigravity requires sign-in: run \`agy\` once in a terminal (${message})`,
+      `Antigravity requires sign-in: run \`agy\` once in a terminal or \`agy acp --login\` for headless/SSH setups (${message})`,
       'AUTH',
       { cause: error },
     )

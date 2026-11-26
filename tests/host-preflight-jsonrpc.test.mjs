@@ -291,7 +291,7 @@ test('runtime warns instead of failing openSession when OAuth token sync fails',
   const runtime = new AntigravityRuntime({
     config: { ...defaults, command: fakeAgy, home: defaultPiHome },
     spawnAcp: (argv, cwd) => spawnAcp([process.execPath, ...argv], cwd),
-    runCommand: async () => ({ code: 0, stdout: '1.5.14', stderr: '' }),
+    runCommand: async () => ({ code: 0, stdout: '1.5.18', stderr: '' }),
     log: {
       info() {},
       warn(msg) {
@@ -748,7 +748,7 @@ extension(
     on() {},
   },
   {
-    runCommand: async () => ({ code: 0, stdout: '1.5.14', stderr: '' }),
+    runCommand: async () => ({ code: 0, stdout: '1.5.18', stderr: '' }),
     spawnAcp: () => {
       const stdin = new PassThrough()
       const stdout = new PassThrough()

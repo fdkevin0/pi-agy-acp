@@ -92,7 +92,8 @@ Working directory is `<PI_AGY_HOME>/workspace`. ACP JSON-RPC timeouts:
   `tier`, `contextWindows`, and the subprocess-free binary fingerprint
   (`${realpath}:${dev}:${ino}:${size}:${mtimeNs}`).
 - Both `agy --version` (30 s timeout) and ACP `initialize` (`agentInfo.version`)
-  enforce `MIN_AGY_VERSION` (`1.5.10`).
+  enforce `MIN_AGY_VERSION` (`1.5.18`, which adds long-turn OAuth/503 recovery
+  and fixes Windows cross-drive plugin loading).
 - Non-forced refreshes reuse `catalog.json` without spawning `agy` whenever
   cached models match the current binary fingerprint. Loading a cache with a
   mismatched fingerprint drops cached `contextWindows` while keeping models
@@ -204,9 +205,11 @@ Working directory is `<PI_AGY_HOME>/workspace`. ACP JSON-RPC timeouts:
   files across `.db`, `.db-wal`, `.db-shm`, and `.db-journal`.
 - Gates streaming reads with cached context window / positive `usage_update`
   checks and `(mtimeNs, size)` stamps across `.db`, `.db-wal`, and
-  `.db-journal`. `gen_metadata` scans are bounded (`LIMIT 64`) and advance
-  `metaFloorIdx` on mid-session model switches so prior context windows cannot
-  bleed across models.
+  `.db-journal`. `gen_metadata.data` remains the authoritative per-model
+  `max_context_tokens` source in `agy` 1.5.18 because `usage_update.size` still
+  reports a fixed `1048576` rather than per-model limits. `gen_metadata` scans
+  are bounded (`LIMIT 64`) and advance `metaFloorIdx` on mid-session model
+  switches so prior context windows cannot bleed across models.
 - On `end_turn` and `refusal`, inspects the newest terminal `steps` row
   (`step_type = 17`, cross-checked against `step_type = 15` model reachability)
   to surface hidden API errors while preserving pure safety refusals:

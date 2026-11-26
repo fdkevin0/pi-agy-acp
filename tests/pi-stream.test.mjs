@@ -52,7 +52,7 @@ test('Pi to ACP tool loop, next turn, rewritten history, usage and images', asyn
   const runtime = new AntigravityRuntime({
     config: { ...defaults, command: fake, home },
     spawnAcp,
-    runCommand: async () => ({ code: 0, stdout: '1.5.14', stderr: '' }),
+    runCommand: async () => ({ code: 0, stdout: '1.5.18', stderr: '' }),
     log: { info() {}, warn() {} },
     onModelsChanged() {},
   })
@@ -264,6 +264,9 @@ test('timeout and cancellation cannot masquerade as overflow; quota and overflow
     'CONTEXT_WINDOW_EXCEEDED',
   )
   assert.equal(mapError(new Error('rate limit reached')).code, 'RATE_LIMIT')
+  const authErr = mapError(new Error('Authentication required'))
+  assert.equal(authErr.code, 'AUTH')
+  assert.match(authErr.message, /agy acp --login/)
   const overflow = await result(
     {
       async *stream() {
@@ -327,7 +330,7 @@ test('a direct provider callback failure closes the runtime iterator and abandon
   const home = mkdtempSync(join(tmpdir(), 'pi-callback-'))
   const runtime = new AntigravityRuntime({
     config: { ...defaults, command: resolve('tests/fake-agy.mjs'), home },
-    spawnAcp, runCommand: async () => ({ code: 0, stdout: '1.5.14', stderr: '' }),
+    spawnAcp, runCommand: async () => ({ code: 0, stdout: '1.5.18', stderr: '' }),
     log: { info() {}, warn() {} }, onModelsChanged() {},
   })
   try {
@@ -397,7 +400,7 @@ test('streamPi preserves cumulative turn pricing while feeding live context occu
   const runtime = new AntigravityRuntime({
     config: { ...defaults, command: fake, home },
     spawnAcp,
-    runCommand: async () => ({ code: 0, stdout: '1.5.14', stderr: '' }),
+    runCommand: async () => ({ code: 0, stdout: '1.5.18', stderr: '' }),
     log: { info() {}, warn() {} },
     onModelsChanged() {},
   })
@@ -464,7 +467,7 @@ test('streamPi forwards xhigh and max reasoning levels and runtime clamps them t
   const runtime = new AntigravityRuntime({
     config: { ...defaults, command: fake, home },
     spawnAcp,
-    runCommand: async () => ({ code: 0, stdout: '1.5.14', stderr: '' }),
+    runCommand: async () => ({ code: 0, stdout: '1.5.18', stderr: '' }),
     log: { info() {}, warn() {} },
     onModelsChanged() {},
   })

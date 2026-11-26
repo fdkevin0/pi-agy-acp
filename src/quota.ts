@@ -318,7 +318,7 @@ export class QuotaReader {
         AUTH_REQUIRED_STDERR.test(result.stderr)
       ) {
         throw new Error(
-          'Antigravity requires sign-in: run `agy` once in a terminal (Authentication required)',
+          'Antigravity requires sign-in: run `agy` once in a terminal or `agy acp --login` for headless/SSH setups (Authentication required)',
         )
       }
       if (result.abortedBy === 'maxStdout') {
