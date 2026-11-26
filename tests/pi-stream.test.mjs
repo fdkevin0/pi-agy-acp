@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtempSync, rmSync, chmodSync } from 'node:fs'
+import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { streamPi, requestMessages } from '../src/pi-stream.ts'
 import { AntigravityRuntime, mapError } from '../src/runtime.ts'
 import { JsonRpcRemoteError } from '../src/jsonrpc.ts'
@@ -15,6 +16,8 @@ import {
 import { calculateContextTokens } from '@earendil-works/pi-coding-agent'
 import { defaults } from '../src/config.ts'
 import { spawnAcp } from '../src/host.ts'
+const fakeAgy = join(dirname(fileURLToPath(import.meta.url)), 'fake-agy.mjs')
+const spawnFakeAcp = (argv, cwd) => spawnAcp([process.execPath, ...argv], cwd)
 const model = {
   id: 'gemini-4-argon',
   provider: 'antigravity-acp',
@@ -48,11 +51,9 @@ async function result(runtime, ctx, opts = options, selectedModel = model) {
 }
 test('Pi to ACP tool loop, next turn, rewritten history, usage and images', async () => {
   const home = mkdtempSync(join(tmpdir(), 'pi-acp-'))
-  const fake = resolve('tests/fake-agy.mjs')
-  chmodSync(fake, 0o755)
   const runtime = new AntigravityRuntime({
-    config: { ...defaults, command: fake, home },
-    spawnAcp,
+    config: { ...defaults, command: fakeAgy, home },
+    spawnAcp: spawnFakeAcp,
     runCommand: async () => ({ code: 0, stdout: '1.5.18', stderr: '' }),
     log: { info() {}, warn() {} },
     onModelsChanged() {},
@@ -384,9 +385,11 @@ test('an initial aborted finish does not report a synthetic successful response'
 test('a direct provider callback failure closes the runtime iterator and abandons its turn', async () => {
   const home = mkdtempSync(join(tmpdir(), 'pi-callback-'))
   const runtime = new AntigravityRuntime({
-    config: { ...defaults, command: resolve('tests/fake-agy.mjs'), home },
-    spawnAcp, runCommand: async () => ({ code: 0, stdout: '1.5.18', stderr: '' }),
-    log: { info() {}, warn() {} }, onModelsChanged() {},
+    config: { ...defaults, command: fakeAgy, home },
+    spawnAcp: spawnFakeAcp,
+    runCommand: async () => ({ code: 0, stdout: '1.5.18', stderr: '' }),
+    log: { info() {}, warn() {} },
+    onModelsChanged() {},
   })
   try {
     const { message } = await result(runtime, context(system, user('CALL bash {"command":"pwd"}')), {
@@ -450,11 +453,9 @@ test('onPayload preserves routing metadata, inherits omitted tools, keeps empty 
 
 test('streamPi preserves cumulative turn pricing while feeding live context occupancy to calculateContextTokens', async () => {
   const home = mkdtempSync(join(tmpdir(), 'pi-usage-cost-'))
-  const fake = resolve('tests/fake-agy.mjs')
-  chmodSync(fake, 0o755)
   const runtime = new AntigravityRuntime({
-    config: { ...defaults, command: fake, home },
-    spawnAcp,
+    config: { ...defaults, command: fakeAgy, home },
+    spawnAcp: spawnFakeAcp,
     runCommand: async () => ({ code: 0, stdout: '1.5.18', stderr: '' }),
     log: { info() {}, warn() {} },
     onModelsChanged() {},
@@ -517,11 +518,9 @@ test('streamPi forwards xhigh and max reasoning levels and runtime clamps them t
   assert.deepEqual(seen, [undefined, 'low', 'xhigh', 'max'])
 
   const home = mkdtempSync(join(tmpdir(), 'pi-effort-clamp-'))
-  const fake = resolve('tests/fake-agy.mjs')
-  chmodSync(fake, 0o755)
   const runtime = new AntigravityRuntime({
-    config: { ...defaults, command: fake, home },
-    spawnAcp,
+    config: { ...defaults, command: fakeAgy, home },
+    spawnAcp: spawnFakeAcp,
     runCommand: async () => ({ code: 0, stdout: '1.5.18', stderr: '' }),
     log: { info() {}, warn() {} },
     onModelsChanged() {},

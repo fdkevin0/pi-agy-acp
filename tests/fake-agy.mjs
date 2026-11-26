@@ -4,7 +4,7 @@
 // and follows directives embedded in prompt text:
 //   CALL <tool> <json>      report the tool call, ask permission, call one MCP tool
 //   PCALL <tool> <json> ;; <tool> <json>   call several tools concurrently
-//   SLEEP <ms>              wait before ending the turn
+//   WAIT_CANCEL             block until session/cancel arrives
 //   MAXTOK                  end the first segment with max_tokens
 //   USAGEUPD <n>            emit a session/update usage_update notification
 //   MAXCTX <n>              record max_context_tokens = <n> in gen_metadata
@@ -138,6 +138,10 @@ let toolCallSeq = 0
 function askPermission(s, toolCall, sessionIdOverride, optionsMode) {
   return new Promise((resolve) => {
     const id = ++rpcId
+    const onClose = () => {
+      rl.off('line', handler)
+      resolve(undefined)
+    }
     const handler = (line) => {
       let msg
       try {
@@ -147,10 +151,12 @@ function askPermission(s, toolCall, sessionIdOverride, optionsMode) {
       }
       if (msg.id === id && msg.method === undefined) {
         rl.off('line', handler)
+        rl.off('close', onClose)
         resolve(msg.result?.outcome)
       }
     }
     rl.on('line', handler)
+    rl.once('close', onClose)
     const options =
       optionsMode === 'always-only'
         ? [
@@ -415,7 +421,16 @@ async function runPrompt(s, text) {
   const lines = text.split('\n')
   let output = []
   let stopReason
+  let inHistory = false
   for (const line of lines) {
+    if (line === '<pi_history>') {
+      inHistory = true
+      continue
+    }
+    if (line === '</pi_history>') {
+      inHistory = false
+      continue
+    }
     if (line.startsWith('CALL ')) {
       const [, name, ...rest] = line.split(' ')
       const result = await runToolCall(s, name, JSON.parse(rest.join(' ')))
@@ -676,8 +691,12 @@ async function runPrompt(s, text) {
         .run(s.stepSeq++, stepType, Buffer.from(payload, 'utf8'))
     } else if (line.startsWith('STOP ')) {
       stopReason = line.slice('STOP '.length).trim()
-    } else if (line.startsWith('SLEEP ')) {
-      await new Promise((r) => setTimeout(r, Number(line.slice(6))))
+    } else if (!inHistory && line === 'WAIT_CANCEL') {
+      if (!s.cancelled) {
+        await new Promise((resolve) => {
+          s.cancelWaiter = resolve
+        })
+      }
     }
   }
   if (text.includes('PROMPT_ERR')) throw new Error('synthetic prompt error')
@@ -715,10 +734,24 @@ async function runPrompt(s, text) {
   }
 }
 
-rl.on('line', async (line) => {
+const inFlight = new Set()
+
+function cancelSession(s) {
+  s.cancelled = true
+  const wake = s.cancelWaiter
+  s.cancelWaiter = undefined
+  wake?.()
+}
+
+async function handleLine(line) {
   const msg = JSON.parse(line)
   const { id, method, params } = msg
   if (method === undefined) return
+  if (method === 'session/cancel') {
+    const s = sessions.get(params?.sessionId)
+    if (s) cancelSession(s)
+    return
+  }
   try {
     if (method === 'initialize') {
       if (initLog)
@@ -871,8 +904,16 @@ rl.on('line', async (line) => {
       error: { code: -32603, message: String(error?.message ?? error) },
     })
   }
+}
+
+rl.on('line', (line) => {
+  const task = handleLine(line).finally(() => inFlight.delete(task))
+  inFlight.add(task)
 })
-function shutdown() {
+
+async function shutdown() {
+  for (const s of sessions.values()) cancelSession(s)
+  await Promise.allSettled([...inFlight])
   for (const s of sessions.values()) {
     try {
       s.db?.close()
@@ -882,13 +923,6 @@ function shutdown() {
   }
   process.exit(0)
 }
-rl.on('close', shutdown)
-process.stdin.on('end', shutdown)
-// session/cancel notification
-rl.on('line', (line) => {
-  const msg = JSON.parse(line)
-  if (msg.method === 'session/cancel') {
-    const s = sessions.get(msg.params.sessionId)
-    if (s) s.cancelled = true
-  }
+rl.on('close', () => {
+  void shutdown()
 })

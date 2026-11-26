@@ -1178,115 +1178,157 @@ test('TUI quota loader closes on completion or Escape and suppresses late result
   const { BorderedLoader, initTheme } =
     await import('@earendil-works/pi-coding-agent')
   initTheme('dark', false)
-  for (const scenario of [
-    'success',
-    'error',
-    'cancel-success',
-    'cancel-error',
-  ]) {
-    await t.test(scenario, async (t) => {
-      const query = Promise.withResolvers()
-      const read = t.mock.method(
-        QuotaReader.prototype,
-        'read',
-        () => query.promise,
-      )
-      const handlers = new Map()
-      let command,
-        loader,
-        customCalls = 0,
-        completions = 0,
-        renders = 0
-      const notices = []
-      extension({
-        registerProvider() {},
-        on(name, handler) {
-          handlers.set(name, handler)
-        },
-        registerCommand(_name, definition) {
-          command = definition
-        },
-      })
-      t.after(async () => {
-        loader?.dispose()
-        await handlers.get('session_shutdown')()
-      })
-      const ctx = {
-        mode: 'tui',
-        ui: {
-          notify(text, level) {
-            notices.push({ text, level })
-          },
-          custom(factory) {
-            customCalls++
-            return new Promise((resolve) => {
-              loader = factory(
-                {
-                  requestRender() {
-                    renders++
-                  },
-                },
-                {
-                  fg(_color, text) {
-                    return text
-                  },
-                },
-                undefined,
-                (value) => {
-                  completions++
-                  // Pi owns component disposal when custom UI completes.
-                  loader.dispose()
-                  resolve(value)
-                },
-              )
-            })
-          },
-        },
-      }
-      const pending = command.handler('quota', ctx)
-      assert.equal(customCalls, 1)
-      assert.ok(loader instanceof BorderedLoader)
-      assert.ok(renders > 0)
-      assert.match(
-        loader.render(80).join('\n'),
-        /Fetching Antigravity quota\.\.\./,
-      )
-      assert.equal(read.mock.callCount(), 1)
-      assert.deepEqual(read.mock.calls[0].arguments, [true])
-      assert.equal(notices.length, 0)
-      const dispose = t.mock.method(loader, 'dispose')
-      const snapshot = scenario.endsWith('error')
-        ? quotaSnapshot([], {
-            status: 'error',
-            groups: [],
-            error: 'Network unavailable',
-          })
-        : quotaSnapshot([0.75])
-      if (scenario.startsWith('cancel')) {
-        loader.handleInput('\x1b')
-        assert.equal(loader.signal.aborted, true)
-        await pending
-        assert.deepEqual(notices, [
-          { text: 'Quota check cancelled', level: 'info' },
-        ])
-        assert.equal(dispose.mock.callCount(), 1)
-        query.resolve(snapshot)
-        await new Promise((resolve) => setImmediate(resolve))
-        assert.equal(notices.length, 1)
-      } else {
-        query.resolve(snapshot)
-        await pending
-        assert.equal(notices.length, 1)
-        assert.match(notices[0].text, /Antigravity Quota/)
-        assert.equal(notices[0].level, scenario === 'error' ? 'error' : 'info')
-        if (scenario === 'error')
-          assert.match(notices[0].text, /Network unavailable/)
-        else assert.match(notices[0].text, /25%/)
-      }
-      assert.equal(completions, 1)
-      assert.equal(dispose.mock.callCount(), 1)
+
+  function mountLoader(st) {
+    const query = Promise.withResolvers()
+    const read = st.mock.method(
+      QuotaReader.prototype,
+      'read',
+      () => query.promise,
+    )
+    const handlers = new Map()
+    let command,
+      loader,
+      customCalls = 0,
+      completions = 0,
+      renders = 0
+    const notices = []
+    extension({
+      registerProvider() {},
+      on(name, handler) {
+        handlers.set(name, handler)
+      },
+      registerCommand(_name, definition) {
+        command = definition
+      },
     })
+    st.after(async () => {
+      loader?.dispose()
+      await handlers.get('session_shutdown')()
+    })
+    const ctx = {
+      mode: 'tui',
+      ui: {
+        notify(text, level) {
+          notices.push({ text, level })
+        },
+        custom(factory) {
+          customCalls++
+          return new Promise((resolve) => {
+            loader = factory(
+              {
+                requestRender() {
+                  renders++
+                },
+              },
+              {
+                fg(_color, text) {
+                  return text
+                },
+              },
+              undefined,
+              (value) => {
+                completions++
+                // Pi owns component disposal when custom UI completes.
+                loader.dispose()
+                resolve(value)
+              },
+            )
+          })
+        },
+      },
+    }
+    const pending = command.handler('quota', ctx)
+    assert.equal(customCalls, 1)
+    assert.ok(loader instanceof BorderedLoader)
+    assert.ok(renders > 0)
+    assert.match(
+      loader.render(80).join('\n'),
+      /Fetching Antigravity quota\.\.\./,
+    )
+    assert.equal(read.mock.callCount(), 1)
+    assert.deepEqual(read.mock.calls[0].arguments, [true])
+    assert.equal(notices.length, 0)
+    const dispose = st.mock.method(loader, 'dispose')
+    return {
+      query,
+      pending,
+      loader,
+      notices,
+      dispose,
+      getCompletions: () => completions,
+    }
   }
+
+  await t.test('success', async (st) => {
+    const { query, pending, notices, dispose, getCompletions } = mountLoader(st)
+    query.resolve(quotaSnapshot([0.75]))
+    await pending
+    assert.equal(notices.length, 1)
+    assert.match(notices[0].text, /Antigravity Quota/)
+    assert.equal(notices[0].level, 'info')
+    assert.match(notices[0].text, /25%/)
+    assert.equal(getCompletions(), 1)
+    assert.equal(dispose.mock.callCount(), 1)
+  })
+
+  await t.test('error', async (st) => {
+    const { query, pending, notices, dispose, getCompletions } = mountLoader(st)
+    query.resolve(
+      quotaSnapshot([], {
+        status: 'error',
+        groups: [],
+        error: 'Network unavailable',
+      }),
+    )
+    await pending
+    assert.equal(notices.length, 1)
+    assert.match(notices[0].text, /Antigravity Quota/)
+    assert.equal(notices[0].level, 'error')
+    assert.match(notices[0].text, /Network unavailable/)
+    assert.equal(getCompletions(), 1)
+    assert.equal(dispose.mock.callCount(), 1)
+  })
+
+  await t.test('cancel-success', async (st) => {
+    const { query, pending, loader, notices, dispose, getCompletions } =
+      mountLoader(st)
+    loader.handleInput('\x1b')
+    assert.equal(loader.signal.aborted, true)
+    await pending
+    assert.deepEqual(notices, [
+      { text: 'Quota check cancelled', level: 'info' },
+    ])
+    assert.equal(dispose.mock.callCount(), 1)
+    query.resolve(quotaSnapshot([0.75]))
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.equal(notices.length, 1)
+    assert.equal(getCompletions(), 1)
+    assert.equal(dispose.mock.callCount(), 1)
+  })
+
+  await t.test('cancel-error', async (st) => {
+    const { query, pending, loader, notices, dispose, getCompletions } =
+      mountLoader(st)
+    loader.handleInput('\x1b')
+    assert.equal(loader.signal.aborted, true)
+    await pending
+    assert.deepEqual(notices, [
+      { text: 'Quota check cancelled', level: 'info' },
+    ])
+    assert.equal(dispose.mock.callCount(), 1)
+    query.resolve(
+      quotaSnapshot([], {
+        status: 'error',
+        groups: [],
+        error: 'Network unavailable',
+      }),
+    )
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.equal(notices.length, 1)
+    assert.equal(getCompletions(), 1)
+    assert.equal(dispose.mock.callCount(), 1)
+  })
 })
 
 test('quota queries directly outside TUI or when custom UI is unavailable', async (t) => {
@@ -1750,30 +1792,31 @@ test('runCommand ignores stdin, caps stdout, aborts early on auth-required stder
   const authScript = join(root, 'auth-agy.mjs')
   writeFileSync(
     authScript,
-    "#!/usr/bin/env node\nprocess.stderr.write('Authentication required. Please run agy to sign in.\\n'); setTimeout(() => {}, 30000)\n",
+    "process.stderr.write('Authentication required. Please run agy to sign in.\\n'); setTimeout(() => {}, 30000)\n",
   )
-  chmodSync(authScript, 0o755)
-  const started = Date.now()
-  const reader = new QuotaReader(() => authScript, runCommand, 60_000)
+  let lastAuthRun
+  const runNodeCommand = async (argv, timeoutMs, options) => {
+    const res = await runCommand([process.execPath, ...argv], timeoutMs, options)
+    lastAuthRun = res
+    return res
+  }
+  const reader = new QuotaReader(() => authScript, runNodeCommand, 60_000)
   const authSnap = await reader.read(true)
   assert.equal(authSnap.status, 'error')
   assert.match(authSnap.error, /Authentication required/i)
-  assert.ok(
-    Date.now() - started < 5_000,
-    'auth-required stderr should abort long before the 45s timeout',
-  )
+  assert.equal(lastAuthRun.abortedBy, 'stderr')
 
   // 3. Stdout exceeding 1 MiB aborts QuotaReader cleanly.
   const bigStdoutScript = join(root, 'big-agy.mjs')
   writeFileSync(
     bigStdoutScript,
-    "#!/usr/bin/env node\nprocess.stdout.write('x'.repeat(1024 * 1024 + 64)); setTimeout(() => {}, 30000)\n",
+    "process.stdout.write('x'.repeat(1024 * 1024 + 64)); setTimeout(() => {}, 30000)\n",
   )
-  chmodSync(bigStdoutScript, 0o755)
-  const bigReader = new QuotaReader(() => bigStdoutScript, runCommand, 60_000)
+  const bigReader = new QuotaReader(() => bigStdoutScript, runNodeCommand, 60_000)
   const bigSnap = await bigReader.read(true)
   assert.equal(bigSnap.status, 'error')
   assert.match(bigSnap.error, /stdout exceeded/i)
+  assert.equal(lastAuthRun.abortedBy, 'maxStdout')
 })
 
 test(
