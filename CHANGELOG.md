@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.2.4](https://github.com/fdkevin0/pi-agy-acp/compare/v0.2.3...v0.2.4) (2026-11-26)
+
+
+### Features
+
+* default AGY_CLI_AUTO_COMPACT_OVERRIDE=100% and idle session/resume ([#54](https://github.com/fdkevin0/pi-agy-acp/issues/54)) ([bf7c1f4](https://github.com/fdkevin0/pi-agy-acp/commit/bf7c1f45eb19d39b2a1c1fcf56fdbfa756187ab2))
+* **preflight:** raise agy minimum to 1.5.18, add headless login hints, and sync 1.5.18 fixtures ([#48](https://github.com/fdkevin0/pi-agy-acp/issues/48)) ([fe3b58e](https://github.com/fdkevin0/pi-agy-acp/commit/fe3b58e2c7f1a3782ca6e4512e0560a72b6e11e4))
+
+
+### Bug Fixes
+
+* **runtime:** classify hidden 400 INVALID_ARGUMENT and billing/prepaid quota errors ([#50](https://github.com/fdkevin0/pi-agy-acp/issues/50)) ([d0ddc3d](https://github.com/fdkevin0/pi-agy-acp/commit/d0ddc3d8d426049bd7e36f7d437d3cb33b1aa241))
+
 ## [0.2.3](https://github.com/fdkevin0/pi-agy-acp/compare/v0.2.2...v0.2.3) (2026-11-23)
 
 
