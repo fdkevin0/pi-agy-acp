@@ -730,25 +730,87 @@ function accumulateRawUsage(
   }
 }
 
+function nonNegativeInt(value: number | undefined): number {
+  return value !== undefined && Number.isFinite(value)
+    ? Math.max(0, Math.round(value))
+    : 0
+}
+
+function positiveInt(value: number | undefined): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0
+    ? Math.round(value)
+    : undefined
+}
+
+function promptBuckets(
+  usage: NonNullable<AcpPromptResult['usage']>,
+): [number, number, number] {
+  return [
+    nonNegativeInt(usage.inputTokens),
+    nonNegativeInt(usage.cachedReadTokens),
+    nonNegativeInt(usage.cachedWriteTokens),
+  ]
+}
+
 /**
- * Map accumulated ACP turn usage into Pi token usage.
+ * Proportionally cap prompt buckets (`input`, `cacheRead`, `cacheWrite`) to
+ * `cap` using largest-remainder allocation so their sum never exceeds `cap`,
+ * cache-hit ratios stay accurate, and zero buckets stay zero.
+ */
+function capPromptBuckets(
+  buckets: readonly [number, number, number],
+  cap: number,
+): [number, number, number] {
+  const [input, cacheRead, cacheWrite] = buckets
+  const sum = input + cacheRead + cacheWrite
+  if (sum <= cap || sum === 0) return [input, cacheRead, cacheWrite]
+  if (cap <= 0) return [0, 0, 0]
+  const exact: [number, number, number] = [
+    (input / sum) * cap,
+    (cacheRead / sum) * cap,
+    (cacheWrite / sum) * cap,
+  ]
+  const floors: [number, number, number] = [
+    Math.min(input, Math.floor(exact[0])),
+    Math.min(cacheRead, Math.floor(exact[1])),
+    Math.min(cacheWrite, Math.floor(exact[2])),
+  ]
+  let remaining = cap - (floors[0] + floors[1] + floors[2])
+  const order = ([0, 1, 2] as const)
+    .slice()
+    .sort((a, b) => exact[b] - floors[b] - (exact[a] - floors[a]))
+  for (const idx of order) {
+    if (remaining <= 0) break
+    if (floors[idx] >= buckets[idx]) continue
+    floors[idx] += 1
+    remaining -= 1
+  }
+  return floors
+}
+
+/**
+ * Map accumulated ACP turn usage into Pi single-call token usage.
  *
- * Consumption buckets (`inputTokens`, `outputTokens`, `cacheReadTokens`,
- * `cacheWriteTokens`, `reasoningTokens`) stay unscaled cumulative turn totals
- * because intermediate `toolUse` steps emit zero usage and Pi sums those
- * buckets across steps for session accounting and flat pricing overrides.
+ * Pi's `AssistantMessage.usage` represents one model call: `isContextOverflow()`
+ * checks `input + cacheRead` against `contextWindow` even on successful `stop`
+ * turns, while `calculateContextTokens()` reads `totalTokens`. Raw cumulative
+ * multi-call ACP usage therefore stays on `turn.usage` (`RuntimeStatus.lastTurn`),
+ * while prompt buckets (`inputTokens`, `cacheReadTokens`, `cacheWriteTokens`)
+ * emitted to Pi are normalized to the final call's prompt occupancy (preserving
+ * cache-hit ratios and leaving single-call turns untouched). `outputTokens` and
+ * `reasoningTokens` remain cumulative turn totals.
  *
- * `totalTokens` feeds Pi's `calculateContextTokens` / ContextMeter / compaction
- * threshold as final-call context occupancy: when `options.contextTokens`
- * (from live `usage_update.used`) is positive, it is used directly; otherwise
- * final-segment prompt buckets are normalized by `calls` and added to final-
- * segment output tokens.
+ * `totalTokens` resolves final-call context occupancy in priority order:
+ * 1. Positive live `options.contextTokens` (`usage_update.used`).
+ * 2. Positive `options.estimatedContextTokens` (same-turn `gen_metadata`).
+ * 3. Final-segment average prompt tokens divided by `calls`, plus final-segment
+ *    output tokens.
  *
  * `agy acp` reports `inputTokens` as uncached input only, disjoint from
  * `cachedReadTokens` and `cachedWriteTokens`.
  * @param usage - accumulated turn usage.
  * @param calls - model calls inside the final `session/prompt` segment (>= 1).
- * @param options - optional live `usage_update` count and final segment usage.
+ * @param options - optional live `usage_update` count, metadata estimate, and final segment usage.
  * @returns Pi usage.
  */
 export function toTokenUsage(
@@ -757,48 +819,40 @@ export function toTokenUsage(
   options?: TokenUsageOptions,
 ): TokenUsage | undefined {
   if (usage === undefined) return undefined
-  const input = Math.max(0, Math.round(usage.inputTokens ?? 0))
-  const cacheRead = Math.max(0, Math.round(usage.cachedReadTokens ?? 0))
-  const cacheWrite = Math.max(0, Math.round(usage.cachedWriteTokens ?? 0))
-  const output = Math.max(0, Math.round(usage.outputTokens ?? 0))
+  const output = nonNegativeInt(usage.outputTokens)
   const reasoning =
-    usage.thoughtTokens !== undefined && usage.thoughtTokens > 0
+    usage.thoughtTokens !== undefined &&
+    Number.isFinite(usage.thoughtTokens) &&
+    usage.thoughtTokens > 0
       ? Math.min(output, Math.round(usage.thoughtTokens))
       : undefined
-  const liveContext = options?.contextTokens
-  const estimatedContext = options?.estimatedContextTokens
+  const seg = options?.lastSegmentUsage ?? usage
+  const segBuckets = promptBuckets(seg)
+  const segPromptSum = segBuckets[0] + segBuckets[1] + segBuckets[2]
+  const promptSource = segPromptSum > 0 ? seg : usage
+  const rawPrompt = segPromptSum > 0 ? segBuckets : promptBuckets(usage)
+
+  const liveContext =
+    positiveInt(options?.contextTokens) ??
+    positiveInt(options?.estimatedContextTokens)
+  let promptCap: number
   let totalTokens: number
-  if (
-    typeof liveContext === 'number' &&
-    Number.isFinite(liveContext) &&
-    liveContext > 0
-  ) {
-    totalTokens = Math.round(liveContext)
-  } else if (
-    typeof estimatedContext === 'number' &&
-    Number.isFinite(estimatedContext) &&
-    estimatedContext > 0
-  ) {
-    totalTokens = Math.round(estimatedContext)
+  if (liveContext !== undefined) {
+    promptCap = liveContext
+    totalTokens = liveContext
   } else {
-    const seg = options?.lastSegmentUsage ?? usage
     const scale = Math.max(1, calls)
-    const segPrompt = Math.max(
-      0,
-      Math.round(
-        ((seg.inputTokens ?? 0) +
-          (seg.cachedReadTokens ?? 0) +
-          (seg.cachedWriteTokens ?? 0)) /
-          scale,
-      ),
-    )
-    const segOutput = Math.max(0, Math.round(seg.outputTokens ?? 0))
-    totalTokens = segPrompt + segOutput
+    promptCap = Math.max(0, Math.round(segPromptSum / scale))
+    totalTokens = promptCap + nonNegativeInt(seg.outputTokens)
   }
+
+  const [input, cacheRead, cacheWrite] = capPromptBuckets(rawPrompt, promptCap)
   return {
     inputTokens: input,
     outputTokens: output,
-    ...(usage.cachedReadTokens !== undefined || cacheRead > 0
+    ...(promptSource.cachedReadTokens !== undefined ||
+    usage.cachedReadTokens !== undefined ||
+    cacheRead > 0
       ? { cacheReadTokens: cacheRead }
       : {}),
     ...(cacheWrite > 0 ? { cacheWriteTokens: cacheWrite } : {}),

@@ -421,6 +421,7 @@ async function runPrompt(s, text) {
   const lines = text.split('\n')
   let output = []
   let stopReason
+  let customUsage
   let inHistory = false
   for (const line of lines) {
     if (line === '<pi_history>') {
@@ -679,6 +680,8 @@ async function runPrompt(s, text) {
         used: Number(line.slice(9).trim()),
         size: 1_048_576,
       })
+    } else if (line.startsWith('USAGE ')) {
+      customUsage = JSON.parse(line.slice(6).trim())
     } else if (line.startsWith('STEP ')) {
       const rest = line.slice('STEP '.length)
       const sep = rest.indexOf(' ')
@@ -723,7 +726,7 @@ async function runPrompt(s, text) {
   })
   return {
     stopReason: 'end_turn',
-    usage: {
+    usage: customUsage ?? {
       inputTokens: 600,
       outputTokens: 50,
       cachedReadTokens: 400,

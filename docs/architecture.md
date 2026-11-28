@@ -245,14 +245,26 @@ Working directory is `<PI_AGY_HOME>/workspace`. ACP JSON-RPC timeouts:
 ### Usage and `totalTokens` priority
 
 `toTokenUsage()` emits usage only when `session/prompt` includes a `usage`
-object. Cumulative buckets (`inputTokens`, `outputTokens`, `cacheReadTokens`,
-`cacheWriteTokens`, `reasoningTokens`) sum across `max_tokens` continuations;
-`totalTokens` resolves in priority order:
+object. Raw cumulative multi-call ACP usage is retained on
+`RuntimeStatus.lastTurn.usage`, while the `AssistantMessage.usage` sent to Pi
+normalizes prompt buckets to single-call occupancy so Pi's `isContextOverflow()`
+(`input + cacheRead > contextWindow` on `stop` turns) does not false-positive on
+tool-heavy or continued turns:
 
-1. Positive `usage_update.used` from the current continuation segment.
-2. Positive `estimated_tokens_used` from `gen_metadata` in the current segment.
-3. Final-segment average fallback:
-   `round((input + cacheRead + cacheWrite) / max(1, segmentCalls)) + round(output)`.
+1. `totalTokens` resolves final-call context occupancy in priority order:
+   1. Positive `usage_update.used` from the current continuation segment.
+   2. Positive `estimated_tokens_used` from `gen_metadata` in the current segment.
+   3. Final-segment average fallback:
+      `round((input + cacheRead + cacheWrite) / max(1, segmentCalls)) + round(output)`.
+2. Prompt buckets (`inputTokens`, `cacheReadTokens`, `cacheWriteTokens`) are
+   taken from the final segment (falling back to accumulated usage when the
+   final segment reports zero prompt tokens) and capped proportionally with
+   largest-remainder allocation so their sum never exceeds the resolved
+   single-call prompt budget (`totalTokens` for live/metadata occupancy, or the
+   averaged `segPrompt` fallback). Single-call turns that already fit remain
+   unscaled, and cache-hit ratios are preserved.
+3. `outputTokens` and `reasoningTokens` remain cumulative across `max_tokens`
+   continuations.
 
 ## Quota reader and Pi stream contracts
 

@@ -463,12 +463,14 @@ test('a tool call parks, ends the step, and resumes the same ACP turn with the P
   assert.equal(finishOf(step2).reason.kind, 'stop')
   assert.equal(textOf(step2), 'RESULT(bash)=file-a')
   assert.deepEqual(step2.find((c) => c.type === 'usage').usage, {
-    inputTokens: 600,
+    inputTokens: 300,
     outputTokens: 50,
-    cacheReadTokens: 400,
+    cacheReadTokens: 200,
     reasoningTokens: 20,
     totalTokens: 550,
   })
+  assert.equal(adapter.status().lastTurn.usage.inputTokens, 600)
+  assert.equal(adapter.status().lastTurn.usage.cachedReadTokens, 400)
   assert.equal(
     prompts().length,
     1,
@@ -973,7 +975,7 @@ test('an output-length stop continues automatically (long decode)', async (t) =>
   assert.equal(adapter.status().lastTurn.usage.inputTokens, 610)
   assert.equal(adapter.status().lastTurn.usage.outputTokens, 55)
   assert.deepEqual(chunks.find((c) => c.type === 'usage').usage, {
-    inputTokens: 610,
+    inputTokens: 600,
     outputTokens: 55,
     cacheReadTokens: 400,
     reasoningTokens: 20,
@@ -991,7 +993,7 @@ test('an output-length stop continues automatically (long decode)', async (t) =>
   )
   assert.equal(finishOf(clearStale).reason.kind, 'stop')
   assert.deepEqual(clearStale.find((c) => c.type === 'usage').usage, {
-    inputTokens: 610,
+    inputTokens: 600,
     outputTokens: 55,
     cacheReadTokens: 400,
     reasoningTokens: 20,
@@ -1068,7 +1070,7 @@ test('cache reads stay disjoint from the uncached input count', () => {
   assert.equal(toTokenUsage(undefined), undefined)
 })
 
-test('toTokenUsage keeps cumulative buckets unscaled and prefers positive live usage_update context', () => {
+test('toTokenUsage caps prompt buckets to single-call occupancy while preserving cache ratios and cumulative output', () => {
   assert.deepEqual(
     toTokenUsage(
       {
@@ -1083,10 +1085,10 @@ test('toTokenUsage keeps cumulative buckets unscaled and prefers positive live u
       { contextTokens: 848 },
     ),
     {
-      inputTokens: 1_501,
+      inputTokens: 663,
       outputTokens: 107,
-      cacheReadTokens: 400,
-      cacheWriteTokens: 20,
+      cacheReadTokens: 176,
+      cacheWriteTokens: 9,
       reasoningTokens: 15,
       totalTokens: 848,
     },
@@ -1109,15 +1111,79 @@ test('toTokenUsage keeps cumulative buckets unscaled and prefers positive live u
       },
     ),
     {
-      inputTokens: 610,
+      inputTokens: 300,
       outputTokens: 55,
-      cacheReadTokens: 400,
+      cacheReadTokens: 200,
       totalTokens: 550,
+    },
+  )
+  // Issue #47: cumulative multi-step prompt (1,285,854) scaled to live occupancy (76,210).
+  const issue47 = toTokenUsage(
+    {
+      inputTokens: 212_702,
+      outputTokens: 4_200,
+      cachedReadTokens: 1_073_152,
+      cachedWriteTokens: 0,
+    },
+    28,
+    { contextTokens: 76_210 },
+  )
+  assert.deepEqual(issue47, {
+    inputTokens: 12_606,
+    outputTokens: 4_200,
+    cacheReadTokens: 63_604,
+    totalTokens: 76_210,
+  })
+  // Largest-remainder apportionment never overshoots cap across equal fractional remainders.
+  const rounded = toTokenUsage(
+    {
+      inputTokens: 500_000,
+      outputTokens: 100,
+      cachedReadTokens: 500_000,
+      cachedWriteTokens: 500_000,
+    },
+    3,
+    { contextTokens: 512_000 },
+  )
+  assert.equal(
+    rounded.inputTokens + rounded.cacheReadTokens + rounded.cacheWriteTokens,
+    512_000,
+  )
+  // Genuine single-call overflow keeps prompt buckets > contextWindow.
+  const genuineOverflow = toTokenUsage(
+    {
+      inputTokens: 200_000,
+      outputTokens: 500,
+      cachedReadTokens: 1_000_000,
+    },
+    3,
+    { contextTokens: 550_000 },
+  )
+  assert.equal(
+    genuineOverflow.inputTokens + genuineOverflow.cacheReadTokens,
+    550_000,
+  )
+  // Single-call turns whose prompt fits inside live occupancy remain unscaled.
+  assert.deepEqual(
+    toTokenUsage(
+      {
+        inputTokens: 10_000,
+        outputTokens: 2_000,
+        cachedReadTokens: 60_000,
+      },
+      1,
+      { contextTokens: 72_000 },
+    ),
+    {
+      inputTokens: 10_000,
+      outputTokens: 2_000,
+      cacheReadTokens: 60_000,
+      totalTokens: 72_000,
     },
   )
 })
 
-test('usage_update sets single-call totalTokens across tool steps while ignoring zero reset frames', async (t) => {
+test('usage_update sets single-call totalTokens and bounds prompt buckets across tool steps while ignoring zero reset frames', async (t) => {
   const { adapter } = makeRuntime(t)
   const base = {
     provider: 'antigravity',
@@ -1149,12 +1215,14 @@ test('usage_update sets single-call totalTokens across tool steps while ignoring
   )
   assert.equal(finishOf(step2).reason.kind, 'stop')
   assert.deepEqual(step2.find((c) => c.type === 'usage').usage, {
-    inputTokens: 600,
+    inputTokens: 509,
     outputTokens: 50,
-    cacheReadTokens: 400,
+    cacheReadTokens: 339,
     reasoningTokens: 20,
     totalTokens: 848,
   })
+  assert.equal(adapter.status().lastTurn.usage.inputTokens, 600)
+  assert.equal(adapter.status().lastTurn.usage.cachedReadTokens, 400)
 })
 
 test('bounded replay drops the oldest history, closes the block, and keeps the latest input intact', async (t) => {
