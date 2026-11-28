@@ -451,7 +451,7 @@ test('onPayload preserves routing metadata, inherits omitted tools, keeps empty 
   assert.match(badMessages.message.errorMessage, /messages array/)
 })
 
-test('streamPi preserves cumulative turn pricing while feeding live context occupancy to calculateContextTokens', async () => {
+test('streamPi aligns prompt usage with live context occupancy, prevents false overflow, and preserves genuine overflow and raw lastTurn accounting', async () => {
   const home = mkdtempSync(join(tmpdir(), 'pi-usage-cost-'))
   const runtime = new AntigravityRuntime({
     config: { ...defaults, command: fakeAgy, home },
@@ -487,16 +487,68 @@ test('streamPi preserves cumulative turn pricing while feeding live context occu
       pricedModel,
     )
     assert.equal(step2.message.stopReason, 'stop')
-    assert.equal(step2.message.usage.input, 600)
+    assert.equal(step2.message.usage.input, 509)
     assert.equal(step2.message.usage.output, 50)
-    assert.equal(step2.message.usage.cacheRead, 400)
+    assert.equal(step2.message.usage.cacheRead, 339)
     assert.equal(step2.message.usage.totalTokens, 848)
     assert.equal(calculateContextTokens(step2.message.usage), 848)
-    assert.ok(Math.abs(step2.message.usage.cost.input - 0.0012) < 1e-12)
+    assert.equal(runtime.status().lastTurn.usage.inputTokens, 600)
+    assert.equal(runtime.status().lastTurn.usage.cachedReadTokens, 400)
+    assert.ok(Math.abs(step2.message.usage.cost.input - 0.001018) < 1e-12)
     assert.ok(Math.abs(step2.message.usage.cost.output - 0.0002) < 1e-12)
-    assert.ok(Math.abs(step2.message.usage.cost.cacheRead - 0.0002) < 1e-12)
+    assert.ok(Math.abs(step2.message.usage.cost.cacheRead - 0.0001695) < 1e-12)
     assert.equal(step2.message.usage.cost.cacheWrite, 0)
-    assert.ok(Math.abs(step2.message.usage.cost.total - 0.0016) < 1e-12)
+    assert.ok(Math.abs(step2.message.usage.cost.total - 0.0013875) < 1e-12)
+
+    // Issue #47: tool-heavy turn with cumulative input+cacheRead > 512,000 but live occupancy 76,210
+    // must NOT trip Pi's silent isContextOverflow(message, 512_000).
+    const heavyPrompt = user(
+      'CALL bash {"command":"pwd"}\nUSAGEUPD 76210\nUSAGE {"inputTokens":212702,"outputTokens":4200,"cachedReadTokens":1073152,"cachedWriteTokens":0,"totalTokens":1290054}',
+    )
+    const heavyOpts = { sessionId: 'pi-issue-47' }
+    const heavyStep1 = await result(runtime, context(system, heavyPrompt), heavyOpts)
+    assert.equal(heavyStep1.message.stopReason, 'toolUse')
+    const heavyCall = heavyStep1.message.content.find((b) => b.type === 'toolCall')
+    const heavyTool = {
+      role: 'toolResult',
+      toolCallId: heavyCall.id,
+      toolName: 'bash',
+      content: [{ type: 'text', text: 'ok' }],
+      isError: false,
+      timestamp: 2,
+    }
+    const heavyStep2 = await result(
+      runtime,
+      context(system, heavyPrompt, heavyStep1.message, heavyTool),
+      heavyOpts,
+    )
+    assert.equal(heavyStep2.message.stopReason, 'stop')
+    assert.equal(heavyStep2.message.usage.input, 12_606)
+    assert.equal(heavyStep2.message.usage.cacheRead, 63_604)
+    assert.equal(heavyStep2.message.usage.totalTokens, 76_210)
+    assert.equal(calculateContextTokens(heavyStep2.message.usage), 76_210)
+    assert.equal(isContextOverflow(heavyStep2.message, 512_000), false)
+    assert.equal(runtime.status().lastTurn.usage.inputTokens, 212_702)
+    assert.equal(runtime.status().lastTurn.usage.cachedReadTokens, 1_073_152)
+
+    // Genuine silent overflow (live occupancy 550,000 > 512,000) must still trigger isContextOverflow.
+    const realOverflow = await result(
+      runtime,
+      context(
+        system,
+        user(
+          'USAGEUPD 550000\nUSAGE {"inputTokens":200000,"outputTokens":500,"cachedReadTokens":1000000,"cachedWriteTokens":0,"totalTokens":1200500}',
+        ),
+      ),
+      { sessionId: 'pi-real-overflow' },
+    )
+    assert.equal(realOverflow.message.stopReason, 'stop')
+    assert.equal(realOverflow.message.usage.totalTokens, 550_000)
+    assert.equal(
+      realOverflow.message.usage.input + realOverflow.message.usage.cacheRead,
+      550_000,
+    )
+    assert.equal(isContextOverflow(realOverflow.message, 512_000), true)
   } finally {
     await runtime.dispose()
     rmSync(home, { recursive: true, force: true })

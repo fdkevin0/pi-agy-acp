@@ -195,22 +195,27 @@ Usage comes from the ACP session rather than per-step HTTP headers. Parked
 ACP turn completes (accumulated across any automatic `max_tokens` continuations)
 whenever `session/prompt` reports usage.
 
-The extension separates cumulative turn consumption from final-call context
-occupancy:
+The extension aligns Pi's per-message prompt usage with single-call context
+occupancy while retaining raw cumulative ACP turn totals on
+`RuntimeStatus.lastTurn.usage`:
 
-- `input`, `output`, `cacheRead`, `cacheWrite`, and `reasoning` preserve
-  unscaled cumulative turn totals, so Pi session totals and flat pricing
-  overrides reflect full multi-step consumption.
 - `totalTokens` (feeding Pi's context meter and auto-compaction threshold) uses
   the final call's live token occupancy when reported by `agy`, falling back to
   the same turn's session metadata estimate and then a final-segment average
   estimate.
+- `input`, `cacheRead`, and `cacheWrite` are proportionally capped to that
+  single-call prompt occupancy (preserving cache-hit ratios and leaving
+  single-call turns unchanged), preventing Pi's silent-overflow check
+  (`input + cacheRead > contextWindow`) from falsely triggering auto-compaction
+  after tool-heavy turns while preserving genuine overflow detection.
+- `output` and `reasoning` preserve cumulative turn totals across any automatic
+  `max_tokens` continuations.
 
 Default model prices are zero because upstream pricing is unavailable. With Pi
-pricing overrides, flat per-million rates price cumulative turn buckets
-accurately; tiered `inputTokensAbove` rules evaluate against cumulative turn
-prompt tokens rather than per-call prompt sizes. These numbers are estimates,
-not an invoice or a promise of free access.
+pricing overrides, per-turn prompt costs reflect the normalized single-call
+prompt buckets on multi-step turns rather than the sum across every internal
+tool call; these numbers are estimates, not an invoice or a promise of free
+access.
 
 Read-only SQLite inspection is restricted strictly to session-scoped databases
 inside `PI_AGY_HOME` (for context windows, occupancy estimates, and hidden
