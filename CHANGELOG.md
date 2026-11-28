@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.5](https://github.com/fdkevin0/pi-agy-acp/compare/v0.2.4...v0.2.5) (2026-11-28)
+
+
+### Bug Fixes
+
+* **usage:** cap Pi prompt usage buckets to single-call occupancy ([#57](https://github.com/fdkevin0/pi-agy-acp/issues/57)) ([74a3e2e](https://github.com/fdkevin0/pi-agy-acp/commit/74a3e2e6887f9ee6cbadb17339f5537b340dfe80)), closes [#47](https://github.com/fdkevin0/pi-agy-acp/issues/47)
+
 ## [0.2.4](https://github.com/fdkevin0/pi-agy-acp/compare/v0.2.3...v0.2.4) (2026-11-26)
 
 
